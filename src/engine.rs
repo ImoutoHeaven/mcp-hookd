@@ -560,8 +560,7 @@ impl HookdEngine {
         });
 
         if mutated {
-            let snap = engine.snapshot_state();
-            engine.store.save_and_flush(snap).await?;
+            engine.persist_state().await?;
         }
 
         // Start delivery workers and upstream consumers for active, unpaused subscriptions.
@@ -917,11 +916,7 @@ impl HookdEngine {
                 need_restart_consumer,
             )) = refresh_outcome
             {
-                let snap = self.snapshot_state();
-                self.store
-                    .save_and_flush(snap)
-                    .await
-                    .map_err(EngineError::Internal)?;
+                self.persist_state().await.map_err(EngineError::Internal)?;
 
                 if was_suspended || was_paused {
                     sub.outbox_notify.notify_one();
@@ -1063,8 +1058,7 @@ impl HookdEngine {
             rt.subscriptions.insert(key.clone(), Arc::clone(&sub));
         }
 
-        let snap = self.snapshot_state();
-        if let Err(err) = self.store.save_and_flush(snap).await {
+        if let Err(err) = self.persist_state().await {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
             if rt
                 .subscriptions
@@ -1154,11 +1148,7 @@ impl HookdEngine {
         }
         sub.cancel_all();
 
-        let snap = self.snapshot_state();
-        self.store
-            .save_and_flush(snap)
-            .await
-            .map_err(EngineError::Internal)?;
+        self.persist_state().await.map_err(EngineError::Internal)?;
 
         Ok(())
     }
@@ -1394,8 +1384,7 @@ impl HookdEngine {
             h.abort();
         }
 
-        let snap = self.snapshot_state();
-        self.store.mark_dirty(snap);
+        self.mark_state_dirty();
         self.store.shutdown().await
     }
 
@@ -1651,6 +1640,7 @@ impl HookdEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn snapshot_state(&self) -> PersistedState {
         self.runtime
             .lock()
@@ -1659,7 +1649,13 @@ impl HookdEngine {
     }
 
     fn mark_state_dirty(&self) {
-        self.store.mark_dirty(self.snapshot_state());
+        let runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        self.store.mark_dirty(runtime.snapshot());
+    }
+
+    async fn persist_state(&self) -> Result<(), String> {
+        self.mark_state_dirty();
+        self.store.flush().await
     }
 
     fn spawn_delivery_worker(self: &Arc<Self>, sub: Arc<SubRuntime>) {
@@ -3062,6 +3058,62 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         captured.lock().await.clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_snapshots_preserve_the_latest_runtime_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("subs.json");
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            base_config(
+                path.clone(),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("prod")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut tasks = Vec::new();
+        for worker in 0..8 {
+            let engine = Arc::clone(&engine);
+            tasks.push(tokio::spawn(async move {
+                for step in 0..128 {
+                    let key = (format!("p{worker}"), format!("url{step}"), "hash".into());
+                    engine
+                        .runtime
+                        .lock()
+                        .unwrap()
+                        .verified_endpoints
+                        .insert(key.clone(), unix_now());
+                    engine.mark_state_dirty();
+                    engine
+                        .runtime
+                        .lock()
+                        .unwrap()
+                        .verified_endpoints
+                        .remove(&key);
+                    engine.mark_state_dirty();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        engine.store.flush().await.unwrap();
+        let persisted: PersistedState =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(persisted.verified_endpoints.is_empty());
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
