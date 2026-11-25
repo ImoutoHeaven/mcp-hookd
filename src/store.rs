@@ -178,6 +178,7 @@ pub struct StoreHandle {
     notify: Arc<Notify>,
     flush_notify: Arc<Notify>,
     status_rx: watch::Receiver<FlushStatus>,
+    writer: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl StoreHandle {
@@ -196,7 +197,7 @@ impl StoreHandle {
         let worker_notify = Arc::clone(&notify);
         let worker_flush_notify = Arc::clone(&flush_notify);
 
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             loop {
                 let (has_work, immediate, shutdown) = {
                     let buf = worker_pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -251,6 +252,7 @@ impl StoreHandle {
             notify,
             flush_notify,
             status_rx,
+            writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
         }
     }
 
@@ -313,7 +315,15 @@ impl StoreHandle {
         }
         self.notify.notify_one();
         self.flush_notify.notify_one();
-        res
+        let mut writer = self.writer.lock().await;
+        let joined = match writer.as_mut() {
+            Some(task) => task
+                .await
+                .map_err(|error| format!("state writer task failed: {error}")),
+            None => Ok(()),
+        };
+        writer.take();
+        res.and(joined)
     }
 }
 
@@ -945,6 +955,8 @@ mod tests {
 
         handle.flush().await.unwrap();
         handle.shutdown().await.unwrap();
+        assert!(handle.status_rx.borrow().closed);
+        assert!(handle.writer.lock().await.is_none());
 
         let (_, loaded) = StateStore::open(path).unwrap();
         assert_eq!(loaded.subscriptions.len(), 1);

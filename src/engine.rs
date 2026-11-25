@@ -27,7 +27,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 const CATALOG_CACHE_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_LIST_PAGE_SIZE: usize = 100;
@@ -301,7 +302,6 @@ struct SubRuntime {
     space_notify: Notify,
     cancel_tx: watch::Sender<bool>,
     consumer_cancel: Mutex<Option<watch::Sender<bool>>>,
-    delivery_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SubRuntime {
@@ -425,7 +425,9 @@ pub struct HookdEngine {
     verify_rate: Mutex<HashMap<(String, String), VerifyBucket>>,
     runtime: Mutex<RuntimeState>,
     shutdown_tx: watch::Sender<bool>,
-    bg_tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: TaskTracker,
+    force_stop: CancellationToken,
+    shutdown_result: tokio::sync::OnceCell<Result<(), String>>,
 }
 
 impl HookdEngine {
@@ -436,7 +438,6 @@ impl HookdEngine {
         outbound_override: Option<OutboundClient>,
     ) -> Result<Arc<Self>, String> {
         let (state_store, persisted) = StateStore::open(config.state_path.clone())?;
-        let store = StoreHandle::spawn(state_store);
 
         let outbound = match outbound_override {
             Some(client) => client,
@@ -560,7 +561,7 @@ impl HookdEngine {
             outbound,
             upstream,
             auth_client,
-            store,
+            store: StoreHandle::spawn(state_store),
             upstream_stream_sem,
             global_delivery_sem,
             catalog_cache: tokio::sync::Mutex::new(CatalogCache::default()),
@@ -572,11 +573,14 @@ impl HookdEngine {
                 dedup: HashMap::new(),
             }),
             shutdown_tx,
-            bg_tasks: Mutex::new(Vec::new()),
+            tasks: TaskTracker::new(),
+            force_stop: CancellationToken::new(),
+            shutdown_result: tokio::sync::OnceCell::new(),
         });
 
-        if mutated {
-            engine.persist_state().await?;
+        if mutated && let Err(error) = engine.persist_state().await {
+            let _ = engine.store.shutdown().await;
+            return Err(error);
         }
 
         // Start delivery workers and upstream consumers for active, unpaused subscriptions.
@@ -598,27 +602,17 @@ impl HookdEngine {
         // If any startup auth_refs hit transient errors, spawn an exponential backoff retry task.
         if !transient_auth_refs.is_empty() {
             let eng = Arc::clone(&engine);
-            let handle = tokio::spawn(async move {
+            engine.spawn_task(async move {
                 eng.run_startup_auth_recovery(transient_auth_refs).await;
             });
-            engine
-                .bg_tasks
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(handle);
         }
 
         // Spawn periodic expiry reaper and authorization re-verification loop.
         {
             let eng = Arc::clone(&engine);
-            let handle = tokio::spawn(async move {
+            engine.spawn_task(async move {
                 eng.run_periodic_maintenance().await;
             });
-            engine
-                .bg_tasks
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(handle);
         }
 
         Ok(engine)
@@ -828,6 +822,7 @@ impl HookdEngine {
         // Check if an existing non-expired subscription exists for this composite key.
         let existing = {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+            self.ensure_running()?;
             if let Some(sub) = rt.subscriptions.get(&key).cloned() {
                 let expired = sub
                     .state
@@ -877,6 +872,7 @@ impl HookdEngine {
             // Re-verify subscription was not concurrently removed/expired while awaiting verification.
             let refresh_outcome = {
                 let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+                self.ensure_running()?;
                 let still_live = rt
                     .subscriptions
                     .get(&key)
@@ -958,6 +954,7 @@ impl HookdEngine {
         // New subscription path: enforce quotas before outbound challenge.
         {
             let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+            self.ensure_running()?;
             if rt.subscriptions.len() >= self.quotas.max_subscriptions {
                 return Err(EngineError::ResourceExhausted(
                     "global subscription limit reached".into(),
@@ -1064,6 +1061,7 @@ impl HookdEngine {
         // Re-check quotas under runtime lock before inserting.
         {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+            self.ensure_running()?;
             if rt.subscriptions.len() >= self.quotas.max_subscriptions {
                 return Err(EngineError::ResourceExhausted(
                     "global subscription limit reached".into(),
@@ -1154,6 +1152,7 @@ impl HookdEngine {
 
         let removed = {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+            self.ensure_running()?;
             rt.subscriptions.remove(&key)
         };
 
@@ -1374,52 +1373,75 @@ impl HookdEngine {
         })
     }
 
-    pub async fn shutdown(&self) -> Result<(), String> {
-        let _ = self.shutdown_tx.send(true);
+    pub fn begin_shutdown(&self) {
+        let runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        self.shutdown_tx.send_replace(true);
+        self.tasks.close();
+        for sub in runtime.subscriptions.values() {
+            sub.stop_consumer();
+            sub.outbox_notify.notify_waiters();
+        }
+    }
 
-        // Stop all upstream consumers first, leaving delivery workers to drain in-flight items.
-        let (subs, handles): (Vec<Arc<SubRuntime>>, Vec<JoinHandle<()>>) = {
-            let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
-            let subs: Vec<_> = rt.subscriptions.values().cloned().collect();
-            let mut handles = Vec::new();
-            for sub in &subs {
-                sub.stop_consumer();
-                sub.outbox_notify.notify_waiters();
-                if let Some(h) = sub
-                    .delivery_handle
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) -> Result<(), String> {
+        self.begin_shutdown();
+        self.shutdown_result
+            .get_or_init(|| async {
+                if tokio::time::timeout_at(deadline, self.tasks.wait())
+                    .await
+                    .is_err()
                 {
-                    handles.push(h);
+                    self.force_stop.cancel();
+                    self.tasks.wait().await;
                 }
-            }
-            (subs, handles)
-        };
+                {
+                    let runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    for sub in runtime.subscriptions.values() {
+                        sub.cancel_all();
+                        sub.state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .outbox
+                            .clear();
+                    }
+                    self.store.mark_dirty(runtime.snapshot());
+                }
+                self.store.shutdown().await
+            })
+            .await
+            .clone()
+    }
 
-        // Wait up to drain_timeout_secs for delivery workers to finish in-flight requests.
-        let drain_dur = Duration::from_secs(self.quotas.drain_timeout_secs);
-        let _ = tokio::time::timeout(drain_dur, async {
-            for h in handles {
-                let _ = h.await;
-            }
-        })
-        .await;
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.shutdown_until(
+            tokio::time::Instant::now() + Duration::from_secs(self.quotas.drain_timeout_secs),
+        )
+        .await
+    }
 
-        for sub in subs {
-            sub.cancel_all();
+    fn ensure_running(&self) -> Result<(), EngineError> {
+        if *self.shutdown_tx.borrow() {
+            Err(EngineError::ResourceExhausted(
+                "server is shutting down".into(),
+            ))
+        } else {
+            Ok(())
         }
+    }
 
-        let bg: Vec<JoinHandle<()>> = {
-            let mut guard = self.bg_tasks.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut *guard)
-        };
-        for h in bg {
-            h.abort();
+    fn spawn_task(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let _runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        if *self.shutdown_tx.borrow() {
+            return;
         }
-
-        self.mark_state_dirty();
-        self.store.shutdown().await
+        let force_stop = self.force_stop.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                () = force_stop.cancelled() => {}
+                () = future => {}
+            }
+        });
     }
 
     async fn resolve_caller(
@@ -1652,6 +1674,7 @@ impl HookdEngine {
 
         {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+            self.ensure_running()?;
             if rt.verified_endpoints.len() >= self.quotas.max_verified_endpoints
                 && !rt.verified_endpoints.contains_key(&cache_key)
             {
@@ -1693,14 +1716,10 @@ impl HookdEngine {
     }
 
     fn spawn_delivery_worker(self: &Arc<Self>, sub: Arc<SubRuntime>) {
-        let eng = Arc::clone(self);
-        let sub_for_task = Arc::clone(&sub);
-        let handle = tokio::spawn(async move {
-            eng.run_delivery_worker(sub_for_task).await;
+        let engine = Arc::clone(self);
+        self.spawn_task(async move {
+            engine.run_delivery_worker(sub).await;
         });
-        *sub.delivery_handle
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(handle);
     }
 
     fn spawn_upstream_consumer(self: &Arc<Self>, sub: Arc<SubRuntime>) {
@@ -1719,7 +1738,7 @@ impl HookdEngine {
             }
         }
         let eng = Arc::clone(self);
-        tokio::spawn(async move {
+        self.spawn_task(async move {
             eng.run_upstream_consumer(sub, rx).await;
         });
     }
@@ -2109,23 +2128,28 @@ impl HookdEngine {
                 continue;
             }
 
-            let (supports_push, input_schema) =
-                match self.resolve_event_for_subscribe(event_name).await {
-                    Ok(EventKind::Upstream {
-                        supports_push,
-                        input_schema,
-                        ..
-                    }) => (supports_push, input_schema),
-                    _ => {
-                        tokio::select! {
-                            () = tokio::time::sleep(Duration::from_millis(300)) => {}
-                            _ = cancel_rx.changed() => return,
-                            _ = consumer_cancel.changed() => return,
-                            _ = shutdown_rx.changed() => return,
-                        }
-                        continue;
+            let resolved_event = tokio::select! {
+                result = self.resolve_event_for_subscribe(event_name) => result,
+                _ = cancel_rx.changed() => return,
+                _ = consumer_cancel.changed() => return,
+                _ = shutdown_rx.changed() => return,
+            };
+            let (supports_push, input_schema) = match resolved_event {
+                Ok(EventKind::Upstream {
+                    supports_push,
+                    input_schema,
+                    ..
+                }) => (supports_push, input_schema),
+                _ => {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                        _ = cancel_rx.changed() => return,
+                        _ = consumer_cancel.changed() => return,
+                        _ = shutdown_rx.changed() => return,
                     }
-                };
+                    continue;
+                }
+            };
 
             let mut use_poll = true;
             if supports_push
@@ -2135,17 +2159,21 @@ impl HookdEngine {
                     let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
                     st.ingest_cursor.clone()
                 };
-                match upstream
-                    .open_event_stream(
-                        event_name,
-                        Some(arguments),
-                        &input_schema,
-                        cursor.as_deref(),
-                        None,
-                        None,
-                    )
-                    .await
-                {
+                let opening_stream = upstream.open_event_stream(
+                    event_name,
+                    Some(arguments),
+                    &input_schema,
+                    cursor.as_deref(),
+                    None,
+                    None,
+                );
+                let opened_stream = tokio::select! {
+                    result = opening_stream => result,
+                    _ = cancel_rx.changed() => return,
+                    _ = consumer_cancel.changed() => return,
+                    _ = shutdown_rx.changed() => return,
+                };
+                match opened_stream {
                     Ok(mut stream) => {
                         use_poll = false;
                         loop {
@@ -2564,7 +2592,7 @@ impl HookdEngine {
             let outbound = self.outbound.clone();
             let url = sub.key.url.clone();
             let sub_id = sub.id.clone();
-            tokio::spawn(async move {
+            self.spawn_task(async move {
                 let wid = format!(
                     "msg_{}",
                     random_base64url(18).unwrap_or_else(|_| "terminated".into())
@@ -2891,7 +2919,6 @@ fn new_sub_runtime(sub: PersistedSubscription, source: SubSource, auth_paused: b
         space_notify: Notify::new(),
         cancel_tx,
         consumer_cancel: Mutex::new(None),
-        delivery_handle: Mutex::new(None),
     }
 }
 
@@ -3013,6 +3040,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
     use tokio_rustls::TlsAcceptor;
     use url::Url;
 
@@ -3338,6 +3366,158 @@ mod tests {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert!(persisted.verified_endpoints.is_empty());
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_forced_delivery_cancellation_before_final_snapshot() {
+        let release_callback = Arc::new(Notify::new());
+        let release = Arc::clone(&release_callback);
+        let callback = spawn_tls_callback(move |_headers, _body| {
+            let release = Arc::clone(&release);
+            async move {
+                release.notified().await;
+                (StatusCode::OK, b"{}".to_vec())
+            }
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("subs.json");
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            base_config(
+                path.clone(),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("producer")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(callback.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let sub = sample_upstream_sub(&callback.url);
+        engine
+            .runtime
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(sub.key.clone(), Arc::clone(&sub));
+        assert!(engine.enqueue_single_upstream_event(
+            &sub,
+            sample_polled_event("inflight", json!({})),
+            Some("c1".into()),
+            None,
+        ));
+        engine.spawn_delivery_worker(Arc::clone(&sub));
+        assert_eq!(wait_for_captured(&callback.captured, 1).await.len(), 1);
+
+        engine.begin_shutdown();
+        assert!(!engine.enqueue_gap(&sub, "late".into(), None));
+        assert!(matches!(
+            engine
+                .ingest_event(
+                    0,
+                    br#"{"eventId":"late","name":"ci.build_failed","data":{"repo":"demo"}}"#
+                )
+                .await,
+            Err(IngestError::ServiceUnavailable(_))
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.shutdown_until(tokio::time::Instant::now()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(engine.tasks.len(), 0);
+        assert_eq!(engine.pools.outbox.used(), 0);
+        assert_eq!(sub.state.lock().unwrap().safe_cursor.as_deref(), Some("c0"));
+        let (_, persisted) = StateStore::open(path).unwrap();
+        assert_eq!(
+            persisted.subscriptions[0].safe_cursor.as_deref(),
+            Some("c0")
+        );
+        release_callback.notify_one();
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_finishing_after_shutdown_cannot_register_a_subscription() {
+        let release_verification = Arc::new(Notify::new());
+        let release = Arc::clone(&release_verification);
+        let callback = spawn_tls_callback(move |_headers, body| {
+            let release = Arc::clone(&release);
+            async move {
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                release.notified().await;
+                (
+                    StatusCode::OK,
+                    json!({"challenge": payload["challenge"]})
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("subs.json");
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            base_config(
+                path.clone(),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("producer")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(callback.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let subscribing_engine = Arc::clone(&engine);
+        let url = callback.url.clone();
+        let subscribe = tokio::spawn(async move {
+            subscribing_engine
+                .subscribe(
+                    &CallerAuth::StaticSlot(0),
+                    SubscribeRequest {
+                        event_name: "ci.build_failed".into(),
+                        arguments: Map::new(),
+                        delivery_mode: "webhook".into(),
+                        delivery_url: url,
+                        delivery_secret: test_secret(15),
+                        ttl_ms: None,
+                        cursor: None,
+                        max_age_ms: None,
+                    },
+                )
+                .await
+        });
+        assert_eq!(wait_for_captured(&callback.captured, 1).await.len(), 1);
+        engine
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .unwrap();
+        release_verification.notify_one();
+        assert!(matches!(
+            subscribe.await.unwrap(),
+            Err(EngineError::ResourceExhausted(_))
+        ));
+        assert_eq!(engine.active_subscription_count(), 0);
+        assert_eq!(engine.tasks.len(), 0);
+        let (_, persisted) = StateStore::open(path).unwrap();
+        assert!(persisted.subscriptions.is_empty());
+        assert!(persisted.verified_endpoints.is_empty());
     }
 
     #[tokio::test]
