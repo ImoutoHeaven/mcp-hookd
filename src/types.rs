@@ -381,7 +381,9 @@ impl SubscriptionKey {
         event_name: impl Into<String>,
         arguments: &Map<String, Value>,
     ) -> Result<Self, String> {
-        let canonical_arguments = canonical_json(&Value::Object(arguments.clone()))?;
+        let arguments = Value::Object(arguments.clone());
+        require_exact_jcs_integers(&arguments)?;
+        let canonical_arguments = canonical_json(&arguments)?;
         Ok(Self {
             principal: principal.into(),
             url: url.into(),
@@ -546,71 +548,39 @@ pub fn normalize_emit_event_id(event_name: &str, raw_id: &str) -> String {
 
 /// RFC 8785 (JCS) canonical JSON serialization for deterministic subscription keys.
 pub fn canonical_json(value: &Value) -> Result<String, String> {
-    let mut out = String::new();
-    write_canonical_json(value, &mut out)?;
-    Ok(out)
+    serde_json_canonicalizer::to_string(value)
+        .map_err(|error| format!("cannot canonicalize subscription arguments: {error}"))
 }
 
-fn write_canonical_json(value: &Value, out: &mut String) -> Result<(), String> {
+fn require_exact_jcs_integers(value: &Value) -> Result<(), String> {
     match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                out.push_str(&i.to_string());
-            } else if let Some(u) = n.as_u64() {
-                out.push_str(&u.to_string());
-            } else if let Some(f) = n.as_f64() {
-                if !f.is_finite() {
-                    return Err("non-finite float in JSON".into());
-                }
-                if f == 0.0 {
-                    out.push('0');
-                } else {
-                    // serde_json uses ryu (ECMAScript-compatible shortest representation).
-                    let s = serde_json::to_string(&f)
-                        .map_err(|e| format!("cannot format number: {e}"))?;
-                    // Strip trailing ".0" for whole numbers to match ES2015 Number.toString.
-                    if let Some(int_part) = s.strip_suffix(".0") {
-                        out.push_str(int_part);
-                    } else {
-                        out.push_str(&s);
-                    }
-                }
+        Value::Number(number) => {
+            // JCS uses binary64; reject integer rounding before it can merge subscription keys.
+            let exact = if let Some(value) = number.as_i64() {
+                (value as f64) as i128 == i128::from(value)
+            } else if let Some(value) = number.as_u64() {
+                (value as f64) as u128 == u128::from(value)
+            } else {
+                true
+            };
+            if !exact {
+                return Err(
+                    "subscription argument integer is not exactly representable as IEEE 754 binary64; use a string"
+                        .into(),
+                );
             }
         }
-        Value::String(s) => {
-            let escaped =
-                serde_json::to_string(s).map_err(|e| format!("cannot format string: {e}"))?;
-            out.push_str(&escaped);
-        }
-        Value::Array(arr) => {
-            out.push('[');
-            for (idx, item) in arr.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                write_canonical_json(item, out)?;
+        Value::Array(values) => {
+            for value in values {
+                require_exact_jcs_integers(value)?;
             }
-            out.push(']');
         }
-        Value::Object(map) => {
-            out.push('{');
-            // RFC 8785 sorts object keys by UTF-16 code units.
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            entries.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
-            for (idx, (k, v)) in entries.into_iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                let escaped =
-                    serde_json::to_string(k).map_err(|e| format!("cannot format key: {e}"))?;
-                out.push_str(&escaped);
-                out.push(':');
-                write_canonical_json(v, out)?;
+        Value::Object(values) => {
+            for value in values.values() {
+                require_exact_jcs_integers(value)?;
             }
-            out.push('}');
         }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
     }
     Ok(())
 }
@@ -630,11 +600,55 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_uses_ecmascript_number_formatting() {
+        let value: Value = serde_json::from_str(
+            "[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001,1e18,1e-6]",
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_json(&value).unwrap(),
+            "[333333333.3333333,1e+30,4.5,0.002,1e-27,1000000000000000000,0.000001]"
+        );
+        let key = |value| {
+            SubscriptionKey::new(
+                "principal",
+                "https://example.com/hook",
+                "build",
+                &Map::from_iter([("n".into(), value)]),
+            )
+        };
+        assert_eq!(
+            key(json!(1_000_000_000_000_000_000u64)).unwrap(),
+            key(json!(1e18)).unwrap()
+        );
+        for value in [
+            json!(9_007_199_254_740_992u64),
+            json!(9_223_372_036_854_775_808u64),
+            json!(-9_223_372_036_854_775_808i64),
+            json!(18_446_744_073_709_549_568u64),
+        ] {
+            assert!(key(value).is_ok());
+        }
+        for value in [
+            json!(9_007_199_254_740_993u64),
+            json!(u64::MAX),
+            json!(i64::MAX),
+            json!({"nested": [i64::MIN + 1]}),
+        ] {
+            assert!(key(value).is_err());
+        }
+    }
+
+    #[test]
     fn canonical_json_sorts_keys_by_utf16_and_normalizes_numbers() {
         let v = json!({"b": 1, "a": [true, null, "x"], "c": -0.0});
         assert_eq!(
             canonical_json(&v).unwrap(),
             r#"{"a":[true,null,"x"],"b":1,"c":0}"#
+        );
+        assert_eq!(
+            canonical_json(&json!({"\u{e000}": 1, "\u{1f600}": 2})).unwrap(),
+            "{\"\u{1f600}\":2,\"\u{e000}\":1}"
         );
     }
 
