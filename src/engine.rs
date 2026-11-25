@@ -3079,6 +3079,7 @@ impl HookdEngine {
 
         if send_terminated && self.config.profile == Profile::Sep3415 {
             let engine = Arc::clone(self);
+            let key = sub.key.clone();
             let url = sub.key.url.clone();
             let sub_id = sub.id.clone();
             self.spawn_task(async move {
@@ -3086,6 +3087,12 @@ impl HookdEngine {
                 if *shutdown.borrow() {
                     return;
                 }
+                let key_lock = engine.key_lock(&key);
+                let _key_guard = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => return,
+                    guard = key_lock.lock() => guard,
+                };
                 let _permit = tokio::select! {
                     biased;
                     _ = shutdown.changed() => return,
@@ -3094,7 +3101,14 @@ impl HookdEngine {
                         Err(_) => return,
                     },
                 };
-                if *shutdown.borrow() {
+                if *shutdown.borrow()
+                    || engine
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .subscriptions
+                        .contains_key(&key)
+                {
                     return;
                 }
                 let wid = format!(
@@ -4285,6 +4299,154 @@ mod tests {
             "terminated",
         );
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn termination_is_ordered_with_same_key_recreation() {
+        let directory = tempfile::TempDir::new().unwrap();
+        for recreation_first in [false, true] {
+            let release = Arc::new(Notify::new());
+            let verification_count = Arc::new(AtomicUsize::new(0));
+            let callback_release = Arc::clone(&release);
+            let callback_verifications = Arc::clone(&verification_count);
+            let callback = spawn_tls_callback(move |_headers, body| {
+                let release = Arc::clone(&callback_release);
+                let verifications = Arc::clone(&callback_verifications);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    if body["type"] == "verification" {
+                        let sequence = verifications.fetch_add(1, Ordering::SeqCst);
+                        if sequence == 1 && recreation_first {
+                            release.notified().await;
+                        }
+                    } else if body["type"] == "terminated" && !recreation_first {
+                        release.notified().await;
+                    }
+                    (
+                        StatusCode::OK,
+                        json!({"challenge": body["challenge"]})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                }
+            })
+            .await;
+            let quotas = test_quotas();
+            let engine = HookdEngine::new(
+                base_config(
+                    directory
+                        .path()
+                        .join(format!("ordered-{recreation_first}.json")),
+                    Profile::Sep3415,
+                    None,
+                    Some(IngestConfig {
+                        tokens: vec![SecretString::new("producer")],
+                        events: vec![sample_ingest_event_cfg()],
+                    }),
+                    None,
+                ),
+                quotas.clone(),
+                MemoryPools::from_quotas(&quotas),
+                Some(loopback_outbound(callback.roots.clone())),
+            )
+            .await
+            .unwrap();
+            let request = SubscribeRequest {
+                event_name: "ci.build_failed".into(),
+                arguments: Map::new(),
+                delivery_mode: "webhook".into(),
+                delivery_url: callback.url.clone(),
+                delivery_secret: test_secret(21),
+                ttl_ms: None,
+                cursor: None,
+                max_age_ms: None,
+            };
+            let first = engine
+                .subscribe(&CallerAuth::StaticSlot(0), request.clone())
+                .await
+                .unwrap();
+            let old = engine
+                .runtime
+                .lock()
+                .unwrap()
+                .subscriptions
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            if !recreation_first {
+                engine.revoke_subscription(&old, true).await;
+                assert_eq!(wait_for_captured(&callback.captured, 2).await.len(), 2);
+            }
+            let subscribing_engine = Arc::clone(&engine);
+            let replacement = tokio::spawn(async move {
+                subscribing_engine
+                    .subscribe(
+                        &CallerAuth::StaticSlot(0),
+                        SubscribeRequest {
+                            delivery_secret: test_secret(22),
+                            ..request
+                        },
+                    )
+                    .await
+            });
+            if recreation_first {
+                assert_eq!(wait_for_captured(&callback.captured, 2).await.len(), 2);
+                engine.revoke_subscription(&old, true).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(callback.captured.lock().await.len(), 2);
+            }
+            release.notify_one();
+            let second = replacement.await.unwrap().unwrap();
+            assert_eq!(first.id, second.id);
+            let current = engine
+                .runtime
+                .lock()
+                .unwrap()
+                .subscriptions
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            assert!(!Arc::ptr_eq(&old, &current));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while engine.tasks.len() != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let expected = if recreation_first {
+                vec!["verification", "verification"]
+            } else {
+                vec!["verification", "terminated", "verification"]
+            };
+            let captured_types: Vec<String> = callback
+                .captured
+                .lock()
+                .await
+                .iter()
+                .map(|request| {
+                    serde_json::from_slice::<Value>(&request.body).unwrap()["type"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(captured_types, expected);
+            engine.ingest_event(
+                0,
+                br#"{"eventId":"replacement_live","name":"ci.build_failed","data":{"repo":"demo"}}"#,
+            ).await.unwrap();
+            let captured = wait_for_captured(&callback.captured, expected.len() + 1).await;
+            assert_eq!(captured.len(), expected.len() + 1);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&captured.last().unwrap().body).unwrap()["eventId"],
+                "replacement_live",
+            );
+            engine.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
