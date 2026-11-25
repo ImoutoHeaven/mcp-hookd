@@ -306,6 +306,11 @@ impl SubRuntime {
         PersistedSubscription {
             id: self.id.clone(),
             key: self.key.clone(),
+            arguments: match &self.source {
+                SubSource::Ingest { arguments, .. } | SubSource::Upstream { arguments, .. } => {
+                    arguments.clone()
+                }
+            },
             auth_ref: st.auth_ref.clone(),
             granted_scopes: st.granted_scopes.clone(),
             secret: st.secret.clone(),
@@ -529,7 +534,7 @@ impl HookdEngine {
 
         let mut subscriptions = HashMap::new();
         for (sub, auth_paused) in kept {
-            let Some(source) = build_sub_source(&config, &sub.key) else {
+            let Some(source) = build_sub_source(&config, &sub.key, &sub.arguments) else {
                 mutated = true;
                 continue;
             };
@@ -1001,6 +1006,7 @@ impl HookdEngine {
             }
         };
 
+        let persisted_arguments = normalized_args.clone();
         let source = if is_ingest {
             let filter_fields = self
                 .find_ingest_event(&req.event_name)
@@ -1020,6 +1026,7 @@ impl HookdEngine {
         let persisted = PersistedSubscription {
             id: sub_id.clone(),
             key: key.clone(),
+            arguments: persisted_arguments,
             auth_ref: resolved.auth_ref,
             granted_scopes: resolved.effective_scopes,
             secret: req.delivery_secret,
@@ -2694,20 +2701,23 @@ fn advance_skipped_cursor(st: &mut SubState, cursor: String) {
     }
 }
 
-fn build_sub_source(config: &Config, key: &SubscriptionKey) -> Option<SubSource> {
-    let args: Map<String, Value> = serde_json::from_str(&key.canonical_arguments).ok()?;
+fn build_sub_source(
+    config: &Config,
+    key: &SubscriptionKey,
+    arguments: &Map<String, Value>,
+) -> Option<SubSource> {
     if let Some(ref ingest) = config.ingest
         && let Some(ev) = ingest.events.iter().find(|e| e.name == key.event_name)
     {
         return Some(SubSource::Ingest {
             filter_fields: ev.filter_fields.clone(),
-            arguments: args,
+            arguments: arguments.clone(),
         });
     }
     if config.upstream.is_some() {
         return Some(SubSource::Upstream {
             event_name: key.event_name.clone(),
-            arguments: args,
+            arguments: arguments.clone(),
         });
     }
     None
@@ -3058,6 +3068,80 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         captured.lock().await.clone()
+    }
+
+    #[test]
+    fn persisted_arguments_do_not_round_trip_through_the_canonical_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let arguments = json!({"limit": 9_223_372_036_854_775_808u64})
+            .as_object()
+            .unwrap()
+            .clone();
+        let key = SubscriptionKey {
+            principal: "static:0".into(),
+            url: "https://hooks.example.com/callback".into(),
+            event_name: "task.exited".into(),
+            canonical_arguments: r#"{"limit":9223372036854776000}"#.into(),
+        };
+        let sub = new_sub_runtime(
+            PersistedSubscription {
+                id: key.subscription_id(),
+                key: key.clone(),
+                arguments: arguments.clone(),
+                auth_ref: None,
+                granted_scopes: Vec::new(),
+                secret: test_secret(3),
+                prev_secret: None,
+                prev_secret_until: None,
+                refresh_before: unix_now() + 1800,
+                safe_cursor: None,
+                pending_truncated_for_refresh: false,
+                suspended: false,
+                last_error: None,
+            },
+            SubSource::Upstream {
+                event_name: key.event_name.clone(),
+                arguments: arguments.clone(),
+            },
+            false,
+        );
+        let path = dir.path().join("subs.json");
+        let (store, _) = StateStore::open(path.clone()).unwrap();
+        store
+            .save(&PersistedState {
+                version: STATE_VERSION,
+                subscriptions: vec![sub.to_persisted()],
+                verified_endpoints: Vec::new(),
+            })
+            .unwrap();
+        let (_, saved) = StateStore::open(path.clone()).unwrap();
+        let saved = &saved.subscriptions[0];
+        assert_eq!(saved.arguments, arguments);
+        let cfg = base_config(
+            path,
+            Profile::Sep3415,
+            Some(UpstreamConfig {
+                url: Url::parse("http://127.0.0.1:1/mcp").unwrap(),
+                bearer_token: None,
+                passthrough_prefixes: Vec::new(),
+                request_timeout_secs: 5,
+                expose_events: Vec::new(),
+            }),
+            None,
+            None,
+        );
+        let Some(SubSource::Upstream {
+            arguments: restored,
+            ..
+        }) = build_sub_source(&cfg, &saved.key, &saved.arguments)
+        else {
+            panic!("missing source")
+        };
+        assert_eq!(restored, arguments);
+        assert_ne!(
+            serde_json::from_str::<Value>(&saved.key.canonical_arguments).unwrap(),
+            Value::Object(restored)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4001,6 +4085,7 @@ mod tests {
                 PersistedSubscription {
                     id: k_ok.subscription_id(),
                     key: k_ok.clone(),
+                    arguments: Map::new(),
                     auth_ref: Some("aref_ok".into()),
                     granted_scopes: vec!["events:read".into()],
                     secret: test_secret(1),
@@ -4015,6 +4100,7 @@ mod tests {
                 PersistedSubscription {
                     id: k_rev.subscription_id(),
                     key: k_rev.clone(),
+                    arguments: Map::new(),
                     auth_ref: Some("aref_revoked".into()),
                     granted_scopes: vec!["events:read".into()],
                     secret: test_secret(2),
@@ -4245,6 +4331,7 @@ mod tests {
             PersistedSubscription {
                 id: key.subscription_id(),
                 key,
+                arguments: Map::new(),
                 auth_ref: None,
                 granted_scopes: Vec::new(),
                 secret: test_secret(12),

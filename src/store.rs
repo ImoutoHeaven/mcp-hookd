@@ -2,6 +2,7 @@
 
 use crate::types::{CallbackErrorReason, SecretString, SubscriptionKey, random_base64url};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ const DEFAULT_GROUP_COMMIT_DEBOUNCE: Duration = Duration::from_millis(25);
 pub struct PersistedSubscription {
     pub id: String,
     pub key: SubscriptionKey,
+    pub arguments: Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_ref: Option<String>,
     #[serde(default)]
@@ -805,6 +807,7 @@ mod tests {
         PersistedSubscription {
             id: key.subscription_id(),
             key,
+            arguments: args,
             auth_ref: Some("aref_user1".into()),
             granted_scopes: vec!["events:read".into()],
             secret: SecretString::new("whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
