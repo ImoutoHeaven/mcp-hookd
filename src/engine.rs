@@ -259,6 +259,12 @@ enum SubSource {
     },
 }
 
+enum DeliveryAuthorization {
+    Ready,
+    Retry,
+    Revoked,
+}
+
 enum OutboxItem {
     Event {
         webhook_id: String,
@@ -319,6 +325,7 @@ struct SubRuntime {
     outbox_notify: Notify,
     space_notify: Notify,
     cancel_tx: watch::Sender<bool>,
+    lease_changed: watch::Sender<()>,
     consumer_cancel: Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -401,6 +408,15 @@ impl RefreshGuard<'_> {
                 message: "subscription was removed while refreshing".into(),
             });
         }
+        if state
+            .pending_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.refresh_before <= unix_now())
+        {
+            return Err(EngineError::ResourceExhausted(
+                "subscription lease expired while refreshing".into(),
+            ));
+        }
         let refresh = state
             .pending_refresh
             .take()
@@ -408,6 +424,7 @@ impl RefreshGuard<'_> {
         let resume_suspended = refresh.resume_suspended && state.suspended;
         let resume_auth = refresh.resume_auth_paused && state.auth_paused;
         state.refresh_before = refresh.refresh_before;
+        self.sub.lease_changed.send_replace(());
         state.secret = refresh.secret;
         state.prev_secret = refresh.prev_secret;
         state.prev_secret_until = refresh.prev_secret_until;
@@ -480,6 +497,11 @@ impl RegistrationGuard<'_> {
                 kind: "subscription",
                 message: "subscription was removed while registering".into(),
             });
+        }
+        if state.refresh_before <= unix_now() {
+            return Err(EngineError::ResourceExhausted(
+                "subscription lease expired while registering".into(),
+            ));
         }
         state.registration_pending = false;
         self.committed = true;
@@ -2009,7 +2031,7 @@ impl HookdEngine {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
-            if *cancel_rx.borrow() {
+            if *cancel_rx.borrow() || self.expire_subscription_if_due(&sub) {
                 break;
             }
 
@@ -2033,6 +2055,7 @@ impl HookdEngine {
                     () = sub.outbox_notify.notified() => {}
                     _ = cancel_rx.changed() => {}
                     _ = shutdown_rx.changed() => {}
+                    () = self.subscription_expired(&sub) => return,
                 }
                 continue;
             };
@@ -2063,7 +2086,6 @@ impl HookdEngine {
                             "msg_{}",
                             random_base64url(18).unwrap_or_else(|_| "gap".into())
                         );
-                        let (secret, prev_secret) = active_secrets(&sub);
                         let _permit = tokio::select! {
                             res = self.global_delivery_sem.acquire() => match res {
                                 Ok(p) => p,
@@ -2071,18 +2093,33 @@ impl HookdEngine {
                             },
                             _ = cancel_rx.changed() => return,
                             _ = shutdown_rx.changed() => return,
+                            () = self.subscription_expired(&sub) => return,
                         };
-                        let _ = self
-                            .outbound
-                            .post_webhook(
+                        match self
+                            .delivery_authorization(&sub, &mut cancel_rx, &mut shutdown_rx)
+                            .await
+                        {
+                            DeliveryAuthorization::Ready => {}
+                            DeliveryAuthorization::Retry => continue,
+                            DeliveryAuthorization::Revoked => return,
+                        }
+                        if self.expire_subscription_if_due(&sub) {
+                            return;
+                        }
+                        let (secret, prev_secret) = active_secrets(&sub);
+                        tokio::select! {
+                            biased;
+                            () = self.subscription_expired(&sub) => return,
+                            _ = cancel_rx.changed() => return,
+                            _ = self.outbound.post_webhook(
                                 &sub.key.url,
                                 &sub.id,
                                 &wid,
                                 body.as_bytes(),
                                 &secret,
                                 prev_secret.as_ref(),
-                            )
-                            .await;
+                            ) => {}
+                        }
                     }
                     let should_notify_space = {
                         let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -2119,6 +2156,26 @@ impl HookdEngine {
                             return;
                         }
 
+                        let _permit = tokio::select! {
+                            res = self.global_delivery_sem.acquire() => match res {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            },
+                            _ = cancel_rx.changed() => return,
+                            _ = shutdown_rx.changed() => return,
+                            () = self.subscription_expired(&sub) => return,
+                        };
+                        match self
+                            .delivery_authorization(&sub, &mut cancel_rx, &mut shutdown_rx)
+                            .await
+                        {
+                            DeliveryAuthorization::Ready => {}
+                            DeliveryAuthorization::Retry => continue,
+                            DeliveryAuthorization::Revoked => return,
+                        }
+                        if self.expire_subscription_if_due(&sub) {
+                            return;
+                        }
                         let (secret, prev_secret, safe_cursor, is_suspended) = {
                             let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
                             let now = unix_now();
@@ -2150,25 +2207,19 @@ impl HookdEngine {
                             payload_cursor,
                         );
 
-                        let _permit = tokio::select! {
-                            res = self.global_delivery_sem.acquire() => match res {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            },
+                        let outcome = tokio::select! {
+                            biased;
+                            () = self.subscription_expired(&sub) => return,
                             _ = cancel_rx.changed() => return,
-                            _ = shutdown_rx.changed() => return,
-                        };
-                        let outcome = self
-                            .outbound
-                            .post_webhook(
+                            outcome = self.outbound.post_webhook(
                                 &sub.key.url,
                                 &sub.id,
                                 &webhook_id,
                                 body.as_bytes(),
                                 &secret,
                                 prev_secret.as_ref(),
-                            )
-                            .await;
+                            ) => outcome,
+                        };
                         drop(_permit);
 
                         match outcome {
@@ -2268,10 +2319,11 @@ impl HookdEngine {
                                 let delay = backoff_with_jitter(self.quotas.retry_base_ms, attempt);
                                 attempt += 1;
                                 tokio::select! {
-                                    () = tokio::time::sleep(delay) => {}
-                                    _ = cancel_rx.changed() => return,
-                                    _ = shutdown_rx.changed() => return,
-                                }
+                                        () = tokio::time::sleep(delay) => {}
+                                        _ = cancel_rx.changed() => return,
+                                        _ = shutdown_rx.changed() => return,
+                                () = self.subscription_expired(&sub) => return,
+                                    }
                             }
                         }
                     }
@@ -2287,45 +2339,70 @@ impl HookdEngine {
         cancel_rx: &mut watch::Receiver<bool>,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> bool {
-        let Some(ref client) = self.auth_client else {
-            return true;
-        };
-        let (auth_ref, granted_scopes) = {
-            let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-            (st.auth_ref.clone(), st.granted_scopes.clone())
-        };
-        let Some(aref) = auth_ref else {
-            self.revoke_subscription(&sub.key, true).await;
-            return false;
-        };
-
         loop {
-            if *cancel_rx.borrow() {
-                return false;
-            }
-            match client.check_cached(&aref).await {
-                AuthCheckOutcome::Active(checked) => {
-                    if scopes_subset(&granted_scopes, &checked.scopes) {
-                        return true;
-                    }
-                    self.revoke_subscription(&sub.key, true).await;
-                    return false;
-                }
-                AuthCheckOutcome::Inactive => {
-                    self.revoke_subscription(&sub.key, true).await;
-                    return false;
-                }
-                AuthCheckOutcome::TransientError(_) => {
+            match self
+                .delivery_authorization(sub, cancel_rx, shutdown_rx)
+                .await
+            {
+                DeliveryAuthorization::Ready => return true,
+                DeliveryAuthorization::Revoked => return false,
+                DeliveryAuthorization::Retry => {
                     if *shutdown_rx.borrow() {
                         return false;
                     }
-                    let wait = client.reverify_interval().min(Duration::from_secs(2));
+                    let wait = self
+                        .auth_client
+                        .as_ref()
+                        .map_or(Duration::from_secs(2), |client| {
+                            client.reverify_interval().min(Duration::from_secs(2))
+                        });
                     tokio::select! {
                         () = tokio::time::sleep(wait) => {}
                         _ = cancel_rx.changed() => return false,
                         _ = shutdown_rx.changed() => return false,
+                        () = self.subscription_expired(sub) => return false,
                     }
                 }
+            }
+        }
+    }
+
+    async fn delivery_authorization(
+        self: &Arc<Self>,
+        sub: &Arc<SubRuntime>,
+        cancel_rx: &mut watch::Receiver<bool>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> DeliveryAuthorization {
+        if *cancel_rx.borrow() || self.expire_subscription_if_due(sub) {
+            return DeliveryAuthorization::Revoked;
+        }
+        let Some(ref client) = self.auth_client else {
+            return DeliveryAuthorization::Ready;
+        };
+        let (auth_ref, granted_scopes) = {
+            let state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+            (state.auth_ref.clone(), state.granted_scopes.clone())
+        };
+        let Some(auth_ref) = auth_ref else {
+            self.revoke_subscription(&sub.key, true).await;
+            return DeliveryAuthorization::Revoked;
+        };
+        let checked = tokio::select! {
+            checked = client.check_cached(&auth_ref) => checked,
+            _ = cancel_rx.changed() => return DeliveryAuthorization::Revoked,
+            _ = shutdown_rx.changed() => return DeliveryAuthorization::Revoked,
+            () = self.subscription_expired(sub) => return DeliveryAuthorization::Revoked,
+        };
+        match checked {
+            AuthCheckOutcome::Active(checked)
+                if scopes_subset(&granted_scopes, &checked.scopes) =>
+            {
+                DeliveryAuthorization::Ready
+            }
+            AuthCheckOutcome::TransientError(_) => DeliveryAuthorization::Retry,
+            AuthCheckOutcome::Active(_) | AuthCheckOutcome::Inactive => {
+                self.revoke_subscription(&sub.key, true).await;
+                DeliveryAuthorization::Revoked
             }
         }
     }
@@ -2351,7 +2428,11 @@ impl HookdEngine {
         let mut backpressure_paused = false;
 
         loop {
-            if *cancel_rx.borrow() || *consumer_cancel.borrow() || *shutdown_rx.borrow() {
+            if *cancel_rx.borrow()
+                || *consumer_cancel.borrow()
+                || *shutdown_rx.borrow()
+                || self.expire_subscription_if_due(&sub)
+            {
                 return;
             }
 
@@ -2387,6 +2468,7 @@ impl HookdEngine {
                     _ = cancel_rx.changed() => return,
                     _ = consumer_cancel.changed() => return,
                     _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                 }
                 continue;
             }
@@ -2396,6 +2478,7 @@ impl HookdEngine {
                 _ = cancel_rx.changed() => return,
                 _ = consumer_cancel.changed() => return,
                 _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
             };
             let (supports_push, supports_poll, input_schema) = match resolved_event {
                 Ok(EventKind::Upstream {
@@ -2410,6 +2493,7 @@ impl HookdEngine {
                         _ = cancel_rx.changed() => return,
                         _ = consumer_cancel.changed() => return,
                         _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                     }
                     continue;
                 }
@@ -2421,6 +2505,7 @@ impl HookdEngine {
                     _ = cancel_rx.changed() => return,
                     _ = consumer_cancel.changed() => return,
                     _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                 }
                 continue;
             }
@@ -2445,6 +2530,7 @@ impl HookdEngine {
                         _ = cancel_rx.changed() => return,
                         _ = consumer_cancel.changed() => return,
                         _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                     };
                     match opened_stream {
                         Ok(stream) => {
@@ -2460,11 +2546,12 @@ impl HookdEngine {
                         Err(_) => {
                             use_poll = false;
                             tokio::select! {
-                                () = tokio::time::sleep(Duration::from_millis(300)) => {}
-                                _ = cancel_rx.changed() => return,
-                                _ = consumer_cancel.changed() => return,
-                                _ = shutdown_rx.changed() => return,
-                            }
+                                        () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                                        _ = cancel_rx.changed() => return,
+                                        _ = consumer_cancel.changed() => return,
+                                        _ = shutdown_rx.changed() => return,
+                            () = self.subscription_expired(&sub) => return,
+                                    }
                         }
                     }
                 } else if !supports_poll {
@@ -2473,6 +2560,7 @@ impl HookdEngine {
                         _ = cancel_rx.changed() => return,
                         _ = consumer_cancel.changed() => return,
                         _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                     }
                 }
             }
@@ -2489,6 +2577,7 @@ impl HookdEngine {
                         _ = cancel_rx.changed() => return,
                         _ = consumer_cancel.changed() => return,
                         _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                     };
                     match next {
                         Ok(Some(UpstreamStreamFrame::Active {
@@ -2566,6 +2655,7 @@ impl HookdEngine {
                         _ = cancel_rx.changed() => return,
                         _ = consumer_cancel.changed() => return,
                         _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                     }
                 }
             }
@@ -2595,6 +2685,7 @@ impl HookdEngine {
                     _ = cancel_rx.changed() => return,
                     _ = consumer_cancel.changed() => return,
                     _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                 };
                 match poll_res {
                     Ok(resp) => {
@@ -2622,20 +2713,22 @@ impl HookdEngine {
                         if !backpressure_paused && !resp.has_more {
                             let sleep_ms = resp.next_poll_ms.clamp(20, 60_000);
                             tokio::select! {
-                                () = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-                                _ = cancel_rx.changed() => return,
-                                _ = consumer_cancel.changed() => return,
-                                _ = shutdown_rx.changed() => return,
-                            }
+                                        () = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+                                        _ = cancel_rx.changed() => return,
+                                        _ = consumer_cancel.changed() => return,
+                                        _ = shutdown_rx.changed() => return,
+                            () = self.subscription_expired(&sub) => return,
+                                    }
                         }
                     }
                     Err(_) => {
                         tokio::select! {
-                            () = tokio::time::sleep(Duration::from_millis(300)) => {}
-                            _ = cancel_rx.changed() => return,
-                            _ = consumer_cancel.changed() => return,
-                            _ = shutdown_rx.changed() => return,
-                        }
+                                () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                                _ = cancel_rx.changed() => return,
+                                _ = consumer_cancel.changed() => return,
+                                _ = shutdown_rx.changed() => return,
+                        () = self.subscription_expired(&sub) => return,
+                            }
                     }
                 }
             }
@@ -2646,7 +2739,57 @@ impl HookdEngine {
                     _ = cancel_rx.changed() => return,
                     _ = consumer_cancel.changed() => return,
                     _ = shutdown_rx.changed() => return,
+                    () = self.subscription_expired(&sub) => return,
                 }
+            }
+        }
+    }
+
+    fn expire_subscription_if_due(&self, sub: &SubRuntime) -> bool {
+        let mut runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.removed {
+            return true;
+        }
+        if state.refresh_before > unix_now() {
+            return false;
+        }
+        state.removed = true;
+        state.outbox.clear();
+        sub.stop_consumer_locked(&mut state);
+        sub.cancel_tx.send_replace(true);
+        drop(state);
+        if runtime
+            .subscriptions
+            .get(&sub.key)
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), sub))
+        {
+            runtime.subscriptions.remove(&sub.key);
+            self.store.mark_dirty(runtime.snapshot());
+        }
+        sub.outbox_notify.notify_waiters();
+        sub.space_notify.notify_waiters();
+        true
+    }
+
+    async fn subscription_expired(&self, sub: &SubRuntime) {
+        let mut changed = sub.lease_changed.subscribe();
+        loop {
+            if self.expire_subscription_if_due(sub) {
+                return;
+            }
+            let expires = sub
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .refresh_before;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let remaining = Duration::from_secs(expires).saturating_sub(now);
+            tokio::select! {
+                () = tokio::time::sleep(remaining) => {}
+                _ = changed.changed() => {}
             }
         }
     }
@@ -3182,6 +3325,7 @@ fn build_sub_source(
 
 fn new_sub_runtime(sub: PersistedSubscription, source: SubSource, auth_paused: bool) -> SubRuntime {
     let (cancel_tx, _) = watch::channel(false);
+    let (lease_changed, _) = watch::channel(());
     SubRuntime {
         id: sub.id,
         key: sub.key,
@@ -3209,6 +3353,7 @@ fn new_sub_runtime(sub: PersistedSubscription, source: SubSource, auth_paused: b
         outbox_notify: Notify::new(),
         space_notify: Notify::new(),
         cancel_tx,
+        lease_changed,
         consumer_cancel: Mutex::new(None),
     }
 }
@@ -3737,6 +3882,130 @@ mod tests {
         );
         release_callback.notify_one();
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_lease_changes_interrupt_idle_permit_and_post_waits() {
+        let release_callback = Arc::new(Notify::new());
+        let release = Arc::clone(&release_callback);
+        let callback = spawn_tls_callback(move |_headers, _body| {
+            let release = Arc::clone(&release);
+            async move {
+                release.notified().await;
+                (StatusCode::OK, b"{}".to_vec())
+            }
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        for scenario in 0..3 {
+            let mut quotas = test_quotas();
+            quotas.max_global_deliveries = 1;
+            let engine = HookdEngine::new(
+                base_config(
+                    directory.path().join(format!("lease-{scenario}.json")),
+                    Profile::Sep3415,
+                    None,
+                    Some(IngestConfig {
+                        tokens: vec![SecretString::new("producer")],
+                        events: vec![sample_ingest_event_cfg()],
+                    }),
+                    None,
+                ),
+                quotas.clone(),
+                MemoryPools::from_quotas(&quotas),
+                Some(loopback_outbound(callback.roots.clone())),
+            )
+            .await
+            .unwrap();
+            let sub = sample_upstream_sub(&callback.url);
+            let initial_expiry = unix_now() + if scenario == 2 { 2 } else { 30 };
+            sub.state.lock().unwrap().refresh_before = initial_expiry;
+            engine
+                .runtime
+                .lock()
+                .unwrap()
+                .subscriptions
+                .insert(sub.key.clone(), Arc::clone(&sub));
+            let held_capacity = if scenario == 0 {
+                Some(
+                    Arc::clone(&engine.global_delivery_sem)
+                        .acquire_owned()
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if scenario != 2 {
+                assert!(engine.enqueue_single_upstream_event(
+                    &sub,
+                    sample_polled_event("lease_event", json!({})),
+                    Some("c1".into()),
+                    None,
+                ));
+            }
+            engine.spawn_delivery_worker(Arc::clone(&sub));
+            if scenario == 1 {
+                assert_eq!(wait_for_captured(&callback.captured, 1).await.len(), 1);
+            } else {
+                tokio::task::yield_now().await;
+            }
+            if scenario == 2 {
+                sub.state.lock().unwrap().refresh_before = unix_now() + 30;
+                sub.lease_changed.send_replace(());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap();
+                tokio::time::sleep(
+                    Duration::from_secs(initial_expiry).saturating_sub(now)
+                        + Duration::from_millis(30),
+                )
+                .await;
+                assert_eq!(engine.active_subscription_count(), 1);
+            }
+            sub.state.lock().unwrap().refresh_before = unix_now() + u64::from(scenario == 0);
+            sub.lease_changed.send_replace(());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while engine.active_subscription_count() != 0 || engine.tasks.len() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(engine.pools.outbox.used(), 0);
+            assert_eq!(sub.state.lock().unwrap().safe_cursor.as_deref(), Some("c0"));
+            if scenario == 0 {
+                assert!(callback.captured.lock().await.is_empty());
+            } else if scenario == 1 {
+                release_callback.notify_one();
+            }
+            drop(held_capacity);
+
+            let replacement = sample_upstream_sub(&callback.url);
+            engine
+                .runtime
+                .lock()
+                .unwrap()
+                .subscriptions
+                .insert(replacement.key.clone(), Arc::clone(&replacement));
+            {
+                let mut old = sub.state.lock().unwrap();
+                old.removed = false;
+                old.refresh_before = 0;
+            }
+            assert!(engine.expire_subscription_if_due(&sub));
+            assert!(Arc::ptr_eq(
+                engine
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .subscriptions
+                    .get(&replacement.key)
+                    .unwrap(),
+                &replacement,
+            ));
+            engine.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -5266,6 +5535,20 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                    if scenario == 0 {
+                        sub.state.lock().unwrap().refresh_before = unix_now();
+                        sub.lease_changed.send_replace(());
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            while engine.active_subscription_count() != 0
+                                || engine.upstream_stream_sem.available_permits()
+                                    != quotas.max_upstream_streams
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    }
                 }
                 1 => {
                     assert!(matches!(result, Err(EngineError::ResourceExhausted(_))));
