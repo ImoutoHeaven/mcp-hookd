@@ -305,6 +305,7 @@ struct SubState {
     refresh_before: u64,
     safe_cursor: Option<String>,
     ingest_cursor: Option<String>,
+    poll_not_before: Option<(Instant, Duration)>,
     pending_truncated_for_refresh: bool,
     suspended: bool,
     last_error: Option<CallbackErrorReason>,
@@ -1165,6 +1166,7 @@ impl HookdEngine {
         // Bootstrap cursor and optional replay batch for upstream bridge events.
         let mut started_stream = None;
         let mut stream_cursor = None;
+        let mut poll_not_before = None;
         let push_only = matches!(
             event_kind,
             EventKind::Upstream {
@@ -1204,6 +1206,9 @@ impl HookdEngine {
                 )
                 .await
                 .map_err(map_upstream_subscribe_error)?;
+            if !poll.has_more {
+                poll_not_before = Some((Instant::now(), Duration::from_millis(poll.next_poll_ms)));
+            }
 
             if poll.truncated || poll.events.is_empty() {
                 let head = poll.cursor.or(req.cursor.clone());
@@ -1253,6 +1258,10 @@ impl HookdEngine {
         };
 
         let sub = Arc::new(new_sub_runtime(persisted, source, false));
+        sub.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .poll_not_before = poll_not_before;
         if push_only {
             sub.state
                 .lock()
@@ -2677,6 +2686,33 @@ impl HookdEngine {
             }
 
             if use_poll {
+                loop {
+                    let remaining = sub
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .poll_not_before
+                        .map_or(Duration::ZERO, |(response_at, interval)| {
+                            interval.saturating_sub(response_at.elapsed())
+                        });
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(remaining) => {}
+                        _ = cancel_rx.changed() => return,
+                        _ = consumer_cancel.changed() => return,
+                        _ = shutdown_rx.changed() => return,
+                        () = self.subscription_expired(&sub) => return,
+                    }
+                }
+                if *cancel_rx.borrow()
+                    || *consumer_cancel.borrow()
+                    || *shutdown_rx.borrow()
+                    || self.expire_subscription_if_due(&sub)
+                {
+                    return;
+                }
                 let cursor = {
                     let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
                     st.ingest_cursor.clone()
@@ -2705,6 +2741,15 @@ impl HookdEngine {
                 };
                 match poll_res {
                     Ok(resp) => {
+                        {
+                            let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                            if !self.sub_accepts_events(&state, Some(&consumer_cancel)) {
+                                return;
+                            }
+                            state.poll_not_before = (!resp.has_more).then(|| {
+                                (Instant::now(), Duration::from_millis(resp.next_poll_ms))
+                            });
+                        }
                         if resp.truncated {
                             if let Some(c) = resp.cursor
                                 && !self.enqueue_gap(&sub, c, Some(&consumer_cancel))
@@ -2724,17 +2769,6 @@ impl HookdEngine {
                             Some(&consumer_cancel),
                         ) {
                             backpressure_paused = true;
-                        }
-
-                        if !backpressure_paused && !resp.has_more {
-                            let sleep_ms = resp.next_poll_ms.clamp(20, 60_000);
-                            tokio::select! {
-                                        () = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-                                        _ = cancel_rx.changed() => return,
-                                        _ = consumer_cancel.changed() => return,
-                                        _ = shutdown_rx.changed() => return,
-                            () = self.subscription_expired(&sub) => return,
-                                    }
                         }
                     }
                     Err(_) => {
@@ -3372,6 +3406,7 @@ fn new_sub_runtime(sub: PersistedSubscription, source: SubSource, auth_paused: b
             refresh_before: sub.refresh_before,
             ingest_cursor: sub.safe_cursor.clone(),
             safe_cursor: sub.safe_cursor,
+            poll_not_before: None,
             pending_truncated_for_refresh: sub.pending_truncated_for_refresh,
             suspended: sub.suspended,
             last_error: sub.last_error,
