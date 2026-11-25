@@ -171,6 +171,12 @@ fn append_response(buf: &mut LeasedBuffer, bytes: &[u8]) -> Result<(), UpstreamE
     }
 }
 
+fn encode_request_body(value: &Value, budget: &Arc<ByteBudget>) -> Result<Bytes, UpstreamError> {
+    let mut out = response_buffer(budget);
+    serde_json::to_writer(&mut out, value).map_err(|err| UpstreamError::Http(err.to_string()))?;
+    Ok(out.into_bytes())
+}
+
 fn sse_text(buffer: LeasedBuffer) -> Result<SseText, UpstreamError> {
     let (text, lease) = buffer
         .into_text()
@@ -322,10 +328,15 @@ pub struct UpstreamClient {
     default_timeout: Duration,
     req_counter: Arc<AtomicU64>,
     proxy_budget: Arc<ByteBudget>,
+    control_budget: Arc<ByteBudget>,
 }
 
 impl UpstreamClient {
-    pub fn new(config: &UpstreamConfig, proxy_budget: Arc<ByteBudget>) -> Result<Self, String> {
+    pub fn new(
+        config: &UpstreamConfig,
+        proxy_budget: Arc<ByteBudget>,
+        control_budget: Arc<ByteBudget>,
+    ) -> Result<Self, String> {
         let authority = url_authority(&config.url)?;
         let origin_base = format!("{}://{authority}", config.url.scheme());
 
@@ -363,6 +374,7 @@ impl UpstreamClient {
             default_timeout: Duration::from_secs(config.request_timeout_secs),
             req_counter: Arc::new(AtomicU64::new(1)),
             proxy_budget,
+            control_budget,
         })
     }
 
@@ -499,12 +511,14 @@ impl UpstreamClient {
     ) -> Result<bool, UpstreamError> {
         let rand_hex = random_hex(16).map_err(UpstreamError::Http)?;
         let ping_id = format!("hookd_ping_{rand_hex}");
-        let payload = serde_json::to_vec(&json!({
-            "jsonrpc": "2.0",
-            "id": ping_id,
-            "method": "ping"
-        }))
-        .map_err(|e| UpstreamError::Http(e.to_string()))?;
+        let payload = encode_request_body(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": ping_id,
+                "method": "ping"
+            }),
+            &self.control_budget,
+        )?;
 
         let mut inbound = HeaderMap::new();
         inbound.insert(
@@ -535,7 +549,7 @@ impl UpstreamClient {
                 Method::POST,
                 None,
                 &inbound,
-                Full::new(Bytes::from(payload)),
+                Full::new(payload),
                 true,
                 Some(PING_TIMEOUT),
             )
@@ -558,7 +572,7 @@ impl UpstreamClient {
                 resp.into_body(),
                 MAX_PING_BODY_BYTES,
                 remaining,
-                &self.proxy_budget,
+                &self.control_budget,
             )
             .await?
         } else {
@@ -566,7 +580,7 @@ impl UpstreamClient {
                 resp.into_body(),
                 MAX_PING_BODY_BYTES,
                 remaining,
-                &self.proxy_budget,
+                &self.control_budget,
             )
             .await?;
             serde_json::from_slice::<Value>(&bytes).map_err(|e| {
@@ -721,20 +735,22 @@ impl UpstreamClient {
         let routing = build_event_routing_headers(name, arguments, input_schema)
             .map_err(UpstreamError::Http)?;
         let inbound = build_modern_request_headers("events/stream", &routing)?;
-        let body = serde_json::to_vec(&json!({
-            "jsonrpc": "2.0",
-            "id": self.next_id("hookd_stream"),
-            "method": "events/stream",
-            "params": Value::Object(params),
-        }))
-        .map_err(|e| UpstreamError::Http(e.to_string()))?;
+        let body = encode_request_body(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": self.next_id("hookd_stream"),
+                "method": "events/stream",
+                "params": Value::Object(params),
+            }),
+            &self.proxy_budget,
+        )?;
 
         let resp = self
             .forward_raw(
                 Method::POST,
                 None,
                 &inbound,
-                Full::new(Bytes::from(body)),
+                Full::new(body),
                 true,
                 Some(self.default_timeout),
             )
@@ -773,13 +789,15 @@ impl UpstreamClient {
         extra_headers: &[(HeaderName, HeaderValue)],
     ) -> Result<Value, UpstreamError> {
         let inbound = build_modern_request_headers(method, extra_headers)?;
-        let body = serde_json::to_vec(&json!({
-            "jsonrpc": "2.0",
-            "id": self.next_id("hookd_rpc"),
-            "method": method,
-            "params": params,
-        }))
-        .map_err(|e| UpstreamError::Http(e.to_string()))?;
+        let body = encode_request_body(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": self.next_id("hookd_rpc"),
+                "method": method,
+                "params": params,
+            }),
+            &self.proxy_budget,
+        )?;
 
         let deadline = tokio::time::Instant::now() + self.default_timeout;
         let resp = self
@@ -787,7 +805,7 @@ impl UpstreamClient {
                 Method::POST,
                 None,
                 &inbound,
-                Full::new(Bytes::from(body)),
+                Full::new(body),
                 true,
                 Some(self.default_timeout),
             )
@@ -1321,7 +1339,12 @@ mod tests {
             request_timeout_secs: 10,
             expose_events: vec![],
         };
-        UpstreamClient::new(&cfg, ByteBudget::new(crate::types::PROXY_BYTE_BUDGET)).unwrap()
+        UpstreamClient::new(
+            &cfg,
+            ByteBudget::new(crate::types::PROXY_BYTE_BUDGET),
+            ByteBudget::new(crate::types::CONTROL_BYTE_BUDGET),
+        )
+        .unwrap()
     }
 
     struct OpenSseBody(std::collections::VecDeque<Bytes>);
@@ -1361,6 +1384,50 @@ mod tests {
             }
             assert_eq!(data, ["first", "second\nline"], "split at {split}");
         }
+    }
+
+    #[tokio::test]
+    async fn session_ping_uses_control_budget_when_proxy_pool_is_full() {
+        let (url, _srv) = spawn_mock_server(|req| async {
+            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": {}});
+            Response::new(Full::new(Bytes::from(
+                serde_json::to_vec(&response).unwrap(),
+            )))
+        })
+        .await;
+        let client = make_client(url, None);
+        let reserved = client
+            .proxy_budget
+            .try_acquire(client.proxy_budget.limit())
+            .unwrap();
+        assert!(
+            client
+                .ping_session("session", Some("2025-11-25"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(client.control_budget.used(), 0);
+        drop(reserved);
+    }
+
+    #[test]
+    fn serialized_request_keeps_its_capacity_lease_while_hyper_holds_bytes() {
+        let budget = ByteBudget::new(128);
+        let body = encode_request_body(
+            &json!({"jsonrpc": "2.0", "method": "events/poll", "params": {"name": "changes"}}),
+            &budget,
+        )
+        .unwrap();
+        let retained = body.clone();
+        drop(body);
+        assert!(budget.used() >= retained.len());
+        let reserved = budget.try_acquire(budget.limit() - budget.used()).unwrap();
+        assert!(encode_request_body(&json!({"method": "ping"}), &budget).is_err());
+        drop(reserved);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
