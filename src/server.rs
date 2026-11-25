@@ -275,6 +275,28 @@ impl RunningServer {
     }
 }
 
+const EARLY_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const EARLY_CLOSE_DRAIN_MAX_BYTES: usize = 512 * 1024;
+
+/// Perform a bounded 100ms / 512 KiB RFC 9112 section 9.6 half-close drain before dropping
+/// the socket so unread client body bytes do not trigger a kernel TCP RST that wipes an early HTTP reply.
+async fn drain_half_closed(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = tokio::time::timeout(EARLY_CLOSE_DRAIN_TIMEOUT, async {
+        let _ = stream.shutdown().await;
+        let mut scratch = [0u8; 8192];
+        let mut drained = 0usize;
+        while drained < EARLY_CLOSE_DRAIN_MAX_BYTES {
+            let cap = (EARLY_CLOSE_DRAIN_MAX_BYTES - drained).min(scratch.len());
+            match stream.read(&mut scratch[..cap]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    })
+    .await;
+}
+
 /// Bind `config.listen`, initialize `HookdEngine`, and start serving HTTP/1.1 requests.
 pub async fn start_server(
     config: Config,
@@ -321,7 +343,7 @@ async fn start_server_with_limits(
                 _ = accept_cancel.cancelled() => break,
                 res = listener.accept() => res,
             };
-            let Ok((stream, _peer)) = accepted else {
+            let Ok((mut stream, _peer)) = accepted else {
                 tokio::select! {
                     _ = accept_cancel.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -341,53 +363,59 @@ async fn start_server_with_limits(
 
             accept_tracker.spawn(async move {
                 let _permit = permit;
-                let io = TokioIo::new(stream);
-                let svc = service_fn(move |req| {
-                    svc_activity.in_flight.fetch_add(1, Ordering::AcqRel);
-                    let req_guard = ActiveReqGuard {
-                        activity: Arc::clone(&svc_activity),
-                    };
-                    let state = Arc::clone(&state);
-                    async move {
-                        let resp = handle_request(state, req).await;
-                        let wrapped = resp.map(|body| {
-                            ActiveRespBody {
-                                inner: body,
-                                guard: Some(req_guard),
+                {
+                    let io = TokioIo::new(&mut stream);
+                    let svc = service_fn(move |req| {
+                        svc_activity.in_flight.fetch_add(1, Ordering::AcqRel);
+                        let req_guard = ActiveReqGuard {
+                            activity: Arc::clone(&svc_activity),
+                        };
+                        let state = Arc::clone(&state);
+                        async move {
+                            let resp = handle_request(state, req).await;
+                            let wrapped = resp.map(|body| {
+                                ActiveRespBody {
+                                    inner: body,
+                                    guard: Some(req_guard),
+                                }
+                                .boxed()
+                            });
+                            Ok::<_, Infallible>(wrapped)
+                        }
+                    });
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .half_close(true)
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(limits.header_read_timeout);
+                    let conn = builder.serve_connection(io, svc);
+                    let idle_expired = wait_for_conn_idle(&activity, limits.idle_keepalive_timeout);
+                    tokio::pin!(conn);
+                    tokio::pin!(idle_expired);
+                    tokio::select! {
+                        biased;
+                        _ = conn_force_cancel.cancelled() => {}
+                        _ = conn.as_mut() => {}
+                        _ = &mut idle_expired => {
+                            conn.as_mut().graceful_shutdown();
+                            tokio::select! {
+                                biased;
+                                _ = conn_force_cancel.cancelled() => {}
+                                _ = tokio::time::timeout(limits.header_read_timeout, conn.as_mut()) => {}
                             }
-                            .boxed()
-                        });
-                        Ok::<_, Infallible>(wrapped)
-                    }
-                });
-                let mut builder = http1::Builder::new();
-                builder
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(limits.header_read_timeout);
-                let conn = builder.serve_connection(io, svc);
-                let idle_expired = wait_for_conn_idle(&activity, limits.idle_keepalive_timeout);
-                tokio::pin!(conn);
-                tokio::pin!(idle_expired);
-                tokio::select! {
-                    biased;
-                    _ = conn_force_cancel.cancelled() => {}
-                    _ = conn.as_mut() => {}
-                    _ = &mut idle_expired => {
-                        conn.as_mut().graceful_shutdown();
-                        tokio::select! {
-                            biased;
-                            _ = conn_force_cancel.cancelled() => {}
-                            _ = tokio::time::timeout(limits.header_read_timeout, conn.as_mut()) => {}
+                        }
+                        _ = conn_cancel.cancelled() => {
+                            conn.as_mut().graceful_shutdown();
+                            tokio::select! {
+                                biased;
+                                _ = conn_force_cancel.cancelled() => {}
+                                _ = conn.as_mut() => {}
+                            }
                         }
                     }
-                    _ = conn_cancel.cancelled() => {
-                        conn.as_mut().graceful_shutdown();
-                        tokio::select! {
-                            biased;
-                            _ = conn_force_cancel.cancelled() => {}
-                            _ = conn => {}
-                        }
-                    }
+                }
+                if !conn_force_cancel.is_cancelled() {
+                    drain_half_closed(&mut stream).await;
                 }
             });
         }
@@ -4511,36 +4539,99 @@ mod tests {
         assert_eq!(n_eof, 0, "expected idle keep-alive connection to be reaped");
 
         // 4. Cross-chunk cutover aborts restore exact HTTP statuses (400 -32600, 413, and 408) instead of 502.
+        fn complete_http_len(buf: &[u8]) -> Option<usize> {
+            let hdr_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+            let hdr_str = std::str::from_utf8(&buf[..hdr_end]).ok()?;
+            let mut content_len = 0usize;
+            for line in hdr_str.lines().skip(1) {
+                if let Some((name, val)) = line.split_once(':')
+                    && name.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_len = val.trim().parse::<usize>().ok()?;
+                }
+            }
+            Some(hdr_end + content_len)
+        }
+
         let send_split_chunked = |chunk1: &[u8], pause_ms: u64, chunk2: Option<&[u8]>| {
             let chunk1 = chunk1.to_vec();
             let chunk2 = chunk2.map(|b| b.to_vec());
             async move {
-                let mut conn = TcpStream::connect(addr).await.unwrap();
+                let conn = TcpStream::connect(addr).await.unwrap();
                 let _ = conn.set_nodelay(true);
-                conn.write_all(
+                let (mut rd, mut wr) = conn.into_split();
+                let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let done_rd = Arc::clone(&done);
+                let done_notify = Arc::new(Notify::new());
+                let done_notify_rd = Arc::clone(&done_notify);
+
+                let reader = tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(512);
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        if let Some(need) = complete_http_len(&buf)
+                            && buf.len() >= need
+                        {
+                            buf.truncate(need);
+                            done_rd.store(true, Ordering::Release);
+                            done_notify_rd.notify_waiters();
+                            return String::from_utf8_lossy(&buf).into_owned();
+                        }
+                        match rd.read(&mut tmp).await {
+                            Ok(0) => {
+                                done_rd.store(true, Ordering::Release);
+                                done_notify_rd.notify_waiters();
+                                return String::from_utf8_lossy(&buf).into_owned();
+                            }
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            Err(e) => {
+                                if let Some(need) = complete_http_len(&buf)
+                                    && buf.len() >= need
+                                {
+                                    buf.truncate(need);
+                                    done_rd.store(true, Ordering::Release);
+                                    done_notify_rd.notify_waiters();
+                                    return String::from_utf8_lossy(&buf).into_owned();
+                                }
+                                panic!("unexpected read error before full response: {e}");
+                            }
+                        }
+                    }
+                });
+
+                wr.write_all(
                     b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer inbound-secret-tok-1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
                 let h1 = format!("{:x}\r\n", chunk1.len());
-                conn.write_all(h1.as_bytes()).await.unwrap();
-                conn.write_all(&chunk1).await.unwrap();
-                conn.write_all(b"\r\n").await.unwrap();
-                conn.flush().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
-                if let Some(c2) = chunk2 {
-                    let h2 = format!("{:x}\r\n", c2.len());
-                    let _ = conn.write_all(h2.as_bytes()).await;
-                    let _ = conn.write_all(&c2).await;
-                    let _ = conn.write_all(b"\r\n0\r\n\r\n").await;
-                    let _ = conn.flush().await;
+                wr.write_all(h1.as_bytes()).await.unwrap();
+                wr.write_all(&chunk1).await.unwrap();
+                wr.write_all(b"\r\n").await.unwrap();
+                wr.flush().await.unwrap();
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(pause_ms)) => {}
+                    _ = done_notify.notified() => {}
                 }
-                let mut raw_resp = Vec::new();
-                conn.read_to_end(&mut raw_resp).await.unwrap();
-                String::from_utf8_lossy(&raw_resp).into_owned()
+
+                if let Some(c2) = chunk2
+                    && !done.load(Ordering::Acquire)
+                {
+                    let h2 = format!("{:x}\r\n", c2.len());
+                    let _ = wr.write_all(h2.as_bytes()).await;
+                    let _ = wr.write_all(&c2).await;
+                    let _ = wr.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = wr.flush().await;
+                }
+                let resp = tokio::time::timeout(Duration::from_secs(5), reader)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let _ = wr.shutdown().await;
+                resp
             }
         };
-
         // 4a. Second TCP chunk injects duplicate method -> 400 Bad Request with JSON-RPC -32600 and id=55.
         let resp_dup = send_split_chunked(
             br#"{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"x":"ok""#,
