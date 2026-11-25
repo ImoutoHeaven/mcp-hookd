@@ -11,7 +11,7 @@ use crate::headers::{
     validate_passthrough_path,
 };
 use crate::outbound::OutboundClient;
-use crate::proxy_body::{LeasedBuffer, PrefixedBody, ProxyBody};
+use crate::proxy_body::{LeasedBuffer, PrefixedBody, ProxyBody, StreamValidator};
 use crate::types::{
     ByteBudget, LATEST_LEGACY_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSIONS, LEGACY_SESSION_IDLE_SECS,
     MAX_INGEST_BODY_BYTES, MAX_LEGACY_SESSIONS, MAX_REQUEST_BODY_BYTES, MemoryPools,
@@ -22,30 +22,146 @@ use crate::upstream::UpstreamError;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
-use http_body::Body;
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_FALLBACK_MAX_BYTES: usize = 64 * 1024;
 const MAX_JSON_SCAN_NESTING: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct ListenerLimits {
+    max_connections: usize,
+    header_read_timeout: Duration,
+    idle_keepalive_timeout: Duration,
+}
+
+impl Default for ListenerLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            idle_keepalive_timeout: IDLE_KEEPALIVE_TIMEOUT,
+        }
+    }
+}
+
+struct ConnActivity {
+    in_flight: AtomicUsize,
+    last_idle_ns: AtomicU64,
+    idle_notify: Notify,
+    epoch: Instant,
+}
+
+impl ConnActivity {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            last_idle_ns: AtomicU64::new(0),
+            idle_notify: Notify::new(),
+            epoch: Instant::now(),
+        }
+    }
+}
+
+struct ActiveReqGuard {
+    activity: Arc<ConnActivity>,
+}
+
+impl Drop for ActiveReqGuard {
+    fn drop(&mut self) {
+        if self.activity.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.activity
+                .last_idle_ns
+                .store(elapsed_ns(self.activity.epoch), Ordering::Release);
+            self.activity.idle_notify.notify_waiters();
+        }
+    }
+}
+
+struct ActiveRespBody {
+    inner: RespBody,
+    guard: Option<ActiveReqGuard>,
+}
+
+impl Body for ActiveRespBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            this.guard = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn elapsed_ns(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+async fn wait_for_conn_idle(activity: &ConnActivity, timeout: Duration) {
+    let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+    loop {
+        let notified = activity.idle_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if activity.in_flight.load(Ordering::Acquire) > 0 {
+            notified.await;
+            continue;
+        }
+        let last_idle = activity.last_idle_ns.load(Ordering::Acquire);
+        let now = elapsed_ns(activity.epoch);
+        let idle_for = now.saturating_sub(last_idle);
+        if idle_for >= timeout_ns {
+            if activity.in_flight.load(Ordering::Acquire) == 0
+                && activity.last_idle_ns.load(Ordering::Acquire) == last_idle
+            {
+                return;
+            }
+            continue;
+        }
+        tokio::time::sleep(Duration::from_nanos(timeout_ns - idle_for)).await;
+    }
+}
 
 type RespBody = BoxBody<Bytes, io::Error>;
 
@@ -160,6 +276,15 @@ pub async fn start_server(
     quotas: QuotaConfig,
     outbound_override: Option<OutboundClient>,
 ) -> Result<RunningServer, String> {
+    start_server_with_limits(config, quotas, outbound_override, ListenerLimits::default()).await
+}
+
+async fn start_server_with_limits(
+    config: Config,
+    quotas: QuotaConfig,
+    outbound_override: Option<OutboundClient>,
+    limits: ListenerLimits,
+) -> Result<RunningServer, String> {
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|e| format!("failed to bind {}: {e}", config.listen))?;
@@ -179,6 +304,7 @@ pub async fn start_server(
     let cancel = CancellationToken::new();
     let force_cancel = CancellationToken::new();
     let conn_tracker = TaskTracker::new();
+    let conn_sem = Arc::new(Semaphore::new(limits.max_connections.max(1)));
     let accept_cancel = cancel.clone();
     let accept_force_cancel = force_cancel.clone();
     let accept_tracker = conn_tracker.clone();
@@ -196,21 +322,58 @@ pub async fn start_server(
                 }
                 continue;
             };
+            let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let _ = stream.set_nodelay(true);
             let state = Arc::clone(&state);
             let conn_cancel = accept_cancel.clone();
             let conn_force_cancel = accept_force_cancel.clone();
+            let activity = Arc::new(ConnActivity::new());
+            let svc_activity = Arc::clone(&activity);
+
             accept_tracker.spawn(async move {
+                let _permit = permit;
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req| {
+                    svc_activity.in_flight.fetch_add(1, Ordering::AcqRel);
+                    let req_guard = ActiveReqGuard {
+                        activity: Arc::clone(&svc_activity),
+                    };
                     let state = Arc::clone(&state);
-                    async move { Ok::<_, Infallible>(handle_request(state, req).await) }
+                    async move {
+                        let resp = handle_request(state, req).await;
+                        let wrapped = resp.map(|body| {
+                            ActiveRespBody {
+                                inner: body,
+                                guard: Some(req_guard),
+                            }
+                            .boxed()
+                        });
+                        Ok::<_, Infallible>(wrapped)
+                    }
                 });
-                let conn = http1::Builder::new().serve_connection(io, svc);
+                let mut builder = http1::Builder::new();
+                builder
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(limits.header_read_timeout);
+                let conn = builder.serve_connection(io, svc);
+                let idle_expired = wait_for_conn_idle(&activity, limits.idle_keepalive_timeout);
                 tokio::pin!(conn);
+                tokio::pin!(idle_expired);
                 tokio::select! {
                     biased;
                     _ = conn_force_cancel.cancelled() => {}
                     _ = conn.as_mut() => {}
+                    _ = &mut idle_expired => {
+                        conn.as_mut().graceful_shutdown();
+                        tokio::select! {
+                            biased;
+                            _ = conn_force_cancel.cancelled() => {}
+                            _ = tokio::time::timeout(limits.header_read_timeout, conn.as_mut()) => {}
+                        }
+                    }
                     _ = conn_cancel.cancelled() => {
                         conn.as_mut().graceful_shutdown();
                         tokio::select! {
@@ -379,7 +542,23 @@ async fn handle_ingest(state: Arc<ServerState>, req: Request<Incoming>) -> Respo
     }
 }
 
+fn request_origin_allowed(headers: &HeaderMap, state: &ServerState) -> bool {
+    let origin = match single_header_str(headers, header::ORIGIN.as_str()) {
+        HeaderExtract::Missing => None,
+        HeaderExtract::Single(val) => Some(val),
+        HeaderExtract::DuplicateOrInvalid => return false,
+    };
+    is_origin_allowed(
+        origin,
+        state.bound_addr,
+        &state.engine.config().allowed_origins,
+    )
+}
+
 async fn handle_passthrough(state: Arc<ServerState>, req: Request<Incoming>) -> Response<RespBody> {
+    if !request_origin_allowed(req.headers(), &state) {
+        return empty_response(StatusCode::FORBIDDEN);
+    }
     let method = req.method().clone();
     if !matches!(method, Method::GET | Method::HEAD | Method::PUT) {
         return method_not_allowed("GET, HEAD, PUT");
@@ -426,12 +605,7 @@ async fn handle_mcp(state: Arc<ServerState>, req: Request<Incoming>) -> Response
         return unauthorized_response();
     };
 
-    let origin = match single_header_str(req.headers(), header::ORIGIN.as_str()) {
-        HeaderExtract::Missing => None,
-        HeaderExtract::Single(val) => Some(val),
-        HeaderExtract::DuplicateOrInvalid => return empty_response(StatusCode::FORBIDDEN),
-    };
-    if !is_origin_allowed(origin, state.bound_addr, &cfg.allowed_origins) {
+    if !request_origin_allowed(req.headers(), &state) {
         return empty_response(StatusCode::FORBIDDEN);
     }
 
@@ -602,12 +776,7 @@ async fn handle_mcp_post(
         if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
             return auth_error_response(profile, None, err);
         }
-        if !has_upstream || header_targets_intercepted_method(req.headers()) {
-            return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        }
-        let (parts, incoming) = req.into_parts();
-        let body = ProxyBody::new(incoming, Arc::clone(&state.engine.pools().proxy));
-        return forward_post_to_upstream(&state, &parts.headers, body).await;
+        return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     if !is_json_content_type(req.headers()) {
@@ -630,7 +799,7 @@ async fn handle_mcp_post(
         single_header_str(req.headers(), "mcp-method"),
         HeaderExtract::Single("events/unsubscribe")
     );
-    let (parts, incoming) = req.into_parts();
+    let (mut parts, incoming) = req.into_parts();
 
     let scanned = match scan_or_buffer_json_body(
         incoming,
@@ -664,20 +833,24 @@ async fn handle_mcp_post(
         ScannedPostBody::PassthroughStream {
             prefix,
             rest,
-            eof,
+            scanner,
             captured_id,
         } => {
             if let Err(err) = state.engine.verify_caller(&caller, false).await {
                 return auth_error_response(profile, captured_id, err);
             }
-            if eof {
-                forward_post_to_upstream(&state, &parts.headers, Full::new(prefix)).await
-            } else {
-                let body = PrefixedBody::new(
-                    prefix,
-                    ProxyBody::new(rest, Arc::clone(&state.engine.pools().proxy)),
-                );
-                forward_post_to_upstream(&state, &parts.headers, body).await
+            match scanner {
+                None => forward_post_to_upstream(&state, &parts.headers, Full::new(prefix)).await,
+                Some(scanner) => {
+                    // Force chunked framing so validate_eof runs before the upstream body completes.
+                    parts.headers.remove(header::CONTENT_LENGTH);
+                    let body = PrefixedBody::new(
+                        prefix,
+                        ProxyBody::new(rest, Arc::clone(&state.engine.pools().proxy)),
+                        Box::new(scanner),
+                    );
+                    forward_post_to_upstream(&state, &parts.headers, body).await
+                }
             }
         }
         ScannedPostBody::Malformed { captured_id } => {
@@ -692,15 +865,18 @@ async fn handle_mcp_post(
                 None,
             )
         }
-        ScannedPostBody::DuplicateMethod { captured_id } => {
+        ScannedPostBody::InvalidRequest {
+            captured_id,
+            message,
+        } => {
             if let Err(err) = state.engine.verify_caller(&caller, true).await {
                 return auth_error_response(profile, captured_id, err);
             }
             jsonrpc_error(
                 StatusCode::BAD_REQUEST,
-                Value::Null,
+                captured_id.unwrap_or(Value::Null),
                 -32600,
-                "Invalid Request: duplicate method field",
+                message,
                 None,
             )
         }
@@ -1044,16 +1220,42 @@ async fn handle_mcp_post_local_only(
     );
     let (parts, incoming) = req.into_parts();
 
-    let raw_body = match read_request_body_leased(
+    let raw_body = match read_local_json_body_scanned(
         incoming,
         MAX_REQUEST_BODY_BYTES,
         state.engine.pools(),
         prefer_control,
-        true,
     )
     .await
     {
-        Ok(res) => res,
+        Ok(LocalScannedBody::Buffered(res)) => res,
+        Ok(LocalScannedBody::InvalidRequest {
+            captured_id,
+            message,
+        }) => {
+            if let Err(err) = state.engine.verify_caller(&caller, true).await {
+                return auth_error_response(profile, captured_id, err);
+            }
+            return jsonrpc_error(
+                StatusCode::BAD_REQUEST,
+                captured_id.unwrap_or(Value::Null),
+                -32600,
+                message,
+                None,
+            );
+        }
+        Ok(LocalScannedBody::Malformed { captured_id }) => {
+            if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+                return auth_error_response(profile, captured_id, err);
+            }
+            return jsonrpc_error(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32700,
+                "Parse error",
+                None,
+            );
+        }
         Err(BodyReadError::TooLarge) => return empty_response(StatusCode::PAYLOAD_TOO_LARGE),
         Err(BodyReadError::Timeout) => return empty_response(StatusCode::REQUEST_TIMEOUT),
         Err(BodyReadError::BudgetExhausted) => {
@@ -1882,28 +2084,20 @@ fn extract_caller_auth(
 }
 
 fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
-    let mut saw_any = false;
     for val in headers.get_all(header::CONTENT_ENCODING) {
-        saw_any = true;
         let Ok(raw) = val.to_str() else {
             return true;
         };
-        let mut saw_token = false;
         for tok in raw.split(',') {
             let trimmed = tok.trim();
             if trimmed.is_empty() {
-                return true;
+                continue;
             }
-            saw_token = true;
             if !trimmed.eq_ignore_ascii_case("identity") {
                 return true;
             }
         }
-        if !saw_token {
-            return true;
-        }
     }
-    let _ = saw_any;
     false
 }
 
@@ -1912,13 +2106,6 @@ fn header_mentions_method(headers: &HeaderMap, target: &str) -> bool {
         .get_all("mcp-method")
         .iter()
         .any(|v| v.to_str().ok().is_some_and(|s| s.trim() == target))
-}
-
-fn header_targets_intercepted_method(headers: &HeaderMap) -> bool {
-    headers
-        .get_all("mcp-method")
-        .iter()
-        .any(|v| v.to_str().map_or(true, |s| is_intercepted_method(s.trim())))
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
@@ -2051,6 +2238,9 @@ struct StringCollector {
     cap: usize,
     overflowed: bool,
     escape: EscapeState,
+    utf8_rem: u8,
+    utf8_min: u8,
+    utf8_max: u8,
 }
 
 impl StringCollector {
@@ -2060,6 +2250,9 @@ impl StringCollector {
             cap,
             overflowed: false,
             escape: EscapeState::None,
+            utf8_rem: 0,
+            utf8_min: 0x80,
+            utf8_max: 0xbf,
         }
     }
 
@@ -2088,6 +2281,16 @@ impl StringCollector {
     }
 
     fn feed_byte(&mut self, b: u8) -> Result<bool, ()> {
+        if self.utf8_rem > 0 {
+            if b < self.utf8_min || b > self.utf8_max {
+                return Err(());
+            }
+            self.push_byte(b);
+            self.utf8_min = 0x80;
+            self.utf8_max = 0xbf;
+            self.utf8_rem -= 1;
+            return Ok(false);
+        }
         match self.escape {
             EscapeState::None => match b {
                 b'"' => Ok(true),
@@ -2096,10 +2299,60 @@ impl StringCollector {
                     Ok(false)
                 }
                 0x00..=0x1f => Err(()),
-                _ => {
+                0x20..=0x7f => {
                     self.push_byte(b);
                     Ok(false)
                 }
+                0xc2..=0xdf => {
+                    self.push_byte(b);
+                    self.utf8_rem = 1;
+                    self.utf8_min = 0x80;
+                    self.utf8_max = 0xbf;
+                    Ok(false)
+                }
+                0xe0 => {
+                    self.push_byte(b);
+                    self.utf8_rem = 2;
+                    self.utf8_min = 0xa0;
+                    self.utf8_max = 0xbf;
+                    Ok(false)
+                }
+                0xe1..=0xec | 0xee..=0xef => {
+                    self.push_byte(b);
+                    self.utf8_rem = 2;
+                    self.utf8_min = 0x80;
+                    self.utf8_max = 0xbf;
+                    Ok(false)
+                }
+                0xed => {
+                    self.push_byte(b);
+                    self.utf8_rem = 2;
+                    self.utf8_min = 0x80;
+                    self.utf8_max = 0x9f;
+                    Ok(false)
+                }
+                0xf0 => {
+                    self.push_byte(b);
+                    self.utf8_rem = 3;
+                    self.utf8_min = 0x90;
+                    self.utf8_max = 0xbf;
+                    Ok(false)
+                }
+                0xf1..=0xf3 => {
+                    self.push_byte(b);
+                    self.utf8_rem = 3;
+                    self.utf8_min = 0x80;
+                    self.utf8_max = 0xbf;
+                    Ok(false)
+                }
+                0xf4 => {
+                    self.push_byte(b);
+                    self.utf8_rem = 3;
+                    self.utf8_min = 0x80;
+                    self.utf8_max = 0x8f;
+                    Ok(false)
+                }
+                _ => Err(()),
             },
             EscapeState::Backslash => {
                 let decoded = match b {
@@ -2208,25 +2461,147 @@ enum Depth1Key {
     Other,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipTarget {
+    RootObj,
+    BatchElem,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestedContainer {
+    Obj,
+    Arr,
+}
+
+#[derive(Clone, Copy)]
+enum NumState {
+    Minus,
+    Zero,
+    Int,
+    Dot,
+    Frac,
+    ExpSign,
+    ExpDigitReq,
+    Exp,
+}
+
+enum NumStep {
+    Next(NumState),
+    Done,
+    Malformed,
+}
+
+fn is_value_delimiter(b: u8) -> bool {
+    is_json_ws(b) || matches!(b, b',' | b'}' | b']')
+}
+
+fn is_json_value_start(b: u8) -> bool {
+    matches!(
+        b,
+        b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9'
+    )
+}
+
+fn initial_num_state(b: u8) -> Option<NumState> {
+    match b {
+        b'-' => Some(NumState::Minus),
+        b'0' => Some(NumState::Zero),
+        b'1'..=b'9' => Some(NumState::Int),
+        _ => None,
+    }
+}
+
+fn step_num(state: NumState, b: u8) -> NumStep {
+    match state {
+        NumState::Minus => match b {
+            b'0' => NumStep::Next(NumState::Zero),
+            b'1'..=b'9' => NumStep::Next(NumState::Int),
+            _ => NumStep::Malformed,
+        },
+        NumState::Zero => match b {
+            b'.' => NumStep::Next(NumState::Dot),
+            b'e' | b'E' => NumStep::Next(NumState::ExpSign),
+            _ if is_value_delimiter(b) => NumStep::Done,
+            _ => NumStep::Malformed,
+        },
+        NumState::Int => match b {
+            b'0'..=b'9' => NumStep::Next(NumState::Int),
+            b'.' => NumStep::Next(NumState::Dot),
+            b'e' | b'E' => NumStep::Next(NumState::ExpSign),
+            _ if is_value_delimiter(b) => NumStep::Done,
+            _ => NumStep::Malformed,
+        },
+        NumState::Dot => match b {
+            b'0'..=b'9' => NumStep::Next(NumState::Frac),
+            _ => NumStep::Malformed,
+        },
+        NumState::Frac => match b {
+            b'0'..=b'9' => NumStep::Next(NumState::Frac),
+            b'e' | b'E' => NumStep::Next(NumState::ExpSign),
+            _ if is_value_delimiter(b) => NumStep::Done,
+            _ => NumStep::Malformed,
+        },
+        NumState::ExpSign => match b {
+            b'+' | b'-' => NumStep::Next(NumState::ExpDigitReq),
+            b'0'..=b'9' => NumStep::Next(NumState::Exp),
+            _ => NumStep::Malformed,
+        },
+        NumState::ExpDigitReq => match b {
+            b'0'..=b'9' => NumStep::Next(NumState::Exp),
+            _ => NumStep::Malformed,
+        },
+        NumState::Exp => match b {
+            b'0'..=b'9' => NumStep::Next(NumState::Exp),
+            _ if is_value_delimiter(b) => NumStep::Done,
+            _ => NumStep::Malformed,
+        },
+    }
+}
+
+enum SkipSubState {
+    ExpectValue,
+    InString(StringCollector),
+    InLiteral(&'static [u8], usize),
+    InNumber(NumState),
+    ObjKeyOrEnd,
+    ObjKey,
+    ObjKeyStr(StringCollector),
+    ObjColon,
+    ArrValOrEnd,
+    AfterValue,
+}
+
 enum LexState {
     Start,
-    ObjExpectKeyOrEnd,
-    ObjExpectKey,
-    ReadingKey(StringCollector),
-    ObjExpectColon(Depth1Key),
-    ObjExpectValue(Depth1Key),
-    ReadingMethod(StringCollector),
-    ReadingStringId(StringCollector),
-    ReadingNumberId(Vec<u8>),
-    SkippingString(StringCollector),
-    SkippingPrimitive,
-    SkippingNested {
-        stack: Vec<u8>,
-        in_string: Option<StringCollector>,
+    RootObjKeyOrEnd,
+    RootObjKey,
+    RootObjReadingKey(StringCollector),
+    RootObjColon(Depth1Key),
+    RootObjValue(Depth1Key),
+    RootObjReadingMethod(StringCollector),
+    RootObjReadingStringId(StringCollector),
+    RootObjReadingNumberId {
+        num_state: NumState,
+        buf: Vec<u8>,
     },
-    ObjExpectCommaOrEnd,
-    AfterRootObject,
-    PassthroughRoot,
+    RootObjCommaOrEnd,
+    BatchElemOrEnd,
+    BatchElemAfterComma,
+    BatchElemKeyOrEnd,
+    BatchElemKey,
+    BatchElemReadingKey(StringCollector),
+    BatchElemColon(bool),
+    BatchElemValue(bool),
+    BatchElemReadingMethod(StringCollector),
+    BatchElemCommaOrEnd,
+    BatchAfterElem,
+    Skipping {
+        target: SkipTarget,
+        stack: Vec<NestedContainer>,
+        sub: SkipSubState,
+    },
+    RootClosed,
+    InvalidRequest(&'static str),
     Malformed,
 }
 
@@ -2235,17 +2610,16 @@ enum ScanDecision {
     NeedMore,
     Passthrough,
     Intercepted,
-    DuplicateMethod,
+    InvalidRequest(&'static str),
     Malformed,
 }
 
-/// Zero-AST depth-1 JSON lexical scanner for streaming MCP POST classification.
-struct TopLevelJsonScanner {
+/// Zero-AST streaming JSON lexical scanner for MCP POST classification and tail validation.
+pub(crate) struct TopLevelJsonScanner {
     state: LexState,
     saw_method_key: bool,
+    elem_saw_method: bool,
     intercepted_method: bool,
-    non_string_method: bool,
-    duplicate_method: bool,
     passthrough_ready: bool,
     captured_id: Option<Value>,
 }
@@ -2255,9 +2629,8 @@ impl TopLevelJsonScanner {
         Self {
             state: LexState::Start,
             saw_method_key: false,
+            elem_saw_method: false,
             intercepted_method: false,
-            non_string_method: false,
-            duplicate_method: false,
             passthrough_ready: false,
             captured_id: None,
         }
@@ -2268,19 +2641,12 @@ impl TopLevelJsonScanner {
     }
 
     fn feed_chunk(&mut self, chunk: &[u8]) -> ScanDecision {
-        let mut idx = 0usize;
-        while idx < chunk.len() {
-            let b = chunk[idx];
-            idx += 1;
+        for &b in chunk {
             self.step_byte(b);
-            if matches!(self.state, LexState::Malformed) {
-                return ScanDecision::Malformed;
-            }
-            if self.duplicate_method {
-                return ScanDecision::DuplicateMethod;
-            }
-            if matches!(self.state, LexState::PassthroughRoot) {
-                return ScanDecision::Passthrough;
+            match self.state {
+                LexState::Malformed => return ScanDecision::Malformed,
+                LexState::InvalidRequest(msg) => return ScanDecision::InvalidRequest(msg),
+                _ => {}
             }
         }
         if self.passthrough_ready {
@@ -2293,25 +2659,30 @@ impl TopLevelJsonScanner {
     }
 
     fn finish_eof(&mut self) -> ScanDecision {
-        if let LexState::ReadingNumberId(buf) = &mut self.state {
-            let bytes = std::mem::take(buf);
-            self.finish_number_id(&bytes);
+        if let LexState::RootObjReadingNumberId { num_state, buf } = &mut self.state {
+            if matches!(
+                num_state,
+                NumState::Zero | NumState::Int | NumState::Frac | NumState::Exp
+            ) {
+                let bytes = std::mem::take(buf);
+                self.finish_number_id(&bytes);
+            }
             self.state = LexState::Malformed;
             return ScanDecision::Malformed;
         }
-        if self.duplicate_method {
-            return ScanDecision::DuplicateMethod;
-        }
         match self.state {
-            LexState::PassthroughRoot => ScanDecision::Passthrough,
-            LexState::AfterRootObject => {
-                if self.passthrough_ready || !self.saw_method_key {
+            LexState::InvalidRequest(msg) => ScanDecision::InvalidRequest(msg),
+            LexState::RootClosed => {
+                if self.passthrough_ready {
                     ScanDecision::Passthrough
                 } else {
                     ScanDecision::Intercepted
                 }
             }
-            _ => ScanDecision::Malformed,
+            _ => {
+                self.state = LexState::Malformed;
+                ScanDecision::Malformed
+            }
         }
     }
 
@@ -2334,20 +2705,13 @@ impl TopLevelJsonScanner {
                         return;
                     }
                     match b {
-                        b'[' => {
-                            self.passthrough_ready = true;
-                            self.state = LexState::PassthroughRoot;
-                        }
-                        b'{' => {
-                            self.state = LexState::ObjExpectKeyOrEnd;
-                        }
-                        _ => {
-                            self.state = LexState::Malformed;
-                        }
+                        b'{' => self.state = LexState::RootObjKeyOrEnd,
+                        b'[' => self.state = LexState::BatchElemOrEnd,
+                        _ => self.state = LexState::Malformed,
                     }
                     return;
                 }
-                LexState::ObjExpectKeyOrEnd => {
+                LexState::RootObjKeyOrEnd => {
                     if is_json_ws(b) {
                         return;
                     }
@@ -2356,271 +2720,600 @@ impl TopLevelJsonScanner {
                             if !self.saw_method_key {
                                 self.passthrough_ready = true;
                             }
-                            self.state = LexState::AfterRootObject;
+                            self.state = LexState::RootClosed;
                         }
                         b'"' => {
-                            self.state = LexState::ReadingKey(StringCollector::new(32));
+                            self.state = LexState::RootObjReadingKey(StringCollector::new(32));
                         }
-                        _ => {
-                            self.state = LexState::Malformed;
-                        }
+                        _ => self.state = LexState::Malformed,
                     }
                     return;
                 }
-                LexState::ObjExpectKey => {
+                LexState::RootObjKey => {
                     if is_json_ws(b) {
                         return;
                     }
                     if b == b'"' {
-                        self.state = LexState::ReadingKey(StringCollector::new(32));
+                        self.state = LexState::RootObjReadingKey(StringCollector::new(32));
                     } else {
                         self.state = LexState::Malformed;
                     }
                     return;
                 }
-                LexState::ReadingKey(collector) => {
+                LexState::RootObjReadingKey(collector) => {
                     match collector.feed_byte(b) {
                         Ok(false) => {}
                         Ok(true) => match collector.take_string() {
                             Ok(Some(k)) if k == "method" => {
                                 if self.saw_method_key {
-                                    self.duplicate_method = true;
+                                    self.state = LexState::InvalidRequest(
+                                        "Invalid Request: duplicate method field",
+                                    );
+                                } else {
+                                    self.saw_method_key = true;
+                                    self.state = LexState::RootObjColon(Depth1Key::Method);
                                 }
-                                self.saw_method_key = true;
-                                self.state = LexState::ObjExpectColon(Depth1Key::Method);
                             }
                             Ok(Some(k)) if k == "id" => {
-                                self.state = LexState::ObjExpectColon(Depth1Key::Id);
+                                self.state = LexState::RootObjColon(Depth1Key::Id);
                             }
                             Ok(_) => {
-                                self.state = LexState::ObjExpectColon(Depth1Key::Other);
+                                self.state = LexState::RootObjColon(Depth1Key::Other);
                             }
-                            Err(()) => {
-                                self.state = LexState::Malformed;
-                            }
+                            Err(()) => self.state = LexState::Malformed,
                         },
-                        Err(()) => {
-                            self.state = LexState::Malformed;
-                        }
+                        Err(()) => self.state = LexState::Malformed,
                     }
                     return;
                 }
-                LexState::ObjExpectColon(key) => {
+                LexState::RootObjColon(key) => {
                     if is_json_ws(b) {
                         return;
                     }
                     let key = *key;
                     if b == b':' {
-                        self.state = LexState::ObjExpectValue(key);
+                        self.state = LexState::RootObjValue(key);
                     } else {
                         self.state = LexState::Malformed;
                     }
                     return;
                 }
-                LexState::ObjExpectValue(key) => {
+                LexState::RootObjValue(key) => {
                     if is_json_ws(b) {
                         return;
                     }
                     let key = *key;
                     match (key, b) {
                         (Depth1Key::Method, b'"') => {
-                            self.state = LexState::ReadingMethod(StringCollector::new(64));
+                            self.state = LexState::RootObjReadingMethod(StringCollector::new(64));
+                        }
+                        (Depth1Key::Method, first) if is_json_value_start(first) => {
+                            self.state = LexState::InvalidRequest(
+                                "Invalid Request: method must be a string",
+                            );
                         }
                         (Depth1Key::Method, _) => {
-                            self.non_string_method = true;
-                            self.enter_skip_value(b);
+                            self.state = LexState::Malformed;
                         }
                         (Depth1Key::Id, b'"') if self.captured_id.is_none() => {
-                            self.state = LexState::ReadingStringId(StringCollector::new(256));
+                            self.state =
+                                LexState::RootObjReadingStringId(StringCollector::new(256));
                         }
-                        (Depth1Key::Id, b'-' | b'0'..=b'9') if self.captured_id.is_none() => {
-                            let mut num = Vec::with_capacity(16);
-                            num.push(b);
-                            self.state = LexState::ReadingNumberId(num);
+                        (Depth1Key::Id, first)
+                            if self.captured_id.is_none() && initial_num_state(first).is_some() =>
+                        {
+                            let mut buf = Vec::with_capacity(16);
+                            buf.push(first);
+                            self.state = LexState::RootObjReadingNumberId {
+                                num_state: initial_num_state(first).unwrap(),
+                                buf,
+                            };
                         }
                         (_, first) => {
-                            self.enter_skip_value(first);
+                            self.enter_skip_value(first, SkipTarget::RootObj);
                         }
                     }
                     return;
                 }
-                LexState::ReadingMethod(collector) => {
+                LexState::RootObjReadingMethod(collector) => {
                     match collector.feed_byte(b) {
                         Ok(false) => {}
                         Ok(true) => match collector.take_string() {
                             Ok(Some(m)) if is_intercepted_method(&m) => {
                                 self.intercepted_method = true;
-                                self.state = LexState::ObjExpectCommaOrEnd;
+                                self.state = LexState::RootObjCommaOrEnd;
                             }
                             Ok(_) => {
                                 self.passthrough_ready = true;
-                                self.state = LexState::ObjExpectCommaOrEnd;
+                                self.state = LexState::RootObjCommaOrEnd;
                             }
-                            Err(()) => {
-                                self.state = LexState::Malformed;
-                            }
+                            Err(()) => self.state = LexState::Malformed,
                         },
-                        Err(()) => {
-                            self.state = LexState::Malformed;
-                        }
+                        Err(()) => self.state = LexState::Malformed,
                     }
                     return;
                 }
-                LexState::ReadingStringId(collector) => {
+                LexState::RootObjReadingStringId(collector) => {
                     match collector.feed_byte(b) {
                         Ok(false) => {}
                         Ok(true) => match collector.take_string() {
                             Ok(Some(id_str)) => {
                                 self.captured_id = Some(Value::String(id_str));
-                                self.state = LexState::ObjExpectCommaOrEnd;
+                                self.state = LexState::RootObjCommaOrEnd;
                             }
                             Ok(None) => {
-                                self.state = LexState::ObjExpectCommaOrEnd;
+                                self.state = LexState::RootObjCommaOrEnd;
                             }
-                            Err(()) => {
-                                self.state = LexState::Malformed;
-                            }
-                        },
-                        Err(()) => {
-                            self.state = LexState::Malformed;
-                        }
-                    }
-                    return;
-                }
-                LexState::ReadingNumberId(buf) => {
-                    if matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E') {
-                        if buf.len() <= 32 {
-                            buf.push(b);
-                        }
-                        return;
-                    }
-                    if is_json_ws(b) || b == b',' || b == b'}' {
-                        let bytes = std::mem::take(buf);
-                        self.finish_number_id(&bytes);
-                        self.state = LexState::ObjExpectCommaOrEnd;
-                        continue;
-                    }
-                    self.state = LexState::Malformed;
-                    return;
-                }
-                LexState::SkippingString(collector) => {
-                    match collector.feed_byte(b) {
-                        Ok(false) => {}
-                        Ok(true) => {
-                            self.state = LexState::ObjExpectCommaOrEnd;
-                        }
-                        Err(()) => {
-                            self.state = LexState::Malformed;
-                        }
-                    }
-                    return;
-                }
-                LexState::SkippingPrimitive => {
-                    if matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'+' | b'-' | b'.') {
-                        return;
-                    }
-                    if is_json_ws(b) || b == b',' || b == b'}' {
-                        self.state = LexState::ObjExpectCommaOrEnd;
-                        continue;
-                    }
-                    self.state = LexState::Malformed;
-                    return;
-                }
-                LexState::SkippingNested { stack, in_string } => {
-                    if let Some(sc) = in_string {
-                        match sc.feed_byte(b) {
-                            Ok(false) => {}
-                            Ok(true) => *in_string = None,
                             Err(()) => self.state = LexState::Malformed,
-                        }
-                        return;
-                    }
-                    match b {
-                        b'"' => {
-                            *in_string = Some(StringCollector::new(0));
-                        }
-                        b'{' => {
-                            if stack.len() >= MAX_JSON_SCAN_NESTING {
-                                self.state = LexState::Malformed;
-                            } else {
-                                stack.push(b'}');
-                            }
-                        }
-                        b'[' => {
-                            if stack.len() >= MAX_JSON_SCAN_NESTING {
-                                self.state = LexState::Malformed;
-                            } else {
-                                stack.push(b']');
-                            }
-                        }
-                        b'}' | b']' => {
-                            if stack.pop() != Some(b) {
-                                self.state = LexState::Malformed;
-                            } else if stack.is_empty() {
-                                self.state = LexState::ObjExpectCommaOrEnd;
-                            }
-                        }
-                        _ => {}
+                        },
+                        Err(()) => self.state = LexState::Malformed,
                     }
                     return;
                 }
-                LexState::ObjExpectCommaOrEnd => {
+                LexState::RootObjReadingNumberId { num_state, buf } => {
+                    match step_num(*num_state, b) {
+                        NumStep::Next(next) => {
+                            *num_state = next;
+                            if buf.len() <= 32 {
+                                buf.push(b);
+                            }
+                            return;
+                        }
+                        NumStep::Done => {
+                            let bytes = std::mem::take(buf);
+                            self.finish_number_id(&bytes);
+                            self.state = LexState::RootObjCommaOrEnd;
+                            continue;
+                        }
+                        NumStep::Malformed => {
+                            self.state = LexState::Malformed;
+                            return;
+                        }
+                    }
+                }
+                LexState::RootObjCommaOrEnd => {
                     if is_json_ws(b) {
                         return;
                     }
                     match b {
-                        b',' => {
-                            if self.passthrough_ready && self.captured_id.is_some() {
-                                self.state = LexState::PassthroughRoot;
-                            } else {
-                                self.state = LexState::ObjExpectKey;
-                            }
-                        }
+                        b',' => self.state = LexState::RootObjKey,
                         b'}' => {
                             if !self.saw_method_key {
                                 self.passthrough_ready = true;
                             }
-                            self.state = LexState::AfterRootObject;
+                            self.state = LexState::RootClosed;
                         }
-                        _ => {
+                        _ => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchElemOrEnd => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b']' => {
+                            self.state = LexState::InvalidRequest(
+                                "Invalid Request: batch array must not be empty",
+                            );
+                        }
+                        b'{' => {
+                            self.elem_saw_method = false;
+                            self.state = LexState::BatchElemKeyOrEnd;
+                        }
+                        first if is_json_value_start(first) => {
+                            self.state = LexState::InvalidRequest(
+                                "Invalid Request: batch elements must be JSON objects",
+                            );
+                        }
+                        _ => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchElemAfterComma => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b'{' => {
+                            self.elem_saw_method = false;
+                            self.state = LexState::BatchElemKeyOrEnd;
+                        }
+                        first if is_json_value_start(first) => {
+                            self.state = LexState::InvalidRequest(
+                                "Invalid Request: batch elements must be JSON objects",
+                            );
+                        }
+                        _ => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchElemKeyOrEnd => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b'}' => {
+                            if !self.elem_saw_method {
+                                self.passthrough_ready = true;
+                            }
+                            self.state = LexState::BatchAfterElem;
+                        }
+                        b'"' => {
+                            self.state = LexState::BatchElemReadingKey(StringCollector::new(32));
+                        }
+                        _ => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchElemKey => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    if b == b'"' {
+                        self.state = LexState::BatchElemReadingKey(StringCollector::new(32));
+                    } else {
+                        self.state = LexState::Malformed;
+                    }
+                    return;
+                }
+                LexState::BatchElemReadingKey(collector) => {
+                    match collector.feed_byte(b) {
+                        Ok(false) => {}
+                        Ok(true) => match collector.take_string() {
+                            Ok(Some(k)) if k == "method" => {
+                                if self.elem_saw_method {
+                                    self.state = LexState::InvalidRequest(
+                                        "Invalid Request: duplicate method field in batch element",
+                                    );
+                                } else {
+                                    self.elem_saw_method = true;
+                                    self.state = LexState::BatchElemColon(true);
+                                }
+                            }
+                            Ok(_) => {
+                                self.state = LexState::BatchElemColon(false);
+                            }
+                            Err(()) => self.state = LexState::Malformed,
+                        },
+                        Err(()) => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchElemColon(is_method) => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    let is_method = *is_method;
+                    if b == b':' {
+                        self.state = LexState::BatchElemValue(is_method);
+                    } else {
+                        self.state = LexState::Malformed;
+                    }
+                    return;
+                }
+                LexState::BatchElemValue(is_method) => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    let is_method = *is_method;
+                    match (is_method, b) {
+                        (true, b'"') => {
+                            self.state = LexState::BatchElemReadingMethod(StringCollector::new(64));
+                        }
+                        (true, first) if is_json_value_start(first) => {
+                            self.state = LexState::InvalidRequest(
+                                "Invalid Request: batch element method must be a string",
+                            );
+                        }
+                        (true, _) => {
                             self.state = LexState::Malformed;
+                        }
+                        (false, first) => {
+                            self.enter_skip_value(first, SkipTarget::BatchElem);
                         }
                     }
                     return;
                 }
-                LexState::AfterRootObject => {
+                LexState::BatchElemReadingMethod(collector) => {
+                    match collector.feed_byte(b) {
+                        Ok(false) => {}
+                        Ok(true) => match collector.take_string() {
+                            Ok(Some(m)) if is_intercepted_method(&m) => {
+                                self.state = LexState::InvalidRequest(
+                                    "Invalid Request: controlled MCP method cannot be batched",
+                                );
+                            }
+                            Ok(_) => {
+                                self.passthrough_ready = true;
+                                self.state = LexState::BatchElemCommaOrEnd;
+                            }
+                            Err(()) => self.state = LexState::Malformed,
+                        },
+                        Err(()) => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchElemCommaOrEnd => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b',' => self.state = LexState::BatchElemKey,
+                        b'}' => {
+                            if !self.elem_saw_method {
+                                self.passthrough_ready = true;
+                            }
+                            self.state = LexState::BatchAfterElem;
+                        }
+                        _ => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::BatchAfterElem => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b',' => self.state = LexState::BatchElemAfterComma,
+                        b']' => self.state = LexState::RootClosed,
+                        _ => self.state = LexState::Malformed,
+                    }
+                    return;
+                }
+                LexState::Skipping { target, stack, sub } => match sub {
+                    SkipSubState::ExpectValue => {
+                        if is_json_ws(b) {
+                            return;
+                        }
+                        match b {
+                            b'"' => *sub = SkipSubState::InString(StringCollector::new(0)),
+                            b't' => *sub = SkipSubState::InLiteral(b"rue", 0),
+                            b'f' => *sub = SkipSubState::InLiteral(b"alse", 0),
+                            b'n' => *sub = SkipSubState::InLiteral(b"ull", 0),
+                            b'{' => {
+                                if stack.len() >= MAX_JSON_SCAN_NESTING {
+                                    self.state = LexState::Malformed;
+                                } else {
+                                    stack.push(NestedContainer::Obj);
+                                    *sub = SkipSubState::ObjKeyOrEnd;
+                                }
+                            }
+                            b'[' => {
+                                if stack.len() >= MAX_JSON_SCAN_NESTING {
+                                    self.state = LexState::Malformed;
+                                } else {
+                                    stack.push(NestedContainer::Arr);
+                                    *sub = SkipSubState::ArrValOrEnd;
+                                }
+                            }
+                            first => match initial_num_state(first) {
+                                Some(ns) => *sub = SkipSubState::InNumber(ns),
+                                None => self.state = LexState::Malformed,
+                            },
+                        }
+                        return;
+                    }
+                    SkipSubState::InString(sc) => {
+                        match sc.feed_byte(b) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                if stack.is_empty() {
+                                    let done_target = *target;
+                                    self.finish_skip_target(done_target);
+                                } else {
+                                    *sub = SkipSubState::AfterValue;
+                                }
+                            }
+                            Err(()) => self.state = LexState::Malformed,
+                        }
+                        return;
+                    }
+                    SkipSubState::InLiteral(expected, pos) => {
+                        if b != expected[*pos] {
+                            self.state = LexState::Malformed;
+                            return;
+                        }
+                        *pos += 1;
+                        if *pos == expected.len() {
+                            if stack.is_empty() {
+                                let done_target = *target;
+                                self.finish_skip_target(done_target);
+                            } else {
+                                *sub = SkipSubState::AfterValue;
+                            }
+                        }
+                        return;
+                    }
+                    SkipSubState::InNumber(ns) => match step_num(*ns, b) {
+                        NumStep::Next(next) => {
+                            *ns = next;
+                            return;
+                        }
+                        NumStep::Done => {
+                            if stack.is_empty() {
+                                let done_target = *target;
+                                self.finish_skip_target(done_target);
+                                continue;
+                            }
+                            *sub = SkipSubState::AfterValue;
+                            continue;
+                        }
+                        NumStep::Malformed => {
+                            self.state = LexState::Malformed;
+                            return;
+                        }
+                    },
+                    SkipSubState::ObjKeyOrEnd => {
+                        if is_json_ws(b) {
+                            return;
+                        }
+                        match b {
+                            b'}' => {
+                                stack.pop();
+                                if stack.is_empty() {
+                                    let done_target = *target;
+                                    self.finish_skip_target(done_target);
+                                } else {
+                                    *sub = SkipSubState::AfterValue;
+                                }
+                            }
+                            b'"' => *sub = SkipSubState::ObjKeyStr(StringCollector::new(0)),
+                            _ => self.state = LexState::Malformed,
+                        }
+                        return;
+                    }
+                    SkipSubState::ObjKey => {
+                        if is_json_ws(b) {
+                            return;
+                        }
+                        if b == b'"' {
+                            *sub = SkipSubState::ObjKeyStr(StringCollector::new(0));
+                        } else {
+                            self.state = LexState::Malformed;
+                        }
+                        return;
+                    }
+                    SkipSubState::ObjKeyStr(sc) => {
+                        match sc.feed_byte(b) {
+                            Ok(false) => {}
+                            Ok(true) => *sub = SkipSubState::ObjColon,
+                            Err(()) => self.state = LexState::Malformed,
+                        }
+                        return;
+                    }
+                    SkipSubState::ObjColon => {
+                        if is_json_ws(b) {
+                            return;
+                        }
+                        if b == b':' {
+                            *sub = SkipSubState::ExpectValue;
+                        } else {
+                            self.state = LexState::Malformed;
+                        }
+                        return;
+                    }
+                    SkipSubState::ArrValOrEnd => {
+                        if is_json_ws(b) {
+                            return;
+                        }
+                        if b == b']' {
+                            stack.pop();
+                            if stack.is_empty() {
+                                let done_target = *target;
+                                self.finish_skip_target(done_target);
+                            } else {
+                                *sub = SkipSubState::AfterValue;
+                            }
+                            return;
+                        }
+                        *sub = SkipSubState::ExpectValue;
+                        continue;
+                    }
+                    SkipSubState::AfterValue => {
+                        if is_json_ws(b) {
+                            return;
+                        }
+                        match (stack.last().copied(), b) {
+                            (Some(NestedContainer::Obj), b',') => {
+                                *sub = SkipSubState::ObjKey;
+                            }
+                            (Some(NestedContainer::Obj), b'}') => {
+                                stack.pop();
+                                if stack.is_empty() {
+                                    let done_target = *target;
+                                    self.finish_skip_target(done_target);
+                                }
+                            }
+                            (Some(NestedContainer::Arr), b',') => {
+                                *sub = SkipSubState::ExpectValue;
+                            }
+                            (Some(NestedContainer::Arr), b']') => {
+                                stack.pop();
+                                if stack.is_empty() {
+                                    let done_target = *target;
+                                    self.finish_skip_target(done_target);
+                                }
+                            }
+                            _ => self.state = LexState::Malformed,
+                        }
+                        return;
+                    }
+                },
+                LexState::RootClosed => {
                     if !is_json_ws(b) {
                         self.state = LexState::Malformed;
                     }
                     return;
                 }
-                LexState::PassthroughRoot | LexState::Malformed => return,
+                LexState::InvalidRequest(_) | LexState::Malformed => return,
             }
         }
     }
 
-    fn enter_skip_value(&mut self, first: u8) {
-        match first {
-            b'"' => {
-                self.state = LexState::SkippingString(StringCollector::new(0));
-            }
+    fn finish_skip_target(&mut self, target: SkipTarget) {
+        self.state = match target {
+            SkipTarget::RootObj => LexState::RootObjCommaOrEnd,
+            SkipTarget::BatchElem => LexState::BatchElemCommaOrEnd,
+        };
+    }
+
+    fn enter_skip_value(&mut self, first: u8, target: SkipTarget) {
+        let mut stack = Vec::new();
+        let sub = match first {
+            b'"' => SkipSubState::InString(StringCollector::new(0)),
+            b't' => SkipSubState::InLiteral(b"rue", 0),
+            b'f' => SkipSubState::InLiteral(b"alse", 0),
+            b'n' => SkipSubState::InLiteral(b"ull", 0),
             b'{' => {
-                self.state = LexState::SkippingNested {
-                    stack: vec![b'}'],
-                    in_string: None,
-                };
+                stack.push(NestedContainer::Obj);
+                SkipSubState::ObjKeyOrEnd
             }
             b'[' => {
-                self.state = LexState::SkippingNested {
-                    stack: vec![b']'],
-                    in_string: None,
-                };
+                stack.push(NestedContainer::Arr);
+                SkipSubState::ArrValOrEnd
             }
-            b't' | b'f' | b'n' | b'-' | b'0'..=b'9' => {
-                self.state = LexState::SkippingPrimitive;
+            other => match initial_num_state(other) {
+                Some(ns) => SkipSubState::InNumber(ns),
+                None => {
+                    self.state = LexState::Malformed;
+                    return;
+                }
+            },
+        };
+        self.state = LexState::Skipping { target, stack, sub };
+    }
+}
+
+impl StreamValidator for TopLevelJsonScanner {
+    fn validate_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+        match self.feed_chunk(chunk) {
+            ScanDecision::Passthrough | ScanDecision::NeedMore => Ok(()),
+            ScanDecision::Intercepted => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected controlled method in passthrough stream",
+            )),
+            ScanDecision::InvalidRequest(msg) => {
+                Err(io::Error::new(io::ErrorKind::InvalidData, msg))
             }
-            _ => {
-                self.state = LexState::Malformed;
+            ScanDecision::Malformed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed JSON in passthrough stream",
+            )),
+        }
+    }
+
+    fn validate_eof(&mut self) -> io::Result<()> {
+        match self.finish_eof() {
+            ScanDecision::Passthrough => Ok(()),
+            ScanDecision::InvalidRequest(msg) => {
+                Err(io::Error::new(io::ErrorKind::InvalidData, msg))
+            }
+            ScanDecision::Malformed | ScanDecision::NeedMore | ScanDecision::Intercepted => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated or invalid JSON at passthrough EOF",
+                ))
             }
         }
     }
@@ -2634,12 +3327,24 @@ enum ScannedPostBody<B> {
     PassthroughStream {
         prefix: Bytes,
         rest: B,
-        eof: bool,
+        scanner: Option<TopLevelJsonScanner>,
         captured_id: Option<Value>,
     },
     Buffered(Bytes),
-    DuplicateMethod {
+    InvalidRequest {
         captured_id: Option<Value>,
+        message: &'static str,
+    },
+    Malformed {
+        captured_id: Option<Value>,
+    },
+}
+
+enum LocalScannedBody {
+    Buffered(Bytes),
+    InvalidRequest {
+        captured_id: Option<Value>,
+        message: &'static str,
     },
     Malformed {
         captured_id: Option<Value>,
@@ -2739,17 +3444,42 @@ where
 
                 match scanner.feed_chunk(&chunk) {
                     ScanDecision::Passthrough => {
-                        let eof = body.is_end_stream();
+                        let captured_id = scanner.captured_id();
+                        if body.is_end_stream() {
+                            return match scanner.finish_eof() {
+                                ScanDecision::Passthrough => {
+                                    Ok(ScannedPostBody::PassthroughStream {
+                                        prefix: out.into_bytes(),
+                                        rest: body,
+                                        scanner: None,
+                                        captured_id,
+                                    })
+                                }
+                                ScanDecision::InvalidRequest(message) => {
+                                    Ok(ScannedPostBody::InvalidRequest {
+                                        captured_id: scanner.captured_id(),
+                                        message,
+                                    })
+                                }
+                                ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
+                                    captured_id: scanner.captured_id(),
+                                }),
+                                ScanDecision::Intercepted | ScanDecision::NeedMore => {
+                                    Ok(ScannedPostBody::Buffered(out.into_bytes()))
+                                }
+                            };
+                        }
                         return Ok(ScannedPostBody::PassthroughStream {
                             prefix: out.into_bytes(),
                             rest: body,
-                            eof,
-                            captured_id: scanner.captured_id(),
+                            scanner: Some(scanner),
+                            captured_id,
                         });
                     }
-                    ScanDecision::DuplicateMethod => {
-                        return Ok(ScannedPostBody::DuplicateMethod {
+                    ScanDecision::InvalidRequest(message) => {
+                        return Ok(ScannedPostBody::InvalidRequest {
                             captured_id: scanner.captured_id(),
+                            message,
                         });
                     }
                     ScanDecision::Malformed => {
@@ -2766,11 +3496,12 @@ where
             ScanDecision::Passthrough => Ok(ScannedPostBody::PassthroughStream {
                 prefix: out.into_bytes(),
                 rest: body,
-                eof: true,
+                scanner: None,
                 captured_id: scanner.captured_id(),
             }),
-            ScanDecision::DuplicateMethod => Ok(ScannedPostBody::DuplicateMethod {
+            ScanDecision::InvalidRequest(message) => Ok(ScannedPostBody::InvalidRequest {
                 captured_id: scanner.captured_id(),
+                message,
             }),
             ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
                 captured_id: scanner.captured_id(),
@@ -2782,6 +3513,84 @@ where
     };
 
     tokio::time::timeout(BODY_READ_TIMEOUT, scan_fut)
+        .await
+        .map_err(|_| BodyReadError::Timeout)?
+}
+
+async fn read_local_json_body_scanned<B>(
+    mut body: B,
+    limit: usize,
+    pools: &MemoryPools,
+    prefer_control: bool,
+) -> Result<LocalScannedBody, BodyReadError>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let lease = if prefer_control {
+        pools
+            .control
+            .try_acquire(0)
+            .ok_or(BodyReadError::BudgetExhausted)?
+    } else {
+        pools
+            .proxy
+            .try_acquire(0)
+            .ok_or(BodyReadError::BudgetExhausted)?
+    };
+    let mut using_control = prefer_control;
+
+    let read_fut = async {
+        let mut out = LeasedBuffer::new(lease);
+        let mut scanner = TopLevelJsonScanner::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
+            if let Ok(chunk) = frame.into_data() {
+                if chunk.is_empty() {
+                    continue;
+                }
+                append_leased_chunk(
+                    &mut out,
+                    &chunk,
+                    limit,
+                    pools,
+                    prefer_control,
+                    true,
+                    &mut using_control,
+                )?;
+                match scanner.feed_chunk(&chunk) {
+                    ScanDecision::InvalidRequest(message) => {
+                        return Ok(LocalScannedBody::InvalidRequest {
+                            captured_id: scanner.captured_id(),
+                            message,
+                        });
+                    }
+                    ScanDecision::Malformed => {
+                        return Ok(LocalScannedBody::Malformed {
+                            captured_id: scanner.captured_id(),
+                        });
+                    }
+                    ScanDecision::NeedMore
+                    | ScanDecision::Passthrough
+                    | ScanDecision::Intercepted => {}
+                }
+            }
+        }
+        match scanner.finish_eof() {
+            ScanDecision::InvalidRequest(message) => Ok(LocalScannedBody::InvalidRequest {
+                captured_id: scanner.captured_id(),
+                message,
+            }),
+            ScanDecision::Malformed => Ok(LocalScannedBody::Malformed {
+                captured_id: scanner.captured_id(),
+            }),
+            ScanDecision::Passthrough | ScanDecision::Intercepted | ScanDecision::NeedMore => {
+                Ok(LocalScannedBody::Buffered(out.into_bytes()))
+            }
+        }
+    };
+
+    tokio::time::timeout(BODY_READ_TIMEOUT, read_fut)
         .await
         .map_err(|_| BodyReadError::Timeout)?
 }
@@ -3147,14 +3956,30 @@ mod tests {
             assert_eq!(s.captured_id(), Some(json!("srv_1")));
         }
 
-        // Batch array stops on the opening '['.
-        let mut batch = TopLevelJsonScanner::new();
-        assert_eq!(batch.feed_chunk(b" [ {}"), ScanDecision::Passthrough);
+        // Valid non-controlled batch streams after the first element is verified.
+        let valid_batch =
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":"r1","result":{}}]"#;
+        for step in [1usize, 3, 11] {
+            let mut s = TopLevelJsonScanner::new();
+            let mut dec = ScanDecision::NeedMore;
+            for chunk in valid_batch.chunks(step) {
+                dec = s.feed_chunk(chunk);
+            }
+            assert_eq!(dec, ScanDecision::Passthrough, "batch step {step}");
+            assert_eq!(s.finish_eof(), ScanDecision::Passthrough);
+        }
 
-        // Duplicate depth-1 method key is rejected.
-        let dup = br#"{"jsonrpc":"2.0","id":1,"method":"events/list","method":"tools/call"}"#;
-        let mut dup_s = TopLevelJsonScanner::new();
-        assert_eq!(dup_s.feed_chunk(dup), ScanDecision::DuplicateMethod);
+        // Duplicate depth-1 method key is rejected regardless of order.
+        for dup in [
+            &br#"{"jsonrpc":"2.0","id":1,"method":"events/list","method":"tools/call"}"#[..],
+            &br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{},"method":"events/poll"}"#[..],
+        ] {
+            let mut dup_s = TopLevelJsonScanner::new();
+            assert!(matches!(
+                dup_s.feed_chunk(dup),
+                ScanDecision::InvalidRequest(_)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -3173,17 +3998,330 @@ mod tests {
         match res {
             ScannedPostBody::PassthroughStream {
                 prefix,
-                mut rest,
-                eof,
+                rest,
+                scanner: Some(scanner),
                 captured_id,
             } => {
-                assert!(!eof);
                 assert_eq!(prefix, chunk1);
                 assert_eq!(captured_id, Some(json!(7)));
-                let rem1 = rest.frame().await.unwrap().unwrap().into_data().unwrap();
+                let mut stream = PrefixedBody::new(
+                    prefix,
+                    ProxyBody::new(rest, Arc::clone(&pools.proxy)),
+                    Box::new(scanner),
+                );
+                let _ = stream.frame().await.unwrap().unwrap();
+                let rem1 = stream.frame().await.unwrap().unwrap().into_data().unwrap();
                 assert_eq!(rem1.len(), 256 * 1024);
+                let rem2 = stream.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(&rem2[..], br#""}}"#);
+                assert!(stream.frame().await.is_none());
             }
-            _ => panic!("expected early PassthroughStream"),
+            _ => panic!("expected early PassthroughStream with live validator"),
         }
+    }
+
+    #[tokio::test]
+    async fn scanner_rejects_non_string_method_duplicate_tail_and_invalid_batches() {
+        let pools = MemoryPools::from_quotas(&QuotaConfig::default());
+
+        // 1. Non-string method fails immediately on chunk 1 without reading oversized chunk 2.
+        for bad_first in [
+            &br#"{"jsonrpc":"2.0","id":42,"method":123,"pad":""#[..],
+            &br#"{"jsonrpc":"2.0","id":"req_a","method":true,"pad":""#[..],
+            &br#"{"jsonrpc":"2.0","method":null,"pad":""#[..],
+            &br#"{"jsonrpc":"2.0","id":9,"method":{},"pad":""#[..],
+            &br#"{"jsonrpc":"2.0","id":9,"method":[],"pad":""#[..],
+        ] {
+            let incoming = Chunks(
+                [
+                    Bytes::copy_from_slice(bad_first),
+                    Bytes::from(vec![b'x'; MAX_REQUEST_BODY_BYTES + 1024]),
+                ]
+                .into(),
+            );
+            let res = scan_or_buffer_json_body(incoming, MAX_REQUEST_BODY_BYTES, &pools, false)
+                .await
+                .unwrap();
+            assert!(matches!(res, ScannedPostBody::InvalidRequest { .. }));
+            if bad_first.windows(7).any(|w| w == br#""id":42"#)
+                && let ScannedPostBody::InvalidRequest { captured_id, .. } = res
+            {
+                assert_eq!(captured_id, Some(json!(42)));
+            }
+        }
+
+        // 2. Cross-chunk second method or trailing garbage aborts PrefixedBody before yielding bad frame.
+        for bad_tail in [
+            &br#""},"method":"events/poll"}"#[..],
+            &br#""}} garbage"#[..],
+        ] {
+            let c1 = Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"x":""#,
+            );
+            let c2 = Bytes::copy_from_slice(bad_tail);
+            let res = scan_or_buffer_json_body(
+                Chunks([c1.clone(), c2].into()),
+                MAX_REQUEST_BODY_BYTES,
+                &pools,
+                false,
+            )
+            .await
+            .unwrap();
+            let ScannedPostBody::PassthroughStream {
+                prefix,
+                rest,
+                scanner: Some(scanner),
+                ..
+            } = res
+            else {
+                panic!("expected PassthroughStream");
+            };
+            let mut body = PrefixedBody::new(
+                prefix,
+                ProxyBody::new(rest, Arc::clone(&pools.proxy)),
+                Box::new(scanner),
+            );
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                c1
+            );
+            assert!(body.frame().await.unwrap().is_err());
+        }
+
+        // 3. Batch rejections: empty, non-object, non-string/duplicate method, and all 7 controlled methods.
+        for bad_batch in [
+            "[]".to_owned(),
+            "[1]".to_owned(),
+            r#"["str"]"#.to_owned(),
+            "[true]".to_owned(),
+            "[null]".to_owned(),
+            "[[]]".to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":99}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"initialize"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"server/discover"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"events/list"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"events/subscribe"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"events/unsubscribe"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"events/poll"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"events/stream"}]"#.to_owned(),
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"events/poll"}]"#.to_owned(),
+        ] {
+            for step in [1usize, 4, 64] {
+                let mut s = TopLevelJsonScanner::new();
+                let mut dec = ScanDecision::NeedMore;
+                for ch in bad_batch.as_bytes().chunks(step) {
+                    dec = s.feed_chunk(ch);
+                    if matches!(dec, ScanDecision::InvalidRequest(_) | ScanDecision::Malformed) {
+                        break;
+                    }
+                }
+                if !matches!(dec, ScanDecision::InvalidRequest(_)) {
+                    dec = s.finish_eof();
+                }
+                assert!(
+                    matches!(dec, ScanDecision::InvalidRequest(_)),
+                    "expected InvalidRequest for {bad_batch} at step {step}, got {dec:?}"
+                );
+            }
+        }
+
+        // 4. Cross-chunk batch where element 2 smuggles a controlled method aborts PrefixedBody.
+        let bc1 = Bytes::from_static(br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},"#);
+        let bc2 = Bytes::from_static(br#"{"jsonrpc":"2.0","id":2,"method":"events/poll"}]"#);
+        let res = scan_or_buffer_json_body(
+            Chunks([bc1.clone(), bc2].into()),
+            MAX_REQUEST_BODY_BYTES,
+            &pools,
+            false,
+        )
+        .await
+        .unwrap();
+        let ScannedPostBody::PassthroughStream {
+            prefix,
+            rest,
+            scanner: Some(scanner),
+            ..
+        } = res
+        else {
+            panic!("expected streaming batch");
+        };
+        let mut body = PrefixedBody::new(
+            prefix,
+            ProxyBody::new(rest, Arc::clone(&pools.proxy)),
+            Box::new(scanner),
+        );
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            bc1
+        );
+        assert!(body.frame().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn listener_enforces_connection_cap_header_timeout_and_idle_reap_without_killing_sse() {
+        use crate::config::UpstreamConfig;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // Mock upstream that streams an open SSE response lasting > 2x idle_keepalive_timeout.
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        let up_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = up_listener.accept().await {
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        if req.method() == Method::GET && req.uri().path() == "/mcp" {
+                            let (tx, rx) =
+                                tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
+                            tokio::spawn(async move {
+                                let _ = tx
+                                    .send(Ok(Frame::data(Bytes::from_static(b": first\n\n"))))
+                                    .await;
+                                tokio::time::sleep(Duration::from_millis(450)).await;
+                                let _ = tx
+                                    .send(Ok(Frame::data(Bytes::from_static(b"data: done\n\n"))))
+                                    .await;
+                            });
+                            struct ChanBody(
+                                tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, Infallible>>,
+                            );
+                            impl Body for ChanBody {
+                                type Data = Bytes;
+                                type Error = Infallible;
+                                fn poll_frame(
+                                    mut self: Pin<&mut Self>,
+                                    cx: &mut Context<'_>,
+                                ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>>
+                                {
+                                    self.0.poll_recv(cx)
+                                }
+                            }
+                            let resp = Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .body(ChanBody(rx).boxed())
+                                .unwrap();
+                            return Ok::<_, Infallible>(resp);
+                        }
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Empty::<Bytes>::new().boxed())
+                                .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            resource_path: "/mcp".into(),
+            state_path: dir.path().join("state.json"),
+            profile: Profile::Sep3415,
+            inbound_tokens: vec![SecretString::new("inbound-secret-tok-1")],
+            allowed_origins: Vec::new(),
+            max_ttl_secs: 3600,
+            auth_context: None,
+            upstream: Some(UpstreamConfig {
+                url: url::Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+                bearer_token: None,
+                passthrough_prefixes: Vec::new(),
+                request_timeout_secs: 10,
+                expose_events: Vec::new(),
+            }),
+            ingest: None,
+        };
+        let srv = start_server_with_limits(
+            cfg,
+            QuotaConfig::default(),
+            None,
+            ListenerLimits {
+                max_connections: 2,
+                header_read_timeout: Duration::from_millis(120),
+                idle_keepalive_timeout: Duration::from_millis(180),
+            },
+        )
+        .await
+        .unwrap();
+        let addr = srv.local_addr();
+
+        // 1. Long-lived GET /mcp SSE stream (450ms) survives well past idle_keepalive_timeout (180ms).
+        let mut sse_conn = TcpStream::connect(addr).await.unwrap();
+        sse_conn
+            .write_all(
+                b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer inbound-secret-tok-1\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        // 2. Simultaneously occupy slot #2 with a Slowloris partial-header connection, and verify slot #3 is dropped.
+        let mut slow_conn = TcpStream::connect(addr).await.unwrap();
+        slow_conn
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut overflow_conn = TcpStream::connect(addr).await.unwrap();
+        let mut probe = [0u8; 16];
+        let n_overflow =
+            tokio::time::timeout(Duration::from_millis(150), overflow_conn.read(&mut probe))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            n_overflow, 0,
+            "expected 3rd connection past max_connections=2 to close immediately"
+        );
+
+        // Slowloris connection must be closed by header_read_timeout (~120ms).
+        let n_slow = tokio::time::timeout(Duration::from_millis(300), slow_conn.read(&mut probe))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            n_slow, 0,
+            "expected Slowloris connection to be closed by header_read_timeout"
+        );
+
+        // Meanwhile SSE stream on slot #1 must still complete with "data: done".
+        let mut sse_bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), sse_conn.read_to_end(&mut sse_bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let sse_str = String::from_utf8_lossy(&sse_bytes);
+        assert!(
+            sse_str.contains("200 OK"),
+            "unexpected SSE response: {sse_str}"
+        );
+        assert!(
+            sse_str.contains("data: done"),
+            "SSE stream was prematurely terminated: {sse_str}"
+        );
+
+        // 3. Idle Keep-Alive connection is gracefully closed after idle_keepalive_timeout (~180ms).
+        let mut ka_conn = TcpStream::connect(addr).await.unwrap();
+        ka_conn
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut ka_buf = [0u8; 512];
+        let n_ka = ka_conn.read(&mut ka_buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&ka_buf[..n_ka]).contains("200 OK"));
+        let n_eof = tokio::time::timeout(Duration::from_millis(450), ka_conn.read(&mut probe))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n_eof, 0, "expected idle keep-alive connection to be reaped");
+
+        srv.shutdown().await.unwrap();
+        up_task.abort();
     }
 }

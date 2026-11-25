@@ -176,16 +176,25 @@ where
     }
 }
 
+pub(crate) trait StreamValidator: Send + Sync + Unpin {
+    fn validate_chunk(&mut self, chunk: &[u8]) -> io::Result<()>;
+    fn validate_eof(&mut self) -> io::Result<()>;
+}
+
 pub(crate) struct PrefixedBody<B> {
     prefix: Option<Bytes>,
     rest: B,
+    validator: Option<Box<dyn StreamValidator>>,
+    done: bool,
 }
 
 impl<B> PrefixedBody<B> {
-    pub(crate) fn new(prefix: Bytes, rest: B) -> Self {
+    pub(crate) fn new(prefix: Bytes, rest: B, validator: Box<dyn StreamValidator>) -> Self {
         Self {
             prefix: (!prefix.is_empty()).then_some(prefix),
             rest,
+            validator: Some(validator),
+            done: false,
         }
     }
 }
@@ -202,13 +211,47 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
         let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
         if let Some(prefix) = this.prefix.take() {
             return Poll::Ready(Some(Ok(Frame::data(prefix))));
         }
-        Pin::new(&mut this.rest).poll_frame(cx)
+        match Pin::new(&mut this.rest).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(validator) = this.validator.as_mut()
+                    && let Some(chunk) = frame.data_ref()
+                    && !chunk.is_empty()
+                    && let Err(err) = validator.validate_chunk(chunk)
+                {
+                    this.validator = None;
+                    this.done = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                this.validator = None;
+                this.done = true;
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                this.done = true;
+                if let Some(mut validator) = this.validator.take()
+                    && let Err(err) = validator.validate_eof()
+                {
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
+        if self.validator.is_some() {
+            return SizeHint::default();
+        }
         let rest_hint = self.rest.size_hint();
         let prefix_len = self.prefix.as_ref().map_or(0, |b| b.len() as u64);
         let mut out = SizeHint::new();
@@ -220,7 +263,8 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.prefix.is_none() && self.rest.is_end_stream()
+        self.done
+            || (self.prefix.is_none() && self.validator.is_none() && self.rest.is_end_stream())
     }
 }
 
@@ -246,5 +290,60 @@ mod tests {
 
         drop(retained);
         assert_eq!(budget.used(), 0);
+    }
+
+    struct RejectOnMarker {
+        saw_ok: bool,
+        allow_eof: bool,
+    }
+
+    impl StreamValidator for RejectOnMarker {
+        fn validate_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+            if chunk.contains(&b'!') {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk"));
+            }
+            self.saw_ok = true;
+            Ok(())
+        }
+
+        fn validate_eof(&mut self) -> io::Result<()> {
+            if self.allow_eof && self.saw_ok {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "truncated eof"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prefixed_body_validator_aborts_before_bad_frame_and_checks_eof() {
+        let budget = ByteBudget::new(1024);
+        let rest = ProxyBody::new(Full::new(Bytes::from_static(b"bad!chunk")), budget.clone());
+        let mut body = PrefixedBody::new(
+            Bytes::from_static(b"prefix:"),
+            rest,
+            Box::new(RejectOnMarker {
+                saw_ok: false,
+                allow_eof: true,
+            }),
+        );
+        let f0 = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(&f0[..], b"prefix:");
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(body.frame().await.is_none());
+
+        let rest_eof = ProxyBody::new(Full::new(Bytes::from_static(b"clean")), budget);
+        let mut body_eof = PrefixedBody::new(
+            Bytes::from_static(b"prefix:"),
+            rest_eof,
+            Box::new(RejectOnMarker {
+                saw_ok: false,
+                allow_eof: false,
+            }),
+        );
+        assert!(body_eof.frame().await.unwrap().is_ok());
+        assert!(body_eof.frame().await.unwrap().is_ok());
+        assert!(body_eof.frame().await.unwrap().is_err());
+        assert!(body_eof.frame().await.is_none());
     }
 }

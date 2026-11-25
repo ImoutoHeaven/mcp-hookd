@@ -44,6 +44,11 @@ const MAX_VERIFY_IP_ENTRIES: usize = 4096;
 pub type DnsFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
 pub type DnsResolver = Arc<dyn Fn(&str, u16) -> DnsFuture + Send + Sync>;
 
+#[cfg(test)]
+pub type TcpDialFuture = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
+#[cfg(test)]
+pub type TcpDialer = Arc<dyn Fn(SocketAddr) -> TcpDialFuture + Send + Sync>;
+
 /// Result of a synchronous callback verification challenge.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerifyError {
@@ -353,6 +358,8 @@ pub struct SafeHttpsConnector {
     tls_config: Arc<ClientConfig>,
     allow_loopback: bool,
     resolver: DnsResolver,
+    #[cfg(test)]
+    dialer: Option<TcpDialer>,
     verify_ip_limiter: Option<Arc<Mutex<IpVerifyLimiter>>>,
 }
 
@@ -372,8 +379,16 @@ impl SafeHttpsConnector {
             tls_config,
             allow_loopback,
             resolver,
+            #[cfg(test)]
+            dialer: None,
             verify_ip_limiter: None,
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_dialer(mut self, dialer: TcpDialer) -> Self {
+        self.dialer = Some(dialer);
+        self
     }
 
     fn with_verify_ip_limiter(mut self, limiter: Arc<Mutex<IpVerifyLimiter>>) -> Self {
@@ -395,6 +410,8 @@ impl Service<Uri> for SafeHttpsConnector {
         let tls_config = Arc::clone(&self.tls_config);
         let allow_loopback = self.allow_loopback;
         let resolver = Arc::clone(&self.resolver);
+        #[cfg(test)]
+        let dialer = self.dialer.clone();
         let verify_ip_limiter = self.verify_ip_limiter.clone();
 
         Box::pin(async move {
@@ -440,7 +457,15 @@ impl Service<Uri> for SafeHttpsConnector {
                     }
                     dialed.store(true, Ordering::Release);
                 }
-                match TcpStream::connect(addr).await {
+                #[cfg(test)]
+                let connect_res = match &dialer {
+                    Some(d) => (d)(addr).await,
+                    None => TcpStream::connect(addr).await,
+                };
+                #[cfg(not(test))]
+                let connect_res = TcpStream::connect(addr).await;
+
+                match connect_res {
                     Ok(stream) => {
                         let _ = stream.set_nodelay(true);
                         connected_tcp = Some((stream, addr.ip()));
@@ -841,7 +866,7 @@ mod tests {
         }
     }
 
-    async fn spawn_tls_server_on<F>(bind_ip: &str, san: &str, responder: F) -> TestTlsServer
+    async fn spawn_tls_server<F>(san: &str, responder: F) -> TestTlsServer
     where
         F: Fn(http::HeaderMap, Bytes) -> (StatusCode, Vec<u8>) + Send + Sync + 'static,
     {
@@ -861,7 +886,7 @@ mod tests {
                 .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
 
-        let listener = TcpListener::bind((bind_ip, 0)).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_bg = Arc::clone(&requests);
@@ -911,13 +936,6 @@ mod tests {
             requests,
             handle,
         }
-    }
-
-    async fn spawn_tls_server<F>(san: &str, responder: F) -> TestTlsServer
-    where
-        F: Fn(http::HeaderMap, Bytes) -> (StatusCode, Vec<u8>) + Send + Sync + 'static,
-    {
-        spawn_tls_server_on("127.0.0.1", san, responder).await
     }
 
     #[test]
@@ -1341,18 +1359,12 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({ "challenge": ch })).unwrap(),
             )
         };
-        let victim = spawn_tls_server_on("127.0.0.1", "*.evil.test", echo_challenge).await;
-        let victim_addr = victim.addr;
-
-        // Bind a TCP socket without listening so connect() deterministically returns ECONNREFUSED.
-        let dead_sock = tokio::net::TcpSocket::new_v4().unwrap();
-        dead_sock
-            .bind(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 1, 250)),
-                0,
-            ))
-            .unwrap();
-        let dead_port = dead_sock.local_addr().unwrap().port();
+        let victim = spawn_tls_server("*.evil.test", echo_challenge).await;
+        let real_victim_addr = victim.addr;
+        let virt_victim_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 10)),
+            real_victim_addr.port(),
+        );
 
         // 1. Multi-A fallback: [unreachable_distinct_ip, victim_ip] must charge victim_ip on fallback.
         let resolver_fallback: DnsResolver = Arc::new(move |host, _port| {
@@ -1363,21 +1375,34 @@ mod tests {
                 .unwrap_or(0);
             let unreachable = SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(127, 0, 1, idx.saturating_add(1))),
-                dead_port,
+                9,
             );
-            Box::pin(async move { Ok(vec![unreachable, victim_addr]) })
+            Box::pin(async move { Ok(vec![unreachable, virt_victim_addr]) })
+        });
+        let dialer_fallback: TcpDialer = Arc::new(move |target| {
+            Box::pin(async move {
+                if target == virt_victim_addr {
+                    TcpStream::connect(real_victim_addr).await
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "simulated unreachable address",
+                    ))
+                }
+            })
         });
         let connector = SafeHttpsConnector::with_roots_and_resolver(
             victim.roots.clone(),
             true,
             resolver_fallback,
         )
-        .unwrap();
+        .unwrap()
+        .with_dialer(dialer_fallback);
         let client = OutboundClient::from_connector(connector, true, Duration::from_secs(60));
         let secret = test_secret(7);
 
         for i in 0..VERIFY_IP_RATE_LIMIT {
-            let url = format!("https://h{i}.evil.test:{}/cb", victim_addr.port());
+            let url = format!("https://h{i}.evil.test:{}/cb", real_victim_addr.port());
             client
                 .verify_callback(&url, &format!("sub_fb_{i}"), &secret)
                 .await
@@ -1387,7 +1412,7 @@ mod tests {
 
         let overflow_url = format!(
             "https://h{VERIFY_IP_RATE_LIMIT}.evil.test:{}/cb",
-            victim_addr.port()
+            real_victim_addr.port()
         );
         assert!(matches!(
             client
@@ -1397,79 +1422,42 @@ mod tests {
         ));
         assert_eq!(victim.requests.lock().await.len(), VERIFY_IP_RATE_LIMIT);
 
-        // 2. DNS rebinding: rebind.evil.test switches from 127.0.0.2 to saturated 127.0.0.3.
-        let ck_shared = rcgen::generate_simple_self_signed(vec!["*.evil.test".to_owned()]).unwrap();
-        let cert_der: CertificateDer<'static> = ck_shared.cert.der().clone();
-        let mut combined_roots = RootCertStore::empty();
-        combined_roots.add(cert_der.clone()).unwrap();
-        let spawn_with_cert = |bind_ip: &'static str| {
-            let cert_der = cert_der.clone();
-            let key_bytes = ck_shared.key_pair.serialize_der();
-            async move {
-                let server_cfg = ServerConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert_der],
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes)),
-                )
-                .unwrap();
-                let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
-                let listener = TcpListener::bind((bind_ip, 0)).await.unwrap();
-                let laddr = listener.local_addr().unwrap();
-                let handle = tokio::spawn(async move {
-                    while let Ok((tcp, _)) = listener.accept().await {
-                        let acceptor = acceptor.clone();
-                        tokio::spawn(async move {
-                            let Ok(tls) = acceptor.accept(tcp).await else {
-                                return;
-                            };
-                            let svc = service_fn(move |req: Request<Incoming>| async move {
-                                let body = req.into_body().collect().await.unwrap().to_bytes();
-                                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                                let ch = v["challenge"].as_str().unwrap();
-                                let out =
-                                    serde_json::to_vec(&serde_json::json!({ "challenge": ch }))
-                                        .unwrap();
-                                Ok::<_, hyper::Error>(
-                                    Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header(http::header::CONTENT_TYPE, "application/json")
-                                        .body(Full::new(Bytes::from(out)))
-                                        .unwrap(),
-                                )
-                            });
-                            let _ = http1::Builder::new()
-                                .keep_alive(true)
-                                .serve_connection(TokioIo::new(tls), svc)
-                                .await;
-                        });
-                    }
-                });
-                (laddr, handle)
-            }
-        };
-        let (addr_old, h_old) = spawn_with_cert("127.0.0.2").await;
-        let (addr_victim2, h_victim2) = spawn_with_cert("127.0.0.3").await;
-        let rebind_step2 = Arc::new(AtomicUsize::new(0));
-        let rebind_step2_bg = Arc::clone(&rebind_step2);
-        let resolver_rebind2: DnsResolver = Arc::new(move |host, _port| {
+        // 2. DNS rebinding: rebind.evil.test switches from virtual 127.0.0.2 to saturated 127.0.0.3
+        // while all real listeners stay bound on portable 127.0.0.1:0.
+        let srv_old_and_rebound = spawn_tls_server("*.evil.test", echo_challenge).await;
+        let real_srv_addr = srv_old_and_rebound.addr;
+        let virt_old = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            real_srv_addr.port(),
+        );
+        let virt_saturated = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)),
+            real_srv_addr.port(),
+        );
+
+        let rebind_step = Arc::new(AtomicUsize::new(0));
+        let rebind_step_bg = Arc::clone(&rebind_step);
+        let resolver_rebind: DnsResolver = Arc::new(move |host, _port| {
             let is_rebind = host == "rebind.evil.test";
-            let step = rebind_step2_bg.load(Ordering::SeqCst);
+            let step = rebind_step_bg.load(Ordering::SeqCst);
             Box::pin(async move {
                 if is_rebind && step == 0 {
-                    Ok(vec![addr_old])
+                    Ok(vec![virt_old])
                 } else {
-                    Ok(vec![addr_victim2])
+                    Ok(vec![virt_saturated])
                 }
             })
         });
-        let connector2 =
-            SafeHttpsConnector::with_roots_and_resolver(combined_roots, true, resolver_rebind2)
-                .unwrap();
+        let dialer_rebind: TcpDialer =
+            Arc::new(move |_target| Box::pin(TcpStream::connect(real_srv_addr)));
+
+        let connector2 = SafeHttpsConnector::with_roots_and_resolver(
+            srv_old_and_rebound.roots.clone(),
+            true,
+            resolver_rebind,
+        )
+        .unwrap()
+        .with_dialer(dialer_rebind);
         // Zero conn_max_lifetime forces fresh DNS dial on each call instead of reusing pooled socket.
         let client2 = OutboundClient::from_connector(connector2, true, Duration::ZERO);
 
@@ -1483,16 +1471,18 @@ mod tests {
                 .await
                 .unwrap();
         }
-        rebind_step2.store(1, Ordering::SeqCst);
+        let before_rebind = srv_old_and_rebound.requests.lock().await.len();
+        rebind_step.store(1, Ordering::SeqCst);
         assert!(matches!(
             client2
                 .verify_callback("https://rebind.evil.test/cb", "sub_rb_rebound", &secret)
                 .await,
             Err(VerifyError::RateLimited(_))
         ));
-
-        h_old.abort();
-        h_victim2.abort();
+        assert_eq!(
+            srv_old_and_rebound.requests.lock().await.len(),
+            before_rebind
+        );
     }
 
     #[tokio::test]

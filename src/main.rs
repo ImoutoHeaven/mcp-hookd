@@ -20,12 +20,12 @@ struct Cli {
 enum Command {
     /// Validate configuration and exit.
     Check {
-        #[arg(long, env = "HOOKD_CONFIG", default_value = "hookd.json")]
+        #[arg(short, long, env = "HOOKD_CONFIG", default_value = "hookd.json")]
         config: PathBuf,
     },
     /// Run the HTTP facade and webhook delivery daemon in the foreground.
     Serve {
-        #[arg(long, env = "HOOKD_CONFIG", default_value = "hookd.json")]
+        #[arg(short, long, env = "HOOKD_CONFIG", default_value = "hookd.json")]
         config: PathBuf,
     },
     /// Send one event or a stream of NDJSON events to POST /v1/events.
@@ -88,5 +88,44 @@ fn main() -> ExitCode {
                 token: None,
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn cli_accepts_short_and_long_config_flags_for_check_and_serve() {
+        let check_short = Cli::try_parse_from(["mcp-hookd", "check", "-c", "a.json"]).unwrap();
+        assert!(matches!(
+            check_short.command,
+            Command::Check { config } if config == Path::new("a.json")
+        ));
+
+        let check_long = Cli::try_parse_from(["mcp-hookd", "check", "--config", "b.json"]).unwrap();
+        assert!(matches!(
+            check_long.command,
+            Command::Check { config } if config == Path::new("b.json")
+        ));
+
+        let check_default = Cli::try_parse_from(["mcp-hookd", "check"]).unwrap();
+        assert!(matches!(
+            check_default.command,
+            Command::Check { config } if config == Path::new("hookd.json")
+        ));
+
+        let serve_short = Cli::try_parse_from(["mcp-hookd", "serve", "-c", "s.json"]).unwrap();
+        assert!(matches!(
+            serve_short.command,
+            Command::Serve { config } if config == Path::new("s.json")
+        ));
+
+        let serve_long = Cli::try_parse_from(["mcp-hookd", "serve", "--config", "t.json"]).unwrap();
+        assert!(matches!(
+            serve_long.command,
+            Command::Serve { config } if config == Path::new("t.json")
+        ));
     }
 }

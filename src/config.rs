@@ -451,16 +451,7 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
             let mut passthrough_prefixes = Vec::with_capacity(up.passthrough_prefixes.len());
             for (i, pref) in up.passthrough_prefixes.iter().enumerate() {
                 let field = format!("upstream.passthrough_prefixes[{i}]");
-                if !pref.starts_with('/') || !pref.ends_with('/') || pref == "/" {
-                    return Err(format!(
-                        "{field}: passthrough prefix must start and end with '/' and not be '/'"
-                    ));
-                }
-                if resource_path.starts_with(pref) || pref.starts_with(&resource_path) {
-                    return Err(format!(
-                        "{field}: prefix '{pref}' collides with resource_path '{resource_path}'"
-                    ));
-                }
+                validate_passthrough_prefix(&field, pref, &resource_path, url.path())?;
                 passthrough_prefixes.push(pref.clone());
             }
             let mut expose_events = Vec::with_capacity(up.expose_events.len());
@@ -558,6 +549,58 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
         upstream,
         ingest,
     })
+}
+
+fn validate_passthrough_prefix(
+    field: &str,
+    pref: &str,
+    resource_path: &str,
+    upstream_path: &str,
+) -> Result<(), String> {
+    if pref.len() < 3 || !pref.starts_with('/') || !pref.ends_with('/') {
+        return Err(format!(
+            "{field}: passthrough prefix {pref:?} must start and end with '/' and name a subpath (such as \"/t/\")"
+        ));
+    }
+    if pref.contains("..")
+        || pref.contains('\\')
+        || pref.contains('?')
+        || pref.contains('#')
+        || pref.contains('%')
+        || pref.contains("//")
+        || pref.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "{field}: passthrough prefix {pref:?} contains forbidden characters"
+        ));
+    }
+    let lower = pref.to_ascii_lowercase();
+    let res_dir = format!(
+        "{}/",
+        resource_path.trim_end_matches('/').to_ascii_lowercase()
+    );
+    if lower.starts_with(&res_dir) || res_dir.starts_with(&lower) {
+        return Err(format!(
+            "{field}: prefix {pref:?} overlaps resource_path {resource_path:?}"
+        ));
+    }
+    for reserved in ["/healthz/", "/v1/", "/v1/events/"] {
+        if lower.starts_with(reserved) || reserved.starts_with(&lower) {
+            return Err(format!(
+                "{field}: prefix {pref:?} overlaps reserved route {reserved:?}"
+            ));
+        }
+    }
+    let trimmed_up = upstream_path.trim_end_matches('/');
+    if !trimmed_up.is_empty() {
+        let up_dir = format!("{}/", trimmed_up.to_ascii_lowercase());
+        if lower.starts_with(&up_dir) || up_dir.starts_with(&lower) {
+            return Err(format!(
+                "{field}: prefix {pref:?} overlaps upstream.url path {upstream_path:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_check_url(url: &Url) -> Result<(), String> {
@@ -832,5 +875,65 @@ mod tests {
             }
         }"#;
         assert!(Config::parse_json_with_env(dup, |_| None).is_err());
+    }
+
+    #[test]
+    fn validates_passthrough_prefixes_against_forbidden_chars_reserved_and_upstream_paths() {
+        let make = |resource_path: &str, upstream_url: &str, prefix: &str| {
+            serde_json::json!({
+                "listen": "127.0.0.1:8081",
+                "resource_path": resource_path,
+                "state_path": "/tmp/s.json",
+                "profile": "sep3415",
+                "inbound_tokens": ["inbound_secret_token_01"],
+                "upstream": {
+                    "url": upstream_url,
+                    "passthrough_prefixes": [prefix]
+                }
+            })
+            .to_string()
+        };
+
+        assert!(
+            Config::parse_json_with_env(
+                &make("/mcp", "http://127.0.0.1:8765/rpc/mcp", "/t/"),
+                |_| None
+            )
+            .is_ok()
+        );
+
+        for bad in [
+            "/",
+            "/t",
+            "t/",
+            "//",
+            "/t//a/",
+            "/t/../a/",
+            "/t/a\\b/",
+            "/t/a?b/",
+            "/t/a#b/",
+            "/t/%2f/",
+            "/t/a b/",
+            "/t/a\nb/",
+            "/mcp/",
+            "/MCP/sub/",
+            "/healthz/",
+            "/healthz/live/",
+            "/v1/",
+            "/v1/events/",
+            "/v1/other/",
+            "/rpc/",
+            "/rpc/mcp/",
+        ] {
+            let raw = make("/mcp", "http://127.0.0.1:8765/rpc/mcp", bad);
+            assert!(
+                Config::parse_json_with_env(&raw, |_| None).is_err(),
+                "expected passthrough prefix {bad:?} to be rejected"
+            );
+        }
+
+        // Prefix enclosing a nested resource_path must also be rejected.
+        let nested_res = make("/api/mcp", "http://127.0.0.1:8765/backend", "/api/");
+        assert!(Config::parse_json_with_env(&nested_res, |_| None).is_err());
     }
 }

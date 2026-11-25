@@ -523,17 +523,26 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
-    // 3. /t/ GET, HEAD, PUT passthrough + %2e%2e traversal blocked + POST 405
+    // 3. /t/ GET, HEAD, PUT passthrough + Origin check + %2e%2e traversal blocked + POST 405
     let (st, _, body) = send_http(
         &client,
         Method::GET,
         &format!("{base_url}/t/item1"),
-        &[],
+        &[("origin", "https://allowed.example.com")],
         Bytes::new(),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(&body[..], b"hello-world");
+    let (st_bad_origin, _, _) = send_http(
+        &client,
+        Method::GET,
+        &format!("{base_url}/t/item1"),
+        &[("origin", "https://evil.example.com")],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_bad_origin, StatusCode::FORBIDDEN);
     let (st, _, _) = send_http(
         &client,
         Method::HEAD,
@@ -2583,6 +2592,63 @@ async fn acceptance_7_streaming_passthrough_stateless_responses_and_multiframe_h
         "batch-ok"
     );
 
+    // Invalid batches, non-string method, and duplicate method return 400 JSON-RPC -32600
+    for bad_batch in [
+        &br#"[]"# [..],
+        &br#"[1]"#[..],
+        &br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"events/poll"}]"#[..],
+    ] {
+        let (st_bad_b, _, body_bad_b) = send_http(
+            &client,
+            Method::POST,
+            &mcp_url,
+            &[
+                ("authorization", "Bearer inbound-secret-tok-1"),
+                ("content-type", "application/json"),
+            ],
+            Bytes::copy_from_slice(bad_batch),
+        )
+        .await;
+        assert_eq!(st_bad_b, StatusCode::BAD_REQUEST);
+        let parsed_err: Value = serde_json::from_slice(&body_bad_b).unwrap();
+        assert_eq!(parsed_err["error"]["code"], -32600);
+        assert!(parsed_err["id"].is_null());
+    }
+
+    let (st_non_str, _, body_non_str) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+        ],
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":77,"method":123}"#),
+    )
+    .await;
+    assert_eq!(st_non_str, StatusCode::BAD_REQUEST);
+    let err_non_str: Value = serde_json::from_slice(&body_non_str).unwrap();
+    assert_eq!(err_non_str["id"], 77);
+    assert_eq!(err_non_str["error"]["code"], -32600);
+
+    let (st_dup_m, _, body_dup_m) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+        ],
+        Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":78,"method":"tools/call","method":"events/poll"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_dup_m, StatusCode::BAD_REQUEST);
+    let err_dup_m: Value = serde_json::from_slice(&body_dup_m).unwrap();
+    assert_eq!(err_dup_m["id"], 78);
+    assert_eq!(err_dup_m["error"]["code"], -32600);
+
     let (st_future_notif, _, _) = send_http(
         &client,
         Method::POST,
@@ -2597,37 +2663,41 @@ async fn acceptance_7_streaming_passthrough_stateless_responses_and_multiframe_h
     .await;
     assert_eq!(st_future_notif, StatusCode::ACCEPTED);
 
-    // 4. Compressed Content-Encoding: gzip passes through on tools/call, returns 415 on intercepted Mcp-Method
-    let (st_gzip_ok, _, body_gzip_ok) = send_http(
-        &client,
-        Method::POST,
-        &mcp_url,
-        &[
+    // 4. Non-identity Content-Encoding on POST /mcp always returns 415 regardless of Mcp-Method; identity passes
+    for extra_hdrs in [
+        &[("content-encoding", "gzip"), ("mcp-method", "tools/call")][..],
+        &[("content-encoding", "gzip"), ("mcp-method", "events/poll")][..],
+        &[("content-encoding", "br")][..],
+    ] {
+        let mut hdrs = vec![
             ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
-            ("content-encoding", "gzip"),
-            ("mcp-method", "tools/call"),
-        ],
-        Bytes::from_static(b"compressed-bytes"),
-    )
-    .await;
-    assert_eq!(st_gzip_ok, StatusCode::OK);
-    assert_eq!(&body_gzip_ok[..], b"compressed-bytes");
+        ];
+        hdrs.extend_from_slice(extra_hdrs);
+        let (st_enc, _, _) = send_http(
+            &client,
+            Method::POST,
+            &mcp_url,
+            &hdrs,
+            Bytes::from_static(b"compressed-bytes"),
+        )
+        .await;
+        assert_eq!(st_enc, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
 
-    let (st_gzip_415, _, _) = send_http(
+    let (st_identity, _, _) = send_http(
         &client,
         Method::POST,
         &mcp_url,
         &[
             ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
-            ("content-encoding", "gzip"),
-            ("mcp-method", "events/poll"),
+            ("content-encoding", "IDENTITY"),
         ],
-        Bytes::from_static(b"compressed-bytes"),
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":91,"result":{}}"#),
     )
     .await;
-    assert_eq!(st_gzip_415, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(st_identity, StatusCode::ACCEPTED);
 
     // Non-JSON Content-Type passes through to upstream when upstream is present
     let (st_bin, _, body_bin) = send_http(

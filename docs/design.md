@@ -16,14 +16,14 @@ All inbound HTTP traffic arrives on `listen` and dispatches across four disjoint
 | :--- | :--- | :--- | :--- |
 | `<resource_path>` (default `/mcp`) | Always | `Origin` check + `inbound_tokens` + optional `auth_context` | MCP Streamable HTTP endpoint (`POST`, `GET`, `DELETE`); handles webhook subscriptions, capability injection, policy checks on `events/poll\|stream`, and streaming passthrough to `upstream`. |
 | `POST /v1/events` | `ingest` configured (`404` otherwise) | `ingest.tokens` (`Authorization: Bearer`) | Accepts a single `application/json` event object up to `256 KiB` (NDJSON line-splitting is performed client-side by `mcp-hookd emit --stream`), validates against precompiled `payload_schema`, deduplicates `(token_slot, name, eventId)`, and enqueues matching webhook deliveries. |
-| `<passthrough_prefixes>` | `upstream` configured | `inbound_tokens` (`Authorization: Bearer`) | Raw HTTP/SSE passthrough to the `upstream.url` origin (for example `/t/` file transfer routes) after path normalization; never injects `upstream.bearer_token`. |
+| `<passthrough_prefixes>` | `upstream` configured | `Origin` check (capability URL; no `inbound_tokens` required) | Raw HTTP (`GET`, `HEAD`, `PUT`) passthrough to the `upstream.url` origin (for example `/t/` capability file transfer routes) after path normalization; strips inbound `Authorization` and never injects `upstream.bearer_token`. |
 | `GET /healthz` | Always | None | Liveness probe returning `200 OK` with `{"ok":true}`. |
 
 ### Origin Validation, Path Normalization, and Header Sanitization
 
-Requests on `<resource_path>` that include an `Origin` header must match either an entry in `allowed_origins` (`scheme://host[:port]` with no path, query, or fragment) or a local `http` origin on the bound port (`http://127.0.0.1:<port>`, `http://localhost:<port>`, `http://[::1]:<port>`, or `http://<bound_ip>:<port>`). Disallowed or malformed `Origin` headers are rejected before authentication or body reads.
+Requests on `<resource_path>` and `<passthrough_prefixes>` that include an `Origin` header must match either an entry in `allowed_origins` (`scheme://host[:port]` with no path, query, or fragment) or a local `http` origin on the bound port (`http://127.0.0.1:<port>`, `http://localhost:<port>`, `http://[::1]:<port>`, or `http://<bound_ip>:<port>`). Disallowed, duplicate, or malformed `Origin` headers are rejected with `403 Forbidden` before body reads or upstream forwarding.
 
-Each entry in `upstream.passthrough_prefixes` must start and end with `/`, differ from `/`, and share no prefix overlap with `<resource_path>`. Candidate passthrough paths undergo up to `8` rounds of percent-decoding; `mcp-hookd` rejects paths containing `\`, `;`, NUL, control characters, malformed `%` sequences, empty segments (`//`), dot segments (`.` or `..`), or decodable `%` sequences remaining after round `8` with `400 Bad Request`, and requires both the raw path and fully decoded path to match the configured prefix.
+Each entry in `upstream.passthrough_prefixes` must start and end with `/` (`len >= 3`), contain no `..`, `\`, `?`, `#`, `%`, `//`, whitespace, or control characters, and share no prefix overlap with `<resource_path>`, reserved routes (`/healthz`, `/healthz/`, `/v1/`, `/v1/events`), or the `upstream.url` path. Candidate passthrough paths undergo up to `8` rounds of percent-decoding; `mcp-hookd` rejects paths containing `\`, `;`, NUL, control characters, malformed `%` sequences, empty segments (`//`), dot segments (`.` or `..`), or decodable `%` sequences remaining after round `8` with `400 Bad Request`, and requires both the raw path and fully decoded path to match the configured prefix.
 
 Before forwarding any request to `upstream`, `mcp-hookd` strips:
 
@@ -36,23 +36,26 @@ Before forwarding any request to `upstream`, `mcp-hookd` strips:
 
 ## 2. Orthogonal Passthrough and On-Demand Protocol Validation
 
-When `upstream` is configured, the upstream MCP server is the sole validation authority for HTTP transport headers (`Content-Type`, `Accept`, `Content-Encoding`), session lifecycle (`Mcp-Session-Id`), protocol version negotiation (`MCP-Protocol-Version`), and non-local JSON-RPC methods. `mcp-hookd` avoids imposing SDK-specific framing rules on traffic it does not terminate.
+When `upstream` is configured, the upstream MCP server is the sole validation authority for `Content-Type`, `Accept`, session lifecycle (`Mcp-Session-Id`), protocol version negotiation (`MCP-Protocol-Version`), and non-local JSON-RPC methods. `mcp-hookd` avoids imposing SDK-specific framing rules on traffic it does not terminate, while unconditionally rejecting compressed (`Content-Encoding` other than `identity`) `POST <resource_path>` requests so encoded bodies cannot obscure controlled MCP methods.
 
 ### Method and Verb Routing on `<resource_path>`
 
 - `GET <resource_path>` and `DELETE <resource_path>`: With `upstream` configured, requests stream directly to `upstream` after `Origin`, hop Bearer auth, `auth_context` verification, and header sanitization, preserving `Mcp-Session-Id`, `MCP-Protocol-Version`, and `Last-Event-ID`. Without `upstream`, `GET` returns `405 Method Not Allowed` and `DELETE` terminates local legacy sessions (`202 Accepted` if active, `404 Not Found` if unknown, `405 Method Not Allowed` for stateless `2026-07-28` without a session, or `400 Bad Request` when `Mcp-Session-Id` is missing or malformed).
-- `POST <resource_path>`: Incoming body chunks are buffered under a `ByteLease` from `PROXY_BYTE_BUDGET` (`64 MiB` total pool, `16 MiB` per-request limit) and scanned by a zero-AST depth-1 JSON lexical scanner.
+- `POST <resource_path>`: Requests carrying a non-empty `Content-Encoding` other than `identity` (case-insensitive) immediately return `415 Unsupported Media Type` regardless of `upstream` or `Mcp-Method`. Non-`application/json` `Content-Type` bodies stream directly to `upstream` (`415` when standalone). JSON request chunks are buffered under a `ByteLease` from `PROXY_BYTE_BUDGET` (`64 MiB` total pool, `16 MiB` buffered limit) and inspected by a zero-AST streaming JSON lexical scanner.
 
-### Zero-AST Depth-1 JSON Lexical Scanner
+### Zero-AST Streaming JSON Lexical Scanner
 
-The scanner tracks JSON tokens at nesting depth `1` over raw bytes, skipping nested objects, nested arrays, and escaped string literals without allocating a `serde_json::Value` tree. Because it scans past arbitrarily large depth-2 `params` values until the top-level fields are classified, requests that place large `params` before `"method"` cannot bypass `events/poll` or `events/stream` inspection.
+The scanner validates RFC 8259 JSON tokens and UTF-8 strings over raw bytes without allocating a `serde_json::Value` tree. Every incoming chunk is scanned to its end (with no early short-circuit after the first `"method"`), and when a request transitions to streaming `PrefixedBody` passthrough before root JSON EOF, the scanner moves into `PrefixedBody` to validate every subsequent frame and final EOF closure:
 
-As soon as classification completes, `mcp-hookd` splices the already-read byte prefix ahead of the remaining `hyper::body::Incoming` stream and forwards the request untouched to `upstream` with zero local protocol checks whenever any of the following holds:
+- On root JSON objects `{...}`, a non-string depth-1 `"method"` or a duplicate depth-1 `"method"` immediately returns `400 Bad Request` with JSON-RPC `-32600` (echoing any valid `id` already captured, or `null`) without buffering the rest of a `16 MiB` payload; if a second depth-1 `"method"`, syntax error, or trailing non-whitespace token appears in a later streamed frame, `PrefixedBody` aborts the outbound stream before yielding that frame.
+- On root JSON batch arrays `[...]`, the scanner inspects every depth-2 element object across single-buffer and multi-chunk `PrefixedBody` streams: empty batches `[]`, non-object elements, elements with non-string or duplicate `"method"`, or any element whose `"method"` matches one of the seven controlled methods (`initialize`, `server/discover`, `events/list`, `events/subscribe`, `events/unsubscribe`, `events/poll`, `events/stream`) are rejected with `400 Bad Request` and JSON-RPC `-32600`.
 
-1. `Content-Type` is anything other than `application/json`, or `Content-Encoding` is non-identity;
-2. The top-level JSON value starts with `[` (JSON-RPC batch);
-3. The top-level JSON object is a client-to-server JSON-RPC `Response` or `Error` containing `"result"` or `"error"` without `"method"` (for example client replies to upstream `sampling/createMessage`, `elicitation/create`, `roots/list`, or `ping` requests);
-4. The top-level `"method"` is outside the seven locally inspected methods listed below.
+Once the current chunk finishes scanning cleanly, `mcp-hookd` splices the validated prefix ahead of the remaining `hyper::body::Incoming` stream (`PrefixedBody`) and forwards the request to `upstream` whenever any of the following holds:
+
+1. `Content-Type` is anything other than `application/json` (with `identity` or omitted `Content-Encoding`);
+2. The top-level JSON value is a non-empty `[...]` batch of objects containing only non-controlled methods (for example `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`) or client `Response`/`Error` objects;
+3. The top-level JSON object is a client-to-server JSON-RPC `Response` or `Error` without `"method"` (for example client replies to upstream `sampling/createMessage`, `elicitation/create`, `roots/list`, or `ping` requests);
+4. The top-level `"method"` is a valid string outside the seven locally inspected methods listed below.
 
 | Method Group | Methods | Validation and Handling Contract |
 | :--- | :--- | :--- |
@@ -80,7 +83,7 @@ On `events/poll`, `events/stream`, `events/subscribe`, and `events/unsubscribe`,
 
 ### Hop Authentication (`inbound_tokens`)
 
-Every request to `<resource_path>` and `<passthrough_prefixes>` must carry a single `Authorization: Bearer <token>` header matching an entry in `inbound_tokens` under constant-time comparison (`subtle::ConstantTimeEq`). Every static token configured in `inbound_tokens[*]`, `auth_context.check_token`, `upstream.bearer_token`, and `ingest.tokens[*]` must be at least `16` visible ASCII characters (`0x21..=0x7E`). When `auth_context` is omitted, the authenticated caller principal is `token:<slot_index>`.
+Every request to `<resource_path>` must carry a single `Authorization: Bearer <token>` header matching an entry in `inbound_tokens` under constant-time comparison (`subtle::ConstantTimeEq`). Capability URL routes under `<passthrough_prefixes>` do not require `inbound_tokens`; they enforce browser `Origin` validation, strip any inbound `Authorization` header, and never inject `upstream.bearer_token`. Every static token configured in `inbound_tokens[*]`, `auth_context.check_token`, `upstream.bearer_token`, and `ingest.tokens[*]` must be at least `16` visible ASCII characters (`0x21..=0x7E`). When `auth_context` is omitted, the authenticated caller principal is `token:<slot_index>`.
 
 ### Delegated Subject Authorization (`auth_context`)
 

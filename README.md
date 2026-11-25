@@ -92,11 +92,11 @@ HOOKD_PRODUCER_TOKEN="$HOOKD_INGEST_TOKEN" \
 | `resource_path` | No | `"/mcp"` | MCP endpoint path starting with `/`; cannot be `/`, `/healthz`, or `/v1/events`. |
 | `state_path` | Yes | None | Atomic JSON state file path (`16 MiB` read/write limit, `0600` mode on Unix, owner-only DACL on Windows). |
 | `profile` | Yes | None | `"sep3415"` or `"chatgpt"`; selects JSON-RPC error codes, gap handling, and `webhook-id` derivation. |
-| `inbound_tokens` | Yes | None | Non-empty list of hop Bearer tokens for `<resource_path>` and `passthrough_prefixes`; each token requires `>= 16` visible ASCII bytes (`0x21..=0x7E`). |
-| `allowed_origins` | No | `[]` | Additional `scheme://host[:port]` origins allowed on `<resource_path>` alongside local `http` loopback/bound-port origins. |
+| `inbound_tokens` | Yes | None | Non-empty list of hop Bearer tokens required on `<resource_path>`; each token requires `>= 16` visible ASCII bytes (`0x21..=0x7E`). |
+| `allowed_origins` | No | `[]` | Additional `scheme://host[:port]` origins allowed on `<resource_path>` and `passthrough_prefixes` alongside local `http` loopback/bound-port origins. |
 | `max_ttl_secs` | No | `3600` | Maximum subscription TTL in seconds (`60..=86400`; default requested TTL when omitted is `1800`). |
 | `auth_context` | No | Omitted | Delegated OAuth verification (`check_url`, `check_token` `>= 16` visible ASCII, `expected_resource`, `reverify_secs` in `5..=300` defaulting to `15`). Plain `http://` in `check_url` requires a literal loopback IP. |
-| `upstream` | Conditional | Omitted | Upstream HTTP MCP target (`url`, optional `bearer_token` `>= 16` visible ASCII, `passthrough_prefixes`, `request_timeout_secs` default `300`, `expose_events` with `name` and `disallow_arguments`). |
+| `upstream` | Conditional | Omitted | Upstream HTTP MCP target (`url`, optional `bearer_token` `>= 16` visible ASCII, `passthrough_prefixes` capability URL subpaths with `Origin` check and stripped `Authorization` without requiring `inbound_tokens` or injecting `bearer_token`, `request_timeout_secs` default `300`, `expose_events` with `name` and `disallow_arguments`). |
 | `ingest` | Conditional | Omitted | Local producer ingest (`tokens` `>= 16` visible ASCII, `events` with unique `name`, `description` `1..=400` chars, scalar `filter_fields`, and offline `payload_schema`). |
 
 ## Further Documentation
