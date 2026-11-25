@@ -2348,7 +2348,13 @@ async fn acceptance_7_streaming_passthrough_stateless_responses_and_multiframe_h
         async move {
             let method = req.method().clone();
             let headers = req.headers().clone();
-            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let Ok(collected) = req.into_body().collect().await else {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+            };
+            let body = collected.to_bytes();
 
             if method == Method::GET {
                 return Response::builder()
@@ -2648,6 +2654,133 @@ async fn acceptance_7_streaming_passthrough_stateless_responses_and_multiframe_h
     let err_dup_m: Value = serde_json::from_slice(&body_dup_m).unwrap();
     assert_eq!(err_dup_m["id"], 78);
     assert_eq!(err_dup_m["error"]["code"], -32600);
+
+    // Real multi-chunk TCP HTTP/1.1 requests after PassthroughStream cutover return 400 (-32600) and 413 (not 502)
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let srv_addr = server.local_addr();
+
+        // (a) Chunk 1 enters PassthroughStream on tools/call; Chunk 2 injects duplicate method -> 400 (-32600, id=79)
+        let mut conn = TcpStream::connect(srv_addr).await.unwrap();
+        let _ = conn.set_nodelay(true);
+        conn.write_all(
+            b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer inbound-secret-tok-1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let c1 = br#"{"jsonrpc":"2.0","id":79,"method":"tools/call","params":{"a":"1""#;
+        conn.write_all(format!("{:x}\r\n", c1.len()).as_bytes())
+            .await
+            .unwrap();
+        conn.write_all(c1).await.unwrap();
+        conn.write_all(b"\r\n").await.unwrap();
+        conn.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let c2 = br#"},"method":"events/poll"}"#;
+        let _ = conn
+            .write_all(format!("{:x}\r\n", c2.len()).as_bytes())
+            .await;
+        let _ = conn.write_all(c2).await;
+        let _ = conn.write_all(b"\r\n0\r\n\r\n").await;
+        let _ = conn.flush().await;
+
+        let mut raw_resp = Vec::new();
+        conn.read_to_end(&mut raw_resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&raw_resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected 400 Bad Request on split duplicate method, got: {resp_str}"
+        );
+        let body_part = resp_str.split("\r\n\r\n").nth(1).unwrap();
+        let parsed: Value = serde_json::from_str(body_part).unwrap();
+        assert_eq!(parsed["id"], 79);
+        assert_eq!(parsed["error"]["code"], -32600);
+
+        // (b) Chunk 1 enters PassthroughStream on batch element 1; Chunk 2 injects controlled method -> 400 (-32600, id=null)
+        let mut bconn = TcpStream::connect(srv_addr).await.unwrap();
+        let _ = bconn.set_nodelay(true);
+        bconn
+            .write_all(
+                b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer inbound-secret-tok-1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let bc1 = br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},"#;
+        bconn
+            .write_all(format!("{:x}\r\n", bc1.len()).as_bytes())
+            .await
+            .unwrap();
+        bconn.write_all(bc1).await.unwrap();
+        bconn.write_all(b"\r\n").await.unwrap();
+        bconn.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let bc2 = br#"{"jsonrpc":"2.0","id":2,"method":"events/poll"}]"#;
+        let _ = bconn
+            .write_all(format!("{:x}\r\n", bc2.len()).as_bytes())
+            .await;
+        let _ = bconn.write_all(bc2).await;
+        let _ = bconn.write_all(b"\r\n0\r\n\r\n").await;
+        let _ = bconn.flush().await;
+
+        let mut raw_bresp = Vec::new();
+        bconn.read_to_end(&mut raw_bresp).await.unwrap();
+        let bresp_str = String::from_utf8_lossy(&raw_bresp);
+        assert!(
+            bresp_str.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected 400 Bad Request on split controlled batch, got: {bresp_str}"
+        );
+        let bbody_part = bresp_str.split("\r\n\r\n").nth(1).unwrap();
+        let bparsed: Value = serde_json::from_str(bbody_part).unwrap();
+        assert!(bparsed["id"].is_null());
+        assert_eq!(bparsed["error"]["code"], -32600);
+
+        // (c) Chunk 1 enters PassthroughStream; subsequent chunks exceed 16 MiB -> 413 Payload Too Large (not 502)
+        let mut lconn = TcpStream::connect(srv_addr).await.unwrap();
+        let _ = lconn.set_nodelay(true);
+        lconn
+            .write_all(
+                b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer inbound-secret-tok-1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let lc1 = br#"{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"blob":""#;
+        lconn
+            .write_all(format!("{:x}\r\n", lc1.len()).as_bytes())
+            .await
+            .unwrap();
+        lconn.write_all(lc1).await.unwrap();
+        lconn.write_all(b"\r\n").await.unwrap();
+        lconn.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let pad_chunk = vec![b'x'; 256 * 1024];
+        let chunk_header = format!("{:x}\r\n", pad_chunk.len());
+        // 65 * 256 KiB = 16.25 MiB > MAX_REQUEST_BODY_BYTES (16 MiB)
+        for _ in 0..65 {
+            if lconn.write_all(chunk_header.as_bytes()).await.is_err() {
+                break;
+            }
+            if lconn.write_all(&pad_chunk).await.is_err() {
+                break;
+            }
+            if lconn.write_all(b"\r\n").await.is_err() {
+                break;
+            }
+        }
+        let _ = lconn.flush().await;
+
+        let mut raw_lresp = Vec::new();
+        lconn.read_to_end(&mut raw_lresp).await.unwrap();
+        let lresp_str = String::from_utf8_lossy(&raw_lresp);
+        assert!(
+            lresp_str.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "expected 413 Payload Too Large on >16 MiB split stream, got: {lresp_str}"
+        );
+    }
 
     let (st_future_notif, _, _) = send_http(
         &client,

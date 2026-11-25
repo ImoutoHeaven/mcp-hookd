@@ -59,6 +59,8 @@ struct ListenerLimits {
     max_connections: usize,
     header_read_timeout: Duration,
     idle_keepalive_timeout: Duration,
+    body_read_timeout: Duration,
+    max_request_body_bytes: usize,
 }
 
 impl Default for ListenerLimits {
@@ -67,6 +69,8 @@ impl Default for ListenerLimits {
             max_connections: MAX_CONCURRENT_CONNECTIONS,
             header_read_timeout: HEADER_READ_TIMEOUT,
             idle_keepalive_timeout: IDLE_KEEPALIVE_TIMEOUT,
+            body_read_timeout: BODY_READ_TIMEOUT,
+            max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
         }
     }
 }
@@ -230,6 +234,7 @@ impl LegacySessionStore {
 struct ServerState {
     engine: Arc<HookdEngine>,
     bound_addr: SocketAddr,
+    limits: ListenerLimits,
     legacy_sessions: Mutex<LegacySessionStore>,
 }
 
@@ -298,6 +303,7 @@ async fn start_server_with_limits(
     let state = Arc::new(ServerState {
         engine: Arc::clone(&engine),
         bound_addr,
+        limits,
         legacy_sessions: Mutex::new(LegacySessionStore::new()),
     });
 
@@ -803,7 +809,8 @@ async fn handle_mcp_post(
 
     let scanned = match scan_or_buffer_json_body(
         incoming,
-        MAX_REQUEST_BODY_BYTES,
+        state.limits.max_request_body_bytes,
+        state.limits.body_read_timeout,
         state.engine.pools(),
         prefer_control,
     )
@@ -844,12 +851,37 @@ async fn handle_mcp_post(
                 Some(scanner) => {
                     // Force chunked framing so validate_eof runs before the upstream body completes.
                     parts.headers.remove(header::CONTENT_LENGTH);
+                    let abort_slot: Arc<Mutex<Option<StreamAbortReason>>> =
+                        Arc::new(Mutex::new(None));
+                    let validator = PassthroughBodyValidator {
+                        scanner,
+                        abort_slot: Arc::clone(&abort_slot),
+                    };
                     let body = PrefixedBody::new(
                         prefix,
                         ProxyBody::new(rest, Arc::clone(&state.engine.pools().proxy)),
-                        Box::new(scanner),
+                        Box::new(validator),
+                        state.limits.max_request_body_bytes,
+                        state.limits.body_read_timeout,
                     );
-                    forward_post_to_upstream(&state, &parts.headers, body).await
+                    let Some(upstream) = state.engine.upstream_client() else {
+                        return empty_response(StatusCode::NOT_FOUND);
+                    };
+                    let forward_res = upstream
+                        .forward_raw(Method::POST, None, &parts.headers, body, true, None)
+                        .await;
+                    if let Some(reason) =
+                        abort_slot.lock().unwrap_or_else(|p| p.into_inner()).take()
+                    {
+                        return stream_abort_response(reason);
+                    }
+                    match forward_res {
+                        Ok(resp) => {
+                            relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy))
+                        }
+                        Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
+                        Err(_) => empty_response(StatusCode::BAD_GATEWAY),
+                    }
                 }
             }
         }
@@ -1222,7 +1254,8 @@ async fn handle_mcp_post_local_only(
 
     let raw_body = match read_local_json_body_scanned(
         incoming,
-        MAX_REQUEST_BODY_BYTES,
+        state.limits.max_request_body_bytes,
+        state.limits.body_read_timeout,
         state.engine.pools(),
         prefer_control,
     )
@@ -3285,6 +3318,121 @@ impl TopLevelJsonScanner {
     }
 }
 
+#[derive(Clone, Debug)]
+enum StreamAbortReason {
+    InvalidRequest {
+        id: Option<Value>,
+        message: &'static str,
+    },
+    ParseError,
+    PayloadTooLarge,
+    BodyTimeout,
+    BudgetExhausted,
+}
+
+struct PassthroughBodyValidator {
+    scanner: TopLevelJsonScanner,
+    abort_slot: Arc<Mutex<Option<StreamAbortReason>>>,
+}
+
+impl PassthroughBodyValidator {
+    fn record(&self, reason: StreamAbortReason) {
+        let mut guard = self.abort_slot.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = Some(reason);
+        }
+    }
+}
+
+impl StreamValidator for PassthroughBodyValidator {
+    fn validate_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
+        match self.scanner.feed_chunk(chunk) {
+            ScanDecision::Passthrough | ScanDecision::NeedMore => Ok(()),
+            ScanDecision::Intercepted => {
+                let message = "Invalid Request: controlled MCP method in passthrough stream";
+                self.record(StreamAbortReason::InvalidRequest {
+                    id: self.scanner.captured_id(),
+                    message,
+                });
+                Err(io::Error::new(io::ErrorKind::InvalidData, message))
+            }
+            ScanDecision::InvalidRequest(message) => {
+                self.record(StreamAbortReason::InvalidRequest {
+                    id: self.scanner.captured_id(),
+                    message,
+                });
+                Err(io::Error::new(io::ErrorKind::InvalidData, message))
+            }
+            ScanDecision::Malformed => {
+                self.record(StreamAbortReason::ParseError);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed JSON in passthrough stream",
+                ))
+            }
+        }
+    }
+
+    fn validate_eof(&mut self) -> io::Result<()> {
+        match self.scanner.finish_eof() {
+            ScanDecision::Passthrough => Ok(()),
+            ScanDecision::InvalidRequest(message) => {
+                self.record(StreamAbortReason::InvalidRequest {
+                    id: self.scanner.captured_id(),
+                    message,
+                });
+                Err(io::Error::new(io::ErrorKind::InvalidData, message))
+            }
+            ScanDecision::Malformed | ScanDecision::NeedMore | ScanDecision::Intercepted => {
+                self.record(StreamAbortReason::ParseError);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated or invalid JSON at passthrough EOF",
+                ))
+            }
+        }
+    }
+
+    fn on_too_large(&mut self) {
+        self.record(StreamAbortReason::PayloadTooLarge);
+    }
+
+    fn on_timeout(&mut self) {
+        self.record(StreamAbortReason::BodyTimeout);
+    }
+
+    fn on_read_error(&mut self, err: &io::Error) {
+        if err.kind() == io::ErrorKind::OutOfMemory {
+            self.record(StreamAbortReason::BudgetExhausted);
+        } else {
+            self.record(StreamAbortReason::ParseError);
+        }
+    }
+}
+
+fn stream_abort_response(reason: StreamAbortReason) -> Response<RespBody> {
+    match reason {
+        StreamAbortReason::InvalidRequest { id, message } => jsonrpc_error(
+            StatusCode::BAD_REQUEST,
+            id.unwrap_or(Value::Null),
+            -32600,
+            message,
+            None,
+        ),
+        StreamAbortReason::ParseError => jsonrpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32700,
+            "Parse error",
+            None,
+        ),
+        StreamAbortReason::PayloadTooLarge => empty_response(StatusCode::PAYLOAD_TOO_LARGE),
+        StreamAbortReason::BodyTimeout => empty_response(StatusCode::REQUEST_TIMEOUT),
+        StreamAbortReason::BudgetExhausted => empty_response(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[cfg(test)]
 impl StreamValidator for TopLevelJsonScanner {
     fn validate_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
         match self.feed_chunk(chunk) {
@@ -3402,6 +3550,7 @@ fn append_leased_chunk(
 async fn scan_or_buffer_json_body<B>(
     mut body: B,
     limit: usize,
+    frame_timeout: Duration,
     pools: &MemoryPools,
     prefer_control: bool,
 ) -> Result<ScannedPostBody<B>, BodyReadError>
@@ -3421,105 +3570,103 @@ where
             .ok_or(BodyReadError::BudgetExhausted)?
     };
     let mut using_control = prefer_control;
+    let mut out = LeasedBuffer::new(lease);
+    let mut scanner = TopLevelJsonScanner::new();
 
-    let scan_fut = async {
-        let mut out = LeasedBuffer::new(lease);
-        let mut scanner = TopLevelJsonScanner::new();
+    loop {
+        let next_frame = tokio::time::timeout(frame_timeout, body.frame())
+            .await
+            .map_err(|_| BodyReadError::Timeout)?;
+        let Some(frame) = next_frame else {
+            break;
+        };
+        let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
+        if let Ok(chunk) = frame.into_data() {
+            if chunk.is_empty() {
+                continue;
+            }
+            append_leased_chunk(
+                &mut out,
+                &chunk,
+                limit,
+                pools,
+                prefer_control,
+                true,
+                &mut using_control,
+            )?;
 
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
-            if let Ok(chunk) = frame.into_data() {
-                if chunk.is_empty() {
-                    continue;
-                }
-                append_leased_chunk(
-                    &mut out,
-                    &chunk,
-                    limit,
-                    pools,
-                    prefer_control,
-                    true,
-                    &mut using_control,
-                )?;
-
-                match scanner.feed_chunk(&chunk) {
-                    ScanDecision::Passthrough => {
-                        let captured_id = scanner.captured_id();
-                        if body.is_end_stream() {
-                            return match scanner.finish_eof() {
-                                ScanDecision::Passthrough => {
-                                    Ok(ScannedPostBody::PassthroughStream {
-                                        prefix: out.into_bytes(),
-                                        rest: body,
-                                        scanner: None,
-                                        captured_id,
-                                    })
-                                }
-                                ScanDecision::InvalidRequest(message) => {
-                                    Ok(ScannedPostBody::InvalidRequest {
-                                        captured_id: scanner.captured_id(),
-                                        message,
-                                    })
-                                }
-                                ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
+            match scanner.feed_chunk(&chunk) {
+                ScanDecision::Passthrough => {
+                    let captured_id = scanner.captured_id();
+                    if body.is_end_stream() {
+                        return match scanner.finish_eof() {
+                            ScanDecision::Passthrough => Ok(ScannedPostBody::PassthroughStream {
+                                prefix: out.into_bytes(),
+                                rest: body,
+                                scanner: None,
+                                captured_id,
+                            }),
+                            ScanDecision::InvalidRequest(message) => {
+                                Ok(ScannedPostBody::InvalidRequest {
                                     captured_id: scanner.captured_id(),
-                                }),
-                                ScanDecision::Intercepted | ScanDecision::NeedMore => {
-                                    Ok(ScannedPostBody::Buffered(out.into_bytes()))
-                                }
-                            };
-                        }
-                        return Ok(ScannedPostBody::PassthroughStream {
-                            prefix: out.into_bytes(),
-                            rest: body,
-                            scanner: Some(scanner),
-                            captured_id,
-                        });
+                                    message,
+                                })
+                            }
+                            ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
+                                captured_id: scanner.captured_id(),
+                            }),
+                            ScanDecision::Intercepted | ScanDecision::NeedMore => {
+                                Ok(ScannedPostBody::Buffered(out.into_bytes()))
+                            }
+                        };
                     }
-                    ScanDecision::InvalidRequest(message) => {
-                        return Ok(ScannedPostBody::InvalidRequest {
-                            captured_id: scanner.captured_id(),
-                            message,
-                        });
-                    }
-                    ScanDecision::Malformed => {
-                        return Ok(ScannedPostBody::Malformed {
-                            captured_id: scanner.captured_id(),
-                        });
-                    }
-                    ScanDecision::NeedMore | ScanDecision::Intercepted => {}
+                    return Ok(ScannedPostBody::PassthroughStream {
+                        prefix: out.into_bytes(),
+                        rest: body,
+                        scanner: Some(scanner),
+                        captured_id,
+                    });
                 }
+                ScanDecision::InvalidRequest(message) => {
+                    return Ok(ScannedPostBody::InvalidRequest {
+                        captured_id: scanner.captured_id(),
+                        message,
+                    });
+                }
+                ScanDecision::Malformed => {
+                    return Ok(ScannedPostBody::Malformed {
+                        captured_id: scanner.captured_id(),
+                    });
+                }
+                ScanDecision::NeedMore | ScanDecision::Intercepted => {}
             }
         }
+    }
 
-        match scanner.finish_eof() {
-            ScanDecision::Passthrough => Ok(ScannedPostBody::PassthroughStream {
-                prefix: out.into_bytes(),
-                rest: body,
-                scanner: None,
-                captured_id: scanner.captured_id(),
-            }),
-            ScanDecision::InvalidRequest(message) => Ok(ScannedPostBody::InvalidRequest {
-                captured_id: scanner.captured_id(),
-                message,
-            }),
-            ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
-                captured_id: scanner.captured_id(),
-            }),
-            ScanDecision::Intercepted | ScanDecision::NeedMore => {
-                Ok(ScannedPostBody::Buffered(out.into_bytes()))
-            }
+    match scanner.finish_eof() {
+        ScanDecision::Passthrough => Ok(ScannedPostBody::PassthroughStream {
+            prefix: out.into_bytes(),
+            rest: body,
+            scanner: None,
+            captured_id: scanner.captured_id(),
+        }),
+        ScanDecision::InvalidRequest(message) => Ok(ScannedPostBody::InvalidRequest {
+            captured_id: scanner.captured_id(),
+            message,
+        }),
+        ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
+            captured_id: scanner.captured_id(),
+        }),
+        ScanDecision::Intercepted | ScanDecision::NeedMore => {
+            Ok(ScannedPostBody::Buffered(out.into_bytes()))
         }
-    };
-
-    tokio::time::timeout(BODY_READ_TIMEOUT, scan_fut)
-        .await
-        .map_err(|_| BodyReadError::Timeout)?
+    }
 }
 
 async fn read_local_json_body_scanned<B>(
     mut body: B,
     limit: usize,
+    frame_timeout: Duration,
     pools: &MemoryPools,
     prefer_control: bool,
 ) -> Result<LocalScannedBody, BodyReadError>
@@ -3539,60 +3686,59 @@ where
             .ok_or(BodyReadError::BudgetExhausted)?
     };
     let mut using_control = prefer_control;
+    let mut out = LeasedBuffer::new(lease);
+    let mut scanner = TopLevelJsonScanner::new();
 
-    let read_fut = async {
-        let mut out = LeasedBuffer::new(lease);
-        let mut scanner = TopLevelJsonScanner::new();
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
-            if let Ok(chunk) = frame.into_data() {
-                if chunk.is_empty() {
-                    continue;
+    loop {
+        let next_frame = tokio::time::timeout(frame_timeout, body.frame())
+            .await
+            .map_err(|_| BodyReadError::Timeout)?;
+        let Some(frame) = next_frame else {
+            break;
+        };
+        let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
+        if let Ok(chunk) = frame.into_data() {
+            if chunk.is_empty() {
+                continue;
+            }
+            append_leased_chunk(
+                &mut out,
+                &chunk,
+                limit,
+                pools,
+                prefer_control,
+                true,
+                &mut using_control,
+            )?;
+            match scanner.feed_chunk(&chunk) {
+                ScanDecision::InvalidRequest(message) => {
+                    return Ok(LocalScannedBody::InvalidRequest {
+                        captured_id: scanner.captured_id(),
+                        message,
+                    });
                 }
-                append_leased_chunk(
-                    &mut out,
-                    &chunk,
-                    limit,
-                    pools,
-                    prefer_control,
-                    true,
-                    &mut using_control,
-                )?;
-                match scanner.feed_chunk(&chunk) {
-                    ScanDecision::InvalidRequest(message) => {
-                        return Ok(LocalScannedBody::InvalidRequest {
-                            captured_id: scanner.captured_id(),
-                            message,
-                        });
-                    }
-                    ScanDecision::Malformed => {
-                        return Ok(LocalScannedBody::Malformed {
-                            captured_id: scanner.captured_id(),
-                        });
-                    }
-                    ScanDecision::NeedMore
-                    | ScanDecision::Passthrough
-                    | ScanDecision::Intercepted => {}
+                ScanDecision::Malformed => {
+                    return Ok(LocalScannedBody::Malformed {
+                        captured_id: scanner.captured_id(),
+                    });
                 }
+                ScanDecision::NeedMore | ScanDecision::Passthrough | ScanDecision::Intercepted => {}
             }
         }
-        match scanner.finish_eof() {
-            ScanDecision::InvalidRequest(message) => Ok(LocalScannedBody::InvalidRequest {
-                captured_id: scanner.captured_id(),
-                message,
-            }),
-            ScanDecision::Malformed => Ok(LocalScannedBody::Malformed {
-                captured_id: scanner.captured_id(),
-            }),
-            ScanDecision::Passthrough | ScanDecision::Intercepted | ScanDecision::NeedMore => {
-                Ok(LocalScannedBody::Buffered(out.into_bytes()))
-            }
-        }
-    };
+    }
 
-    tokio::time::timeout(BODY_READ_TIMEOUT, read_fut)
-        .await
-        .map_err(|_| BodyReadError::Timeout)?
+    match scanner.finish_eof() {
+        ScanDecision::InvalidRequest(message) => Ok(LocalScannedBody::InvalidRequest {
+            captured_id: scanner.captured_id(),
+            message,
+        }),
+        ScanDecision::Malformed => Ok(LocalScannedBody::Malformed {
+            captured_id: scanner.captured_id(),
+        }),
+        ScanDecision::Passthrough | ScanDecision::Intercepted | ScanDecision::NeedMore => {
+            Ok(LocalScannedBody::Buffered(out.into_bytes()))
+        }
+    }
 }
 
 async fn read_request_body_leased<B>(
@@ -3992,9 +4138,15 @@ mod tests {
         let chunk3 = Bytes::from_static(br#""}}"#);
         let incoming = Chunks([chunk1.clone(), chunk2, chunk3].into());
 
-        let res = scan_or_buffer_json_body(incoming, MAX_REQUEST_BODY_BYTES, &pools, false)
-            .await
-            .unwrap();
+        let res = scan_or_buffer_json_body(
+            incoming,
+            MAX_REQUEST_BODY_BYTES,
+            BODY_READ_TIMEOUT,
+            &pools,
+            false,
+        )
+        .await
+        .unwrap();
         match res {
             ScannedPostBody::PassthroughStream {
                 prefix,
@@ -4008,6 +4160,8 @@ mod tests {
                     prefix,
                     ProxyBody::new(rest, Arc::clone(&pools.proxy)),
                     Box::new(scanner),
+                    MAX_REQUEST_BODY_BYTES,
+                    BODY_READ_TIMEOUT,
                 );
                 let _ = stream.frame().await.unwrap().unwrap();
                 let rem1 = stream.frame().await.unwrap().unwrap().into_data().unwrap();
@@ -4039,9 +4193,15 @@ mod tests {
                 ]
                 .into(),
             );
-            let res = scan_or_buffer_json_body(incoming, MAX_REQUEST_BODY_BYTES, &pools, false)
-                .await
-                .unwrap();
+            let res = scan_or_buffer_json_body(
+                incoming,
+                MAX_REQUEST_BODY_BYTES,
+                BODY_READ_TIMEOUT,
+                &pools,
+                false,
+            )
+            .await
+            .unwrap();
             assert!(matches!(res, ScannedPostBody::InvalidRequest { .. }));
             if bad_first.windows(7).any(|w| w == br#""id":42"#)
                 && let ScannedPostBody::InvalidRequest { captured_id, .. } = res
@@ -4062,6 +4222,7 @@ mod tests {
             let res = scan_or_buffer_json_body(
                 Chunks([c1.clone(), c2].into()),
                 MAX_REQUEST_BODY_BYTES,
+                BODY_READ_TIMEOUT,
                 &pools,
                 false,
             )
@@ -4080,6 +4241,8 @@ mod tests {
                 prefix,
                 ProxyBody::new(rest, Arc::clone(&pools.proxy)),
                 Box::new(scanner),
+                MAX_REQUEST_BODY_BYTES,
+                BODY_READ_TIMEOUT,
             );
             assert_eq!(
                 body.frame().await.unwrap().unwrap().into_data().unwrap(),
@@ -4132,6 +4295,7 @@ mod tests {
         let res = scan_or_buffer_json_body(
             Chunks([bc1.clone(), bc2].into()),
             MAX_REQUEST_BODY_BYTES,
+            BODY_READ_TIMEOUT,
             &pools,
             false,
         )
@@ -4150,6 +4314,8 @@ mod tests {
             prefix,
             ProxyBody::new(rest, Arc::clone(&pools.proxy)),
             Box::new(scanner),
+            MAX_REQUEST_BODY_BYTES,
+            BODY_READ_TIMEOUT,
         );
         assert_eq!(
             body.frame().await.unwrap().unwrap().into_data().unwrap(),
@@ -4204,6 +4370,17 @@ mod tests {
                                 .unwrap();
                             return Ok::<_, Infallible>(resp);
                         }
+                        if req.method() == Method::POST
+                            && req.uri().path() == "/mcp"
+                            && req.into_body().collect().await.is_err()
+                        {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(Empty::<Bytes>::new().boxed())
+                                    .unwrap(),
+                            );
+                        }
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .status(StatusCode::OK)
@@ -4245,6 +4422,8 @@ mod tests {
                 max_connections: 2,
                 header_read_timeout: Duration::from_millis(120),
                 idle_keepalive_timeout: Duration::from_millis(180),
+                body_read_timeout: Duration::from_millis(150),
+                max_request_body_bytes: 2048,
             },
         )
         .await
@@ -4320,6 +4499,78 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n_eof, 0, "expected idle keep-alive connection to be reaped");
+
+        // 4. Cross-chunk cutover aborts restore exact HTTP statuses (400 -32600, 413, and 408) instead of 502.
+        let send_split_chunked = |chunk1: &[u8], pause_ms: u64, chunk2: Option<&[u8]>| {
+            let chunk1 = chunk1.to_vec();
+            let chunk2 = chunk2.map(|b| b.to_vec());
+            async move {
+                let mut conn = TcpStream::connect(addr).await.unwrap();
+                let _ = conn.set_nodelay(true);
+                conn.write_all(
+                    b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer inbound-secret-tok-1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                let h1 = format!("{:x}\r\n", chunk1.len());
+                conn.write_all(h1.as_bytes()).await.unwrap();
+                conn.write_all(&chunk1).await.unwrap();
+                conn.write_all(b"\r\n").await.unwrap();
+                conn.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+                if let Some(c2) = chunk2 {
+                    let h2 = format!("{:x}\r\n", c2.len());
+                    let _ = conn.write_all(h2.as_bytes()).await;
+                    let _ = conn.write_all(&c2).await;
+                    let _ = conn.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = conn.flush().await;
+                }
+                let mut raw_resp = Vec::new();
+                conn.read_to_end(&mut raw_resp).await.unwrap();
+                String::from_utf8_lossy(&raw_resp).into_owned()
+            }
+        };
+
+        // 4a. Second TCP chunk injects duplicate method -> 400 Bad Request with JSON-RPC -32600 and id=55.
+        let resp_dup = send_split_chunked(
+            br#"{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"x":"ok""#,
+            30,
+            Some(br#"},"method":"events/poll"}"#),
+        )
+        .await;
+        assert!(
+            resp_dup.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected 400 on split duplicate method, got: {resp_dup}"
+        );
+        let body_dup = resp_dup.split("\r\n\r\n").nth(1).unwrap();
+        let json_dup: Value = serde_json::from_str(body_dup).unwrap();
+        assert_eq!(json_dup["id"], 55);
+        assert_eq!(json_dup["error"]["code"], -32600);
+
+        // 4b. Second TCP chunk exceeds max_request_body_bytes (2048) -> 413 Payload Too Large.
+        let big_second = format!("{}\"}}", "a".repeat(2500));
+        let resp_413 = send_split_chunked(
+            br#"{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"x":""#,
+            30,
+            Some(big_second.as_bytes()),
+        )
+        .await;
+        assert!(
+            resp_413.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "expected 413 on split oversized body, got: {resp_413}"
+        );
+
+        // 4c. Stalling past body_read_timeout (150ms) after first chunk -> 408 Request Timeout.
+        let resp_408 = send_split_chunked(
+            br#"{"jsonrpc":"2.0","id":57,"method":"tools/call","params":{"x":""#,
+            260,
+            None,
+        )
+        .await;
+        assert!(
+            resp_408.starts_with("HTTP/1.1 408 Request Timeout"),
+            "expected 408 on split inter-frame timeout, got: {resp_408}"
+        );
 
         srv.shutdown().await.unwrap();
         up_task.abort();

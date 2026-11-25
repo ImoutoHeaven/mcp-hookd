@@ -1,10 +1,12 @@
 use crate::types::{ByteBudget, ByteLease};
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 struct LeasedBytes {
     bytes: Bytes,
@@ -145,7 +147,8 @@ where
                     Ok(bytes) => {
                         let Some(lease) = this.budget.try_acquire(bytes.len()) else {
                             this.done = true;
-                            return Poll::Ready(Some(Err(io::Error::other(
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::OutOfMemory,
                                 "proxy byte budget exhausted",
                             ))));
                         };
@@ -179,21 +182,39 @@ where
 pub(crate) trait StreamValidator: Send + Sync + Unpin {
     fn validate_chunk(&mut self, chunk: &[u8]) -> io::Result<()>;
     fn validate_eof(&mut self) -> io::Result<()>;
+    fn on_too_large(&mut self) {}
+    fn on_timeout(&mut self) {}
+    fn on_read_error(&mut self, _err: &io::Error) {}
 }
 
 pub(crate) struct PrefixedBody<B> {
     prefix: Option<Bytes>,
     rest: B,
     validator: Option<Box<dyn StreamValidator>>,
+    total_bytes: usize,
+    max_bytes: usize,
+    frame_timeout: Duration,
+    frame_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     done: bool,
 }
 
 impl<B> PrefixedBody<B> {
-    pub(crate) fn new(prefix: Bytes, rest: B, validator: Box<dyn StreamValidator>) -> Self {
+    pub(crate) fn new(
+        prefix: Bytes,
+        rest: B,
+        validator: Box<dyn StreamValidator>,
+        max_bytes: usize,
+        frame_timeout: Duration,
+    ) -> Self {
+        let total_bytes = prefix.len();
         Self {
             prefix: (!prefix.is_empty()).then_some(prefix),
             rest,
             validator: Some(validator),
+            total_bytes,
+            max_bytes,
+            frame_timeout,
+            frame_sleep: None,
             done: false,
         }
     }
@@ -215,27 +236,57 @@ where
             return Poll::Ready(None);
         }
         if let Some(prefix) = this.prefix.take() {
+            if this.total_bytes > this.max_bytes {
+                if let Some(mut validator) = this.validator.take() {
+                    validator.on_too_large();
+                }
+                this.done = true;
+                return Poll::Ready(Some(Err(io::Error::other(
+                    "request body exceeds maximum size",
+                ))));
+            }
             return Poll::Ready(Some(Ok(Frame::data(prefix))));
         }
         match Pin::new(&mut this.rest).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(validator) = this.validator.as_mut()
-                    && let Some(chunk) = frame.data_ref()
+                this.frame_sleep = None;
+                if let Some(chunk) = frame.data_ref()
                     && !chunk.is_empty()
-                    && let Err(err) = validator.validate_chunk(chunk)
                 {
-                    this.validator = None;
-                    this.done = true;
-                    return Poll::Ready(Some(Err(err)));
+                    match this.total_bytes.checked_add(chunk.len()) {
+                        Some(next) if next <= this.max_bytes => {
+                            this.total_bytes = next;
+                        }
+                        _ => {
+                            if let Some(mut validator) = this.validator.take() {
+                                validator.on_too_large();
+                            }
+                            this.done = true;
+                            return Poll::Ready(Some(Err(io::Error::other(
+                                "request body exceeds maximum size",
+                            ))));
+                        }
+                    }
+                    if let Some(validator) = this.validator.as_mut()
+                        && let Err(err) = validator.validate_chunk(chunk)
+                    {
+                        this.validator = None;
+                        this.done = true;
+                        return Poll::Ready(Some(Err(err)));
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(err))) => {
-                this.validator = None;
+                this.frame_sleep = None;
+                if let Some(mut validator) = this.validator.take() {
+                    validator.on_read_error(&err);
+                }
                 this.done = true;
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
+                this.frame_sleep = None;
                 this.done = true;
                 if let Some(mut validator) = this.validator.take()
                     && let Err(err) = validator.validate_eof()
@@ -244,7 +295,23 @@ where
                 }
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                let sleep = this
+                    .frame_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.frame_timeout)));
+                if sleep.as_mut().poll(cx).is_ready() {
+                    this.frame_sleep = None;
+                    if let Some(mut validator) = this.validator.take() {
+                        validator.on_timeout();
+                    }
+                    this.done = true;
+                    return Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body frame read timed out",
+                    ))));
+                }
+                Poll::Pending
+            }
         }
     }
 
@@ -326,13 +393,15 @@ mod tests {
                 saw_ok: false,
                 allow_eof: true,
             }),
+            1024,
+            Duration::from_secs(5),
         );
         let f0 = body.frame().await.unwrap().unwrap().into_data().unwrap();
         assert_eq!(&f0[..], b"prefix:");
         assert!(body.frame().await.unwrap().is_err());
         assert!(body.frame().await.is_none());
 
-        let rest_eof = ProxyBody::new(Full::new(Bytes::from_static(b"clean")), budget);
+        let rest_eof = ProxyBody::new(Full::new(Bytes::from_static(b"clean")), budget.clone());
         let mut body_eof = PrefixedBody::new(
             Bytes::from_static(b"prefix:"),
             rest_eof,
@@ -340,10 +409,42 @@ mod tests {
                 saw_ok: false,
                 allow_eof: false,
             }),
+            1024,
+            Duration::from_secs(5),
         );
         assert!(body_eof.frame().await.unwrap().is_ok());
         assert!(body_eof.frame().await.unwrap().is_ok());
         assert!(body_eof.frame().await.unwrap().is_err());
         assert!(body_eof.frame().await.is_none());
+
+        let saw_too_large = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct FlagValidator {
+            too_large: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl StreamValidator for FlagValidator {
+            fn validate_chunk(&mut self, _chunk: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn validate_eof(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn on_too_large(&mut self) {
+                self.too_large
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let rest_big = ProxyBody::new(Full::new(Bytes::from_static(b"12345")), budget);
+        let mut body_big = PrefixedBody::new(
+            Bytes::from_static(b"prefix:"),
+            rest_big,
+            Box::new(FlagValidator {
+                too_large: Arc::clone(&saw_too_large),
+            }),
+            10,
+            Duration::from_secs(5),
+        );
+        assert!(body_big.frame().await.unwrap().is_ok());
+        assert!(body_big.frame().await.unwrap().is_err());
+        assert!(saw_too_large.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
