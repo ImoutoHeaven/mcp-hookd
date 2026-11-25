@@ -3,8 +3,10 @@
 use crate::schema::build_filter_input_schema;
 use crate::types::{MAX_TTL_SECS_DEFAULT, MAX_TTL_SECS_UPPER, MIN_TTL_SECS, Profile, SecretString};
 use serde::Deserialize;
-use serde_json::Value;
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
@@ -156,6 +158,73 @@ pub struct IngestEventConfig {
     pub input_schema: Value,
 }
 
+struct UniqueConfigValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueConfigValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct JsonVisitor;
+        impl<'de> Visitor<'de> for JsonVisitor {
+            type Value = UniqueConfigValue;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("JSON with unique object keys")
+            }
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::Bool(value)))
+            }
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::Number(value.into())))
+            }
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::Number(value.into())))
+            }
+            fn visit_f64<E: serde::de::Error>(
+                self,
+                value: f64,
+            ) -> std::result::Result<UniqueConfigValue, E> {
+                Number::from_f64(value)
+                    .map(|number| UniqueConfigValue(Value::Number(number)))
+                    .ok_or_else(|| E::custom("non-finite number"))
+            }
+            fn visit_str<E>(self, value: &str) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::String(value.into())))
+            }
+            fn visit_string<E>(self, value: String) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::String(value)))
+            }
+            fn visit_unit<E>(self) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::Null))
+            }
+            fn visit_none<E>(self) -> std::result::Result<UniqueConfigValue, E> {
+                Ok(UniqueConfigValue(Value::Null))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<UniqueConfigValue, A::Error> {
+                let mut out = Vec::new();
+                while let Some(UniqueConfigValue(value)) = sequence.next_element()? {
+                    out.push(value);
+                }
+                Ok(UniqueConfigValue(Value::Array(out)))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<UniqueConfigValue, A::Error> {
+                let mut out = Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if out.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON object key"));
+                    }
+                    out.insert(key, map.next_value::<UniqueConfigValue>()?.0);
+                }
+                Ok(UniqueConfigValue(Value::Object(out)))
+            }
+        }
+        deserializer.deserialize_any(JsonVisitor)
+    }
+}
+
 impl Config {
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
         Self::load_from_path_with_env(path, |k| std::env::var(k).ok())
@@ -187,10 +256,34 @@ impl Config {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let raw: RawConfig =
+        let UniqueConfigValue(mut value) =
             serde_json::from_str(json_text).map_err(|e| format!("invalid config JSON: {e}"))?;
-        validate_raw_config(raw, &env_lookup)
+        expand_env_value("$", &mut value, &env_lookup)?;
+        let raw: RawConfig =
+            serde_json::from_value(value).map_err(|e| format!("invalid config JSON: {e}"))?;
+        validate_raw_config(raw)
     }
+}
+
+fn expand_env_value<F>(field: &str, value: &mut Value, env_lookup: &F) -> Result<(), String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match value {
+        Value::String(raw) => *raw = expand_env_string(field, raw, env_lookup)?,
+        Value::Array(values) => {
+            for (i, value) in values.iter_mut().enumerate() {
+                expand_env_value(&format!("{field}[{i}]"), value, env_lookup)?;
+            }
+        }
+        Value::Object(values) => {
+            for (name, value) in values {
+                expand_env_value(&format!("{field}.{name}"), value, env_lookup)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
 }
 
 fn expand_env_string<F>(field: &str, raw: &str, env_lookup: &F) -> Result<String, String>
@@ -236,16 +329,13 @@ fn validate_visible_ascii_token(field: &str, token: &str, min_len: usize) -> Res
     Ok(())
 }
 
-fn validate_raw_config<F>(raw: RawConfig, env_lookup: &F) -> Result<Config, String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let listen_str = expand_env_string("listen", &raw.listen, env_lookup)?;
+fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
+    let listen_str = raw.listen;
     let listen: SocketAddr = listen_str
         .parse()
         .map_err(|e| format!("listen: invalid socket address '{listen_str}': {e}"))?;
 
-    let resource_path = expand_env_string("resource_path", &raw.resource_path, env_lookup)?;
+    let resource_path = raw.resource_path;
     if !resource_path.starts_with('/') || resource_path == "/" || resource_path.contains('?') {
         return Err("resource_path: must start with '/', not be '/', and contain no query".into());
     }
@@ -255,7 +345,7 @@ where
         ));
     }
 
-    let state_path_str = expand_env_string("state_path", &raw.state_path, env_lookup)?;
+    let state_path_str = raw.state_path;
     if state_path_str.is_empty() {
         return Err("state_path: must not be empty".into());
     }
@@ -274,17 +364,14 @@ where
     let mut inbound_tokens = Vec::with_capacity(raw.inbound_tokens.len());
     for (i, tok) in raw.inbound_tokens.iter().enumerate() {
         let field = format!("inbound_tokens[{i}]");
-        let expanded = expand_env_string(&field, tok, env_lookup)?;
-        validate_visible_ascii_token(&field, &expanded, 1)?;
-        inbound_tokens.push(SecretString::new(expanded));
+        validate_visible_ascii_token(&field, tok, 1)?;
+        inbound_tokens.push(SecretString::new(tok.clone()));
     }
 
     let mut allowed_origins = Vec::with_capacity(raw.allowed_origins.len());
     for (i, origin) in raw.allowed_origins.iter().enumerate() {
         let field = format!("allowed_origins[{i}]");
-        let expanded = expand_env_string(&field, origin, env_lookup)?;
-        let parsed =
-            Url::parse(&expanded).map_err(|e| format!("{field}: invalid origin URL: {e}"))?;
+        let parsed = Url::parse(origin).map_err(|e| format!("{field}: invalid origin URL: {e}"))?;
         if !matches!(parsed.scheme(), "http" | "https")
             || parsed.path() != "/"
             || parsed.query().is_some()
@@ -294,7 +381,7 @@ where
                 "{field}: origin must be scheme://host[:port] with no path, query, or fragment"
             ));
         }
-        allowed_origins.push(expanded.trim_end_matches('/').to_owned());
+        allowed_origins.push(origin.trim_end_matches('/').to_owned());
     }
 
     let auth_context = match raw.auth_context {
@@ -304,20 +391,15 @@ where
                     "auth_context.reverify_secs: must be in {MIN_REVERIFY_SECS}..={MAX_REVERIFY_SECS}"
                 ));
             }
-            let url_str = expand_env_string("auth_context.check_url", &ac.check_url, env_lookup)?;
+            let url_str = ac.check_url;
             let check_url = Url::parse(&url_str)
                 .map_err(|e| format!("auth_context.check_url: invalid URL: {e}"))?;
             validate_check_url(&check_url)?;
 
-            let check_token_str =
-                expand_env_string("auth_context.check_token", &ac.check_token, env_lookup)?;
+            let check_token_str = ac.check_token;
             validate_visible_ascii_token("auth_context.check_token", &check_token_str, 16)?;
 
-            let expected_resource = expand_env_string(
-                "auth_context.expected_resource",
-                &ac.expected_resource,
-                env_lookup,
-            )?;
+            let expected_resource = ac.expected_resource;
             if expected_resource.is_empty() {
                 return Err("auth_context.expected_resource: must not be empty".into());
             }
@@ -339,7 +421,7 @@ where
     let mut upstream_event_names = HashSet::new();
     let upstream = match raw.upstream {
         Some(up) => {
-            let url_str = expand_env_string("upstream.url", &up.url, env_lookup)?;
+            let url_str = up.url;
             let url =
                 Url::parse(&url_str).map_err(|e| format!("upstream.url: invalid URL: {e}"))?;
             if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -347,9 +429,8 @@ where
             }
             let bearer_token = match up.bearer_token {
                 Some(tok) => {
-                    let expanded = expand_env_string("upstream.bearer_token", &tok, env_lookup)?;
-                    validate_visible_ascii_token("upstream.bearer_token", &expanded, 1)?;
-                    Some(SecretString::new(expanded))
+                    validate_visible_ascii_token("upstream.bearer_token", &tok, 1)?;
+                    Some(SecretString::new(tok))
                 }
                 None => None,
             };
@@ -359,18 +440,17 @@ where
             let mut passthrough_prefixes = Vec::with_capacity(up.passthrough_prefixes.len());
             for (i, pref) in up.passthrough_prefixes.iter().enumerate() {
                 let field = format!("upstream.passthrough_prefixes[{i}]");
-                let expanded = expand_env_string(&field, pref, env_lookup)?;
-                if !expanded.starts_with('/') || !expanded.ends_with('/') || expanded == "/" {
+                if !pref.starts_with('/') || !pref.ends_with('/') || pref == "/" {
                     return Err(format!(
                         "{field}: passthrough prefix must start and end with '/' and not be '/'"
                     ));
                 }
-                if resource_path.starts_with(&expanded) || expanded.starts_with(&resource_path) {
+                if resource_path.starts_with(pref) || pref.starts_with(&resource_path) {
                     return Err(format!(
-                        "{field}: prefix '{expanded}' collides with resource_path '{resource_path}'"
+                        "{field}: prefix '{pref}' collides with resource_path '{resource_path}'"
                     ));
                 }
-                passthrough_prefixes.push(expanded);
+                passthrough_prefixes.push(pref.clone());
             }
             let mut expose_events = Vec::with_capacity(up.expose_events.len());
             for (i, ev) in up.expose_events.into_iter().enumerate() {
@@ -409,9 +489,8 @@ where
             let mut tokens = Vec::with_capacity(ing.tokens.len());
             for (i, tok) in ing.tokens.iter().enumerate() {
                 let field = format!("ingest.tokens[{i}]");
-                let expanded = expand_env_string(&field, tok, env_lookup)?;
-                validate_visible_ascii_token(&field, &expanded, 1)?;
-                tokens.push(SecretString::new(expanded));
+                validate_visible_ascii_token(&field, tok, 1)?;
+                tokens.push(SecretString::new(tok.clone()));
             }
             if ing.events.is_empty() {
                 return Err("ingest.events: must declare at least one event".into());
@@ -541,6 +620,103 @@ mod tests {
         assert_eq!(cfg.resource_path, "/mcp");
         assert_eq!(cfg.max_ttl_secs, 3600);
         assert_eq!(cfg.ingest.as_ref().unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn expands_all_string_values_once_before_typed_validation() {
+        let source = serde_json::json!({
+            "listen": "${LISTEN}",
+            "state_path": "${STATE}",
+            "profile": "${PROFILE}",
+            "inbound_tokens": ["${INBOUND}"],
+            "upstream": {
+                "url": "${UPSTREAM}",
+                "expose_events": [{
+                    "name": "${UPSTREAM_EVENT}",
+                    "disallow_arguments": ["${DISALLOWED}"]
+                }]
+            },
+            "ingest": {
+                "tokens": ["${PROD}"],
+                "events": [{
+                    "name": "${EVENT}",
+                    "description": "${DESCRIPTION}",
+                    "filter_fields": ["${FIELD}"],
+                    "payload_schema": {
+                        "type": "object",
+                        "properties": {
+                            "repo": {
+                                "type": "${TYPE}",
+                                "description": "${DESCRIPTION}",
+                                "enum": ["${REPO}", "unchanged"]
+                            }
+                        },
+                        "required": ["${FIELD}"]
+                    }
+                }]
+            }
+        });
+        let lookup = |key: &str| {
+            Some(
+                match key {
+                    "LISTEN" => "127.0.0.1:8081",
+                    "STATE" => "/tmp/subscriptions.json",
+                    "PROFILE" => "chatgpt",
+                    "INBOUND" => "literal-${NO_SECOND_EXPANSION}",
+                    "UPSTREAM" => "http://127.0.0.1:8765/mcp",
+                    "UPSTREAM_EVENT" => "upstream.build",
+                    "DISALLOWED" => "private_repo",
+                    "PROD" => "producer",
+                    "EVENT" => "local.build",
+                    "DESCRIPTION" => "Build result",
+                    "FIELD" => "repo",
+                    "TYPE" => "string",
+                    "REPO" => "demo",
+                    _ => return None,
+                }
+                .into(),
+            )
+        };
+        let config = Config::parse_json_with_env(&source.to_string(), lookup).unwrap();
+        assert_eq!(config.profile, Profile::Chatgpt);
+        assert_eq!(
+            config.inbound_tokens[0].expose(),
+            "literal-${NO_SECOND_EXPANSION}"
+        );
+        let upstream = config.upstream.unwrap();
+        assert_eq!(upstream.expose_events[0].name, "upstream.build");
+        assert_eq!(
+            upstream.expose_events[0].disallow_arguments,
+            ["private_repo"]
+        );
+        let event = &config.ingest.as_ref().unwrap().events[0];
+        assert_eq!(event.name, "local.build");
+        assert_eq!(event.description, "Build result");
+        assert_eq!(event.filter_fields, ["repo"]);
+        assert_eq!(
+            event.payload_schema["properties"]["repo"]["enum"][0],
+            "demo"
+        );
+        assert_eq!(
+            event.payload_schema["properties"]["repo"]["enum"][1],
+            "unchanged"
+        );
+        assert_eq!(event.input_schema["properties"]["repo"]["type"], "string");
+
+        for replacement in ["prefix-${MISSING}", "${MISSING}"] {
+            let mut bad = source.clone();
+            bad["ingest"]["events"][0]["payload_schema"]["description"] = replacement.into();
+            assert!(Config::parse_json_with_env(&bad.to_string(), lookup).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_fields_before_expansion() {
+        let source = sample_ingest_config().replace(
+            r#""profile": "chatgpt","#,
+            r#""profile": "chatgpt", "profile": "sep3415","#,
+        );
+        assert!(Config::parse_json_with_env(&source, |_| Some("token".into())).is_err());
     }
 
     #[test]
