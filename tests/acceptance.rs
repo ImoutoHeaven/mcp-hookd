@@ -1924,3 +1924,103 @@ async fn shutdown_closes_inflight_http_before_returning() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn unsubscribe_retry_persists_removal_after_transient_io_failure() {
+    let callback = MockTlsCallbackServer::start(standard_challenge_responder).await;
+    for profile in [Profile::Sep3415, Profile::Chatgpt] {
+        let directory = TempDir::new().unwrap();
+        let state_path = directory.path().join("subscriptions.json");
+        let backup_path = directory.path().join("subscriptions.saved");
+        let config = base_config(
+            state_path.clone(),
+            profile,
+            None,
+            Some(IngestConfig {
+                tokens: vec![SecretString::new("producer")],
+                events: vec![ci_ingest_event()],
+            }),
+            None,
+        );
+        let server = start_server(
+            config,
+            QuotaConfig {
+                allow_loopback_callbacks: true,
+                ..Default::default()
+            },
+            Some(callback.outbound_client()),
+        )
+        .await
+        .unwrap();
+        let base_url = format!("http://{}", server.local_addr());
+        let client = http_client();
+        let url = callback.url("/unsubscribe-retry");
+        let (status, _, subscribed) = mcp_post_modern(
+            &client,
+            &base_url,
+            "inbound-tok-1",
+            "events/subscribe",
+            1,
+            json!({
+                "name": "ci.build_failed",
+                "delivery": { "mode": "webhook", "url": url, "secret": test_whsec(23) }
+            }),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(subscribed["result"]["id"].is_string(), "{subscribed}");
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(persisted["subscriptions"].as_array().unwrap().len(), 1);
+
+        std::fs::rename(&state_path, &backup_path).unwrap();
+        std::fs::create_dir(&state_path).unwrap();
+        let params = json!({
+            "name": "ci.build_failed",
+            "delivery": { "mode": "webhook", "url": url }
+        });
+        let (status, _, failed) = mcp_post_modern(
+            &client,
+            &base_url,
+            "inbound-tok-1",
+            "events/unsubscribe",
+            2,
+            params.clone(),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(failed["error"]["code"], -32603, "{failed}");
+        assert_eq!(server.engine().active_subscription_count(), 0);
+        std::fs::remove_dir(&state_path).unwrap();
+        std::fs::rename(&backup_path, &state_path).unwrap();
+
+        let (status, _, retried) = mcp_post_modern(
+            &client,
+            &base_url,
+            "inbound-tok-1",
+            "events/unsubscribe",
+            3,
+            params,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        match profile {
+            Profile::Sep3415 => {
+                assert_eq!(
+                    retried["error"]["code"],
+                    profile.not_found_code(),
+                    "{retried}"
+                );
+                assert_eq!(retried["error"]["data"]["kind"], "subscription");
+            }
+            Profile::Chatgpt => assert_eq!(retried["result"]["resultType"], "complete"),
+        }
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert!(persisted["subscriptions"].as_array().unwrap().is_empty());
+        server.shutdown().await.unwrap();
+    }
+}
