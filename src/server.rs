@@ -1121,9 +1121,24 @@ async fn handle_events_method(
             .map(|e| e.disallow_arguments.as_slice())
             .unwrap_or(&[]);
 
-        if let Err(msg) =
-            validate_optional_event_routing_headers(req_headers, event_name, args_map, disallowed)
+        let input_schema = if req_headers
+            .keys()
+            .any(|name| name.as_str().starts_with("mcp-param-"))
         {
+            match state.engine.routing_input_schema(event_name).await {
+                Ok(schema) => schema,
+                Err(err) => return engine_error_response(id, profile, err),
+            }
+        } else {
+            None
+        };
+        if let Err(msg) = validate_optional_event_routing_headers(
+            req_headers,
+            event_name,
+            args_map,
+            disallowed,
+            input_schema.as_ref(),
+        ) {
             return jsonrpc_error(StatusCode::BAD_REQUEST, id, -32020, &msg, None);
         }
     }

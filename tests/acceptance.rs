@@ -398,7 +398,10 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
-                                        "taskId": { "type": "string" },
+                                        "taskId": { "type": "string", "x-mcp-header": "Task" },
+                                        "nested": { "type": "object", "properties": {
+                                            "count": { "type": "integer", "x-mcp-header": "Count" }
+                                        }},
                                         "scope": { "type": "string", "x-mcp-header": "scope" }
                                     },
                                     "required": ["scope"]
@@ -696,8 +699,8 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
         "inbound-tok-1",
         "events/poll",
         5,
-        json!({"name": "task.exited", "arguments": {"taskId": "t1"}}),
-        &[],
+        json!({"name": "task.exited", "arguments": {"taskId": "t1", "nested": {"count": 7}}}),
+        &[("mcp-param-task", "t1"), ("mcp-param-count", "7")],
     )
     .await;
     assert_eq!(st, StatusCode::OK);

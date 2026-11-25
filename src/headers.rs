@@ -359,10 +359,70 @@ fn is_http_tchar(c: char) -> bool {
         )
 }
 
-/// Build `Mcp-Name` and `Mcp-Param-*` routing headers for upstream `events/poll` and `events/stream`.
+struct HeaderBinding<'a> {
+    name: &'a str,
+    path: Vec<&'a str>,
+}
+
+fn header_bindings(schema: Option<&Value>) -> Result<Vec<HeaderBinding<'_>>, String> {
+    fn visit<'a>(
+        schema: &'a Value,
+        path: &mut Vec<&'a str>,
+        out: &mut Vec<HeaderBinding<'a>>,
+        seen: &mut HashSet<String>,
+    ) -> Result<(), String> {
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        for (name, property) in properties {
+            path.push(name);
+            if let Some(annotation) = property.get("x-mcp-header") {
+                let Some(header) = annotation.as_str() else {
+                    return Err("x-mcp-header must be a string".into());
+                };
+                if header.is_empty() || !header.chars().all(is_http_tchar) {
+                    return Err(format!("invalid x-mcp-header name {header:?}"));
+                }
+                if !seen.insert(header.to_ascii_lowercase()) {
+                    return Err(format!("duplicate x-mcp-header name {header:?}"));
+                }
+                if !matches!(
+                    property.get("type").and_then(Value::as_str),
+                    Some("string" | "integer" | "boolean")
+                ) {
+                    return Err(format!(
+                        "x-mcp-header {header:?} requires a scalar property"
+                    ));
+                }
+                out.push(HeaderBinding {
+                    name: header,
+                    path: path.clone(),
+                });
+            }
+            visit(property, path, out, seen)?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    if let Some(schema) = schema {
+        visit(schema, &mut Vec::new(), &mut out, &mut HashSet::new())?;
+    }
+    Ok(out)
+}
+
+fn argument_at<'a>(arguments: Option<&'a Map<String, Value>>, path: &[&str]) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    rest.iter()
+        .try_fold(arguments?.get(*first)?, |value, key| value.get(*key))
+}
+
+/// Build routing headers from schema annotations and unannotated scalar arguments.
 pub fn build_event_routing_headers(
     event_name: &str,
     arguments: Option<&Map<String, Value>>,
+    input_schema: &Value,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
     let mut out = Vec::new();
     let encoded_name = encode_mcp_header_value(event_name);
@@ -370,20 +430,39 @@ pub fn build_event_routing_headers(
         .map_err(|e| format!("invalid Mcp-Name header value: {e}"))?;
     out.push((HeaderName::from_static("mcp-name"), name_val));
 
+    let bindings = header_bindings(Some(input_schema))?;
+    let mut push = |name: &str, value: &Value| -> Result<(), String> {
+        let Some(scalar_text) = scalar_to_header_string(value) else {
+            return Ok(());
+        };
+        let header_name = HeaderName::from_bytes(format!("mcp-param-{name}").as_bytes())
+            .map_err(|e| format!("invalid Mcp-Param header name '{name}': {e}"))?;
+        let header_val = HeaderValue::from_str(&encode_mcp_header_value(&scalar_text))
+            .map_err(|e| format!("invalid Mcp-Param header value for '{name}': {e}"))?;
+        out.push((header_name, header_val));
+        Ok(())
+    };
+
+    for binding in &bindings {
+        if let Some(value) = argument_at(arguments, &binding.path) {
+            push(binding.name, value)?;
+        }
+    }
     if let Some(args) = arguments {
-        for (key, val) in args {
-            if key.is_empty() || !key.chars().all(is_http_tchar) {
+        for (key, value) in args {
+            if key.is_empty()
+                || !key.chars().all(is_http_tchar)
+                || bindings.iter().any(|binding| {
+                    binding.name.eq_ignore_ascii_case(key)
+                        || (binding.path.len() == 1 && binding.path[0] == key)
+                })
+                || args
+                    .keys()
+                    .any(|other| other != key && other.eq_ignore_ascii_case(key))
+            {
                 continue;
             }
-            let Some(scalar_text) = scalar_to_header_string(val) else {
-                continue;
-            };
-            let header_name = HeaderName::from_bytes(format!("mcp-param-{key}").as_bytes())
-                .map_err(|e| format!("invalid Mcp-Param header name '{key}': {e}"))?;
-            let encoded_val = encode_mcp_header_value(&scalar_text);
-            let header_val = HeaderValue::from_str(&encoded_val)
-                .map_err(|e| format!("invalid Mcp-Param header value for '{key}': {e}"))?;
-            out.push((header_name, header_val));
+            push(key, value)?;
         }
     }
 
@@ -428,6 +507,7 @@ pub fn validate_optional_event_routing_headers(
     event_name: &str,
     arguments: Option<&Map<String, Value>>,
     disallowed_args: &[String],
+    input_schema: Option<&Value>,
 ) -> Result<(), String> {
     let mut name_values = headers.get_all("mcp-name").iter();
     if let Some(first) = name_values.next() {
@@ -446,6 +526,7 @@ pub fn validate_optional_event_routing_headers(
         }
     }
 
+    let bindings = header_bindings(input_schema)?;
     let mut seen_params = HashSet::new();
     for (name, value) in headers {
         let Some(param_key) = name.as_str().strip_prefix("mcp-param-") else {
@@ -457,21 +538,31 @@ pub fn validate_optional_event_routing_headers(
         if !seen_params.insert(param_key) {
             return Err(format!("duplicate Mcp-Param-{param_key} header"));
         }
-        if disallowed_args
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(param_key))
-        {
-            return Err(format!(
-                "Mcp-Param-{param_key} targets a disallowed argument"
-            ));
-        }
         let raw = value
             .to_str()
             .map_err(|_| format!("Mcp-Param-{param_key} header is not valid ASCII"))?;
         let decoded = decode_mcp_header_value(raw)
             .ok_or_else(|| format!("Mcp-Param-{param_key} header has invalid base64 encoding"))?;
 
-        let arg_val = lookup_argument(arguments, param_key)?;
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.name.eq_ignore_ascii_case(param_key));
+        let target = binding.map_or(param_key, |binding| binding.path[0]);
+        if disallowed_args
+            .iter()
+            .any(|disallowed| disallowed.eq_ignore_ascii_case(target))
+        {
+            return Err(format!(
+                "Mcp-Param-{param_key} targets a disallowed argument"
+            ));
+        }
+        let arg_val = if let Some(binding) = binding {
+            argument_at(arguments, &binding.path).ok_or_else(|| {
+                format!("Mcp-Param-{param_key} present but missing from params.arguments")
+            })?
+        } else {
+            lookup_argument(arguments, param_key)?
+        };
         if !header_matches_scalar(&decoded, arg_val) {
             return Err(format!(
                 "Mcp-Param-{param_key} header ({decoded:?}) does not match params.arguments"
@@ -732,7 +823,7 @@ mod tests {
         // Missing headers are allowed.
         let empty = HeaderMap::new();
         assert!(
-            validate_optional_event_routing_headers(&empty, "ci.build", Some(args_map), &[])
+            validate_optional_event_routing_headers(&empty, "ci.build", Some(args_map), &[], None)
                 .is_ok()
         );
 
@@ -749,7 +840,8 @@ mod tests {
         hdrs.insert("mcp-param-pr", "42.0".parse().unwrap());
         hdrs.insert("mcp-param-draft", "false".parse().unwrap());
         assert!(
-            validate_optional_event_routing_headers(&hdrs, "ci.build", Some(args_map), &[]).is_ok()
+            validate_optional_event_routing_headers(&hdrs, "ci.build", Some(args_map), &[], None)
+                .is_ok()
         );
 
         // Disallowed argument is rejected.
@@ -758,7 +850,8 @@ mod tests {
                 &hdrs,
                 "ci.build",
                 Some(args_map),
-                &["repo".to_string()]
+                &["repo".to_string()],
+                None
             )
             .is_err()
         );
@@ -767,15 +860,27 @@ mod tests {
         let mut null_hdr = HeaderMap::new();
         null_hdr.insert("mcp-param-empty", "null".parse().unwrap());
         assert!(
-            validate_optional_event_routing_headers(&null_hdr, "ci.build", Some(args_map), &[])
-                .is_err()
+            validate_optional_event_routing_headers(
+                &null_hdr,
+                "ci.build",
+                Some(args_map),
+                &[],
+                None
+            )
+            .is_err()
         );
 
         let mut missing_hdr = HeaderMap::new();
         missing_hdr.insert("mcp-param-unknown", "1".parse().unwrap());
         assert!(
-            validate_optional_event_routing_headers(&missing_hdr, "ci.build", Some(args_map), &[])
-                .is_err()
+            validate_optional_event_routing_headers(
+                &missing_hdr,
+                "ci.build",
+                Some(args_map),
+                &[],
+                None
+            )
+            .is_err()
         );
 
         // Duplicate Mcp-Name is rejected.
@@ -783,19 +888,95 @@ mod tests {
         dup.append("mcp-name", "ci.build".parse().unwrap());
         dup.append("mcp-name", "ci.build".parse().unwrap());
         assert!(
-            validate_optional_event_routing_headers(&dup, "ci.build", Some(args_map), &[]).is_err()
+            validate_optional_event_routing_headers(&dup, "ci.build", Some(args_map), &[], None)
+                .is_err()
         );
 
         // Round-trip encode helper.
-        let built = build_event_routing_headers("ci.build", Some(args_map)).unwrap();
+        let built = build_event_routing_headers("ci.build", Some(args_map), &json!({})).unwrap();
         let mut built_map = HeaderMap::new();
         for (k, v) in built {
             built_map.append(k, v);
         }
         assert!(built_map.get("mcp-param-empty").is_none());
         assert!(
-            validate_optional_event_routing_headers(&built_map, "ci.build", Some(args_map), &[])
-                .is_ok()
+            validate_optional_event_routing_headers(
+                &built_map,
+                "ci.build",
+                Some(args_map),
+                &[],
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn annotated_aliases_and_nested_properties_round_trip() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "x-mcp-header": "Workspace"},
+                "nested": {"type": "object", "properties": {
+                    "count": {"type": "integer", "x-mcp-header": "Count"}
+                }},
+                "scope": {"type": "string", "x-mcp-header": "Access"}
+            }
+        });
+        let args = json!({
+            "repo": "org/app",
+            "nested": {"count": 7},
+            "scope": "all",
+            "plain": true
+        });
+        let built: HeaderMap = build_event_routing_headers("changes", args.as_object(), &schema)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(built["mcp-param-workspace"], "org/app");
+        assert_eq!(built["mcp-param-count"], "7");
+        assert_eq!(built["mcp-param-plain"], "true");
+        assert!(!built.contains_key("mcp-param-repo"));
+        assert!(
+            validate_optional_event_routing_headers(
+                &built,
+                "changes",
+                args.as_object(),
+                &[],
+                Some(&schema),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_optional_event_routing_headers(
+                &built,
+                "changes",
+                args.as_object(),
+                &["scope".into()],
+                Some(&schema),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_optional_event_routing_headers(
+                &built,
+                "changes",
+                args.as_object(),
+                &["nested".into()],
+                Some(&schema),
+            )
+            .is_err()
+        );
+        let wrong = json!({"repo": "other/app", "nested": {"count": 7}, "scope": "all"});
+        assert!(
+            validate_optional_event_routing_headers(
+                &built,
+                "changes",
+                wrong.as_object(),
+                &[],
+                Some(&schema),
+            )
+            .is_err()
         );
     }
 
@@ -822,7 +1003,7 @@ mod tests {
                 encode_mcp_header_value(bad).parse().unwrap(),
             );
             assert!(
-                validate_optional_event_routing_headers(&h, "ci.build", Some(args_map), &[])
+                validate_optional_event_routing_headers(&h, "ci.build", Some(args_map), &[], None)
                     .is_err(),
                 "expected {bad:?} to be rejected"
             );
@@ -832,7 +1013,7 @@ mod tests {
         let mut ok_big = HeaderMap::new();
         ok_big.insert("mcp-param-big", u64::MAX.to_string().parse().unwrap());
         assert!(
-            validate_optional_event_routing_headers(&ok_big, "ci.build", Some(args_map), &[])
+            validate_optional_event_routing_headers(&ok_big, "ci.build", Some(args_map), &[], None)
                 .is_ok()
         );
 
@@ -843,7 +1024,8 @@ mod tests {
                 &collision_big,
                 "ci.build",
                 Some(args_map),
-                &[]
+                &[],
+                None
             )
             .is_err()
         );
@@ -855,8 +1037,14 @@ mod tests {
             encode_mcp_header_value(" 1.5 ").parse().unwrap(),
         );
         assert!(
-            validate_optional_event_routing_headers(&padded_float, "ci.build", Some(args_map), &[])
-                .is_err()
+            validate_optional_event_routing_headers(
+                &padded_float,
+                "ci.build",
+                Some(args_map),
+                &[],
+                None
+            )
+            .is_err()
         );
     }
 }

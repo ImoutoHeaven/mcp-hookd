@@ -534,6 +534,7 @@ impl UpstreamClient {
         &self,
         name: &str,
         arguments: Option<&Map<String, Value>>,
+        input_schema: &Value,
         cursor: Option<&str>,
         max_age_ms: Option<u64>,
         max_events: Option<usize>,
@@ -556,7 +557,8 @@ impl UpstreamClient {
             params.insert("maxEvents".into(), json!(max));
         }
 
-        let routing = build_event_routing_headers(name, arguments).map_err(UpstreamError::Http)?;
+        let routing = build_event_routing_headers(name, arguments, input_schema)
+            .map_err(UpstreamError::Http)?;
         let resp = self
             .call_modern_jsonrpc("events/poll", Value::Object(params), &routing)
             .await?;
@@ -573,6 +575,7 @@ impl UpstreamClient {
         &self,
         name: &str,
         arguments: Option<&Map<String, Value>>,
+        input_schema: &Value,
         cursor: Option<&str>,
         max_age_ms: Option<u64>,
         heartbeat_ms: Option<u64>,
@@ -595,7 +598,8 @@ impl UpstreamClient {
             params.insert("heartbeatMs".into(), json!(hb));
         }
 
-        let routing = build_event_routing_headers(name, arguments).map_err(UpstreamError::Http)?;
+        let routing = build_event_routing_headers(name, arguments, input_schema)
+            .map_err(UpstreamError::Http)?;
         let inbound = build_modern_request_headers("events/stream", &routing)?;
         let body = serde_json::to_vec(&json!({
             "jsonrpc": "2.0",
@@ -1541,7 +1545,7 @@ mod tests {
 
         let args = json!({"repo": "org/repo"}).as_object().unwrap().clone();
         let polled = client
-            .poll_events("a.ev", Some(&args), None, None, Some(10))
+            .poll_events("a.ev", Some(&args), &json!({}), None, None, Some(10))
             .await
             .unwrap();
         assert_eq!(polled.events.len(), 1);
@@ -1549,7 +1553,7 @@ mod tests {
         assert_eq!(polled.next_poll_ms, 2000);
 
         let mut stream = client
-            .open_event_stream("a.ev", Some(&args), None, None, Some(5000))
+            .open_event_stream("a.ev", Some(&args), &json!({}), None, None, Some(5000))
             .await
             .unwrap();
         assert!(matches!(
