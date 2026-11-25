@@ -701,6 +701,18 @@ impl HookdEngine {
         })
     }
 
+    pub async fn routing_input_schema(&self, name: &str) -> Result<Option<Value>, EngineError> {
+        if let Some(event) = self.find_ingest_event(name) {
+            return Ok(Some(event.input_schema.clone()));
+        }
+        Ok(self
+            .get_upstream_catalog()
+            .await?
+            .into_iter()
+            .find(|event| event.name == name)
+            .map(|event| event.input_schema))
+    }
+
     pub async fn resolve_event_for_passthrough(
         &self,
         name: &str,
