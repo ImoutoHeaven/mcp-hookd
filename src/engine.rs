@@ -267,6 +267,10 @@ enum OutboxItem {
         cursor: String,
         _lease: ByteLease,
     },
+    Checkpoint {
+        cursor: String,
+        _lease: ByteLease,
+    },
 }
 
 struct SubState {
@@ -325,18 +329,23 @@ impl SubRuntime {
     }
 
     fn stop_consumer(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.stop_consumer_locked(&mut state);
+    }
+
+    fn stop_consumer_locked(&self, _state: &mut SubState) {
         let mut guard = self
             .consumer_cancel
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if let Some(tx) = guard.take() {
-            let _ = tx.send(true);
+            tx.send_replace(true);
         }
     }
 
     fn cancel_all(&self) {
         self.stop_consumer();
-        let _ = self.cancel_tx.send(true);
+        self.cancel_tx.send_replace(true);
         self.outbox_notify.notify_waiters();
         self.space_notify.notify_waiters();
     }
@@ -1045,7 +1054,7 @@ impl HookdEngine {
 
         let sub = Arc::new(new_sub_runtime(persisted, source, false));
         if !replay_events.is_empty()
-            && !self.enqueue_polled_batch(&sub, replay_events, replay_cursor)
+            && !self.enqueue_polled_batch(&sub, replay_events, replay_cursor, None)
         {
             return Err(EngineError::ResourceExhausted(
                 "bootstrap replay exceeds outbox capacity".into(),
@@ -1209,6 +1218,11 @@ impl HookdEngine {
 
         // Check and update dedup table.
         let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        if *self.shutdown_tx.borrow() {
+            return Err(IngestError::ServiceUnavailable(
+                "daemon is shutting down".into(),
+            ));
+        }
         let dedup_key = (token_slot, parsed.event_id.clone());
 
         if let Some(existing) = rt.dedup.get(&dedup_key) {
@@ -1261,7 +1275,7 @@ impl HookdEngine {
                 continue;
             }
             let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !st.suspended && !st.auth_paused && !st.removed && st.refresh_before > now {
+            if self.sub_accepts_events(&st, None) {
                 matched_subs.push(Arc::clone(sub));
             }
         }
@@ -1326,7 +1340,9 @@ impl HookdEngine {
             };
             let pushed = {
                 let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                if st.outbox.len() >= self.quotas.max_outbox_per_sub {
+                if !self.sub_accepts_events(&st, None)
+                    || st.outbox.len() >= self.quotas.max_outbox_per_sub
+                {
                     false
                 } else {
                     st.outbox.push_back(OutboxItem::Event {
@@ -1690,12 +1706,16 @@ impl HookdEngine {
     fn spawn_upstream_consumer(self: &Arc<Self>, sub: Arc<SubRuntime>) {
         let (tx, rx) = watch::channel(false);
         {
+            let state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !self.sub_accepts_events(&state, None) {
+                return;
+            }
             let mut guard = sub
                 .consumer_cancel
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(old) = guard.replace(tx) {
-                let _ = old.send(true);
+                old.send_replace(true);
             }
         }
         let eng = Arc::clone(self);
@@ -1738,6 +1758,18 @@ impl HookdEngine {
             };
 
             match head {
+                HeadAction::Checkpoint { cursor } => {
+                    let notify_space = {
+                        let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.outbox.pop_front();
+                        state.safe_cursor = Some(cursor);
+                        state.outbox.len() < self.quotas.max_outbox_per_sub / 2
+                    };
+                    self.mark_state_dirty();
+                    if notify_space {
+                        sub.space_notify.notify_one();
+                    }
+                }
                 HeadAction::Gap { cursor } => {
                     if !self
                         .verify_auth_before_delivery(&sub, &mut cancel_rx, &mut shutdown_rx)
@@ -1923,6 +1955,7 @@ impl HookdEngine {
                                         st.suspended = true;
                                         became_suspended = true;
                                         if matches!(sub.source, SubSource::Upstream { .. }) {
+                                            sub.stop_consumer_locked(&mut st);
                                             st.outbox.clear();
                                             st.ingest_cursor = st.safe_cursor.clone();
                                         }
@@ -1938,9 +1971,6 @@ impl HookdEngine {
                                 }
 
                                 if became_suspended {
-                                    if matches!(sub.source, SubSource::Upstream { .. }) {
-                                        sub.stop_consumer();
-                                    }
                                     self.mark_state_dirty();
                                     break;
                                 }
@@ -2131,18 +2161,32 @@ impl HookdEngine {
                                 })) => {
                                     if truncated {
                                         if let Some(c) = cursor
-                                            && !self.enqueue_gap(&sub, c)
+                                            && !self.enqueue_gap(&sub, c, Some(&consumer_cancel))
                                         {
                                             backpressure_paused = true;
                                             break;
                                         }
-                                    } else if let Some(c) = cursor {
-                                        self.advance_idle_cursor(&sub, c);
+                                    } else if let Some(c) = cursor
+                                        && !self.advance_idle_cursor(
+                                            &sub,
+                                            c,
+                                            Some(&consumer_cancel),
+                                        )
+                                    {
+                                        backpressure_paused = true;
+                                        break;
                                     }
                                 }
                                 Ok(Some(UpstreamStreamFrame::Heartbeat { cursor })) => {
-                                    if let Some(c) = cursor {
-                                        self.advance_idle_cursor(&sub, c);
+                                    if let Some(c) = cursor
+                                        && !self.advance_idle_cursor(
+                                            &sub,
+                                            c,
+                                            Some(&consumer_cancel),
+                                        )
+                                    {
+                                        backpressure_paused = true;
+                                        break;
                                     }
                                 }
                                 Ok(Some(UpstreamStreamFrame::Event {
@@ -2158,16 +2202,12 @@ impl HookdEngine {
                                         timestamp,
                                         data,
                                     };
-                                    if !self.enqueue_single_upstream_event(&sub, ev, cursor) {
-                                        backpressure_paused = true;
-                                        break;
-                                    }
-                                    let at_cap = {
-                                        let st =
-                                            sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                                        st.outbox.len() >= self.quotas.max_outbox_per_sub
-                                    };
-                                    if at_cap {
+                                    if !self.enqueue_single_upstream_event(
+                                        &sub,
+                                        ev,
+                                        cursor,
+                                        Some(&consumer_cancel),
+                                    ) {
                                         backpressure_paused = true;
                                         break;
                                     }
@@ -2178,6 +2218,17 @@ impl HookdEngine {
                                 | Err(_) => {
                                     break;
                                 }
+                            }
+                            if sub
+                                .state
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .outbox
+                                .len()
+                                >= self.quotas.max_outbox_per_sub
+                            {
+                                backpressure_paused = true;
+                                break;
                             }
                         }
                         if !backpressure_paused {
@@ -2238,15 +2289,22 @@ impl HookdEngine {
                     Ok(resp) => {
                         if resp.truncated {
                             if let Some(c) = resp.cursor
-                                && !self.enqueue_gap(&sub, c)
+                                && !self.enqueue_gap(&sub, c, Some(&consumer_cancel))
                             {
                                 backpressure_paused = true;
                             }
                         } else if resp.events.is_empty() {
-                            if let Some(c) = resp.cursor {
-                                self.advance_idle_cursor(&sub, c);
+                            if let Some(c) = resp.cursor
+                                && !self.advance_idle_cursor(&sub, c, Some(&consumer_cancel))
+                            {
+                                backpressure_paused = true;
                             }
-                        } else if !self.enqueue_polled_batch(&sub, resp.events, resp.cursor) {
+                        } else if !self.enqueue_polled_batch(
+                            &sub,
+                            resp.events,
+                            resp.cursor,
+                            Some(&consumer_cancel),
+                        ) {
                             backpressure_paused = true;
                         }
 
@@ -2270,38 +2328,96 @@ impl HookdEngine {
                     }
                 }
             }
-        }
-    }
-
-    fn advance_idle_cursor(&self, sub: &SubRuntime, cursor: String) {
-        let dirty = {
-            let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-            st.ingest_cursor = Some(cursor.clone());
-            if st.outbox.is_empty() && st.safe_cursor.as_deref() != Some(cursor.as_str()) {
-                st.safe_cursor = Some(cursor);
-                true
-            } else {
-                false
+            if backpressure_paused {
+                tokio::select! {
+                    () = sub.space_notify.notified() => {}
+                    () = tokio::time::sleep(Duration::from_millis(200)) => {}
+                    _ = cancel_rx.changed() => return,
+                    _ = consumer_cancel.changed() => return,
+                    _ = shutdown_rx.changed() => return,
+                }
             }
-        };
-        if dirty {
-            self.mark_state_dirty();
         }
     }
 
-    fn enqueue_gap(&self, sub: &SubRuntime, cursor: String) -> bool {
-        let lease_bytes = cursor.len() + 64;
-        let Some(lease) = self.pools.outbox.try_acquire(lease_bytes) else {
+    fn sub_accepts_events(
+        &self,
+        state: &SubState,
+        consumer_cancel: Option<&watch::Receiver<bool>>,
+    ) -> bool {
+        !*self.shutdown_tx.borrow()
+            && !consumer_cancel.is_some_and(|cancel| *cancel.borrow())
+            && !state.removed
+            && !state.suspended
+            && !state.auth_paused
+            && state.refresh_before > unix_now()
+    }
+
+    fn advance_idle_cursor(
+        &self,
+        sub: &SubRuntime,
+        cursor: String,
+        consumer_cancel: Option<&watch::Receiver<bool>>,
+    ) -> bool {
+        let runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.sub_accepts_events(&state, consumer_cancel) {
             return false;
-        };
-        {
-            let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-            st.ingest_cursor = Some(cursor.clone());
-            st.outbox.push_back(OutboxItem::Gap {
-                cursor,
+        }
+        if state.ingest_cursor.as_deref() == Some(cursor.as_str()) {
+            return true;
+        }
+        let dirty = state.outbox.is_empty();
+        if dirty {
+            state.safe_cursor = Some(cursor.clone());
+        } else {
+            if state.outbox.len() >= self.quotas.max_outbox_per_sub {
+                return false;
+            }
+            let Some(lease) = self.pools.outbox.try_acquire(cursor.len()) else {
+                return false;
+            };
+            state.outbox.push_back(OutboxItem::Checkpoint {
+                cursor: cursor.clone(),
                 _lease: lease,
             });
         }
+        state.ingest_cursor = Some(cursor);
+        drop(state);
+        drop(runtime);
+        if dirty {
+            self.mark_state_dirty();
+        } else {
+            sub.outbox_notify.notify_one();
+        }
+        true
+    }
+
+    fn enqueue_gap(
+        &self,
+        sub: &SubRuntime,
+        cursor: String,
+        consumer_cancel: Option<&watch::Receiver<bool>>,
+    ) -> bool {
+        let _runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.sub_accepts_events(&state, consumer_cancel)
+            || state.outbox.len() >= self.quotas.max_outbox_per_sub
+        {
+            return false;
+        }
+        let body_len = json!({ "type": "gap", "cursor": cursor }).to_string().len();
+        if self.config.profile == Profile::Sep3415 && body_len > MAX_WEBHOOK_PAYLOAD_BYTES {
+            return false;
+        }
+        let Some(lease) = self.pools.outbox.try_acquire(body_len) else {
+            return false;
+        };
+        state.ingest_cursor = Some(cursor.clone());
+        state.outbox.push_back(OutboxItem::Gap {
+            cursor,
+            _lease: lease,
+        });
         sub.outbox_notify.notify_one();
         true
     }
@@ -2311,8 +2427,9 @@ impl HookdEngine {
         sub: &SubRuntime,
         ev: UpstreamPolledEvent,
         cursor: Option<String>,
+        consumer_cancel: Option<&watch::Receiver<bool>>,
     ) -> bool {
-        self.enqueue_polled_batch(sub, vec![ev], cursor)
+        self.enqueue_polled_batch(sub, vec![ev], cursor, consumer_cancel)
     }
 
     fn enqueue_polled_batch(
@@ -2320,75 +2437,74 @@ impl HookdEngine {
         sub: &SubRuntime,
         events: Vec<UpstreamPolledEvent>,
         batch_cursor: Option<String>,
+        consumer_cancel: Option<&watch::Receiver<bool>>,
     ) -> bool {
-        let total = events.len();
-        if total == 0 {
-            return true;
+        if events.is_empty() {
+            return batch_cursor
+                .is_none_or(|cursor| self.advance_idle_cursor(sub, cursor, consumer_cancel));
         }
 
-        let current_safe_cursor = {
-            let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-            st.safe_cursor.clone()
-        };
+        let _runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.sub_accepts_events(&state, consumer_cancel) {
+            return false;
+        }
 
-        // Pre-acquire ByteLeases for the entire batch atomically before mutating outbox or cursors.
-        let mut prepared: Vec<OutboxItem> = Vec::with_capacity(total);
-        let mut skipped_tail_cursor: Option<String> = None;
+        // Any earlier queued cursor can become safe before this batch is delivered.
+        let cursor_bytes = state
+            .safe_cursor
+            .as_deref()
+            .into_iter()
+            .chain(state.ingest_cursor.as_deref())
+            .chain(batch_cursor.as_deref())
+            .chain(state.outbox.iter().filter_map(outbox_cursor))
+            .map(|cursor| serde_json::to_string(cursor).expect("JSON string").len())
+            .fold(4, usize::max);
 
-        for (idx, ev) in events.into_iter().enumerate() {
-            let is_last = idx + 1 == total;
-            let advance_cursor = if is_last { batch_cursor.clone() } else { None };
+        let total = events.len();
+        let mut prepared = Vec::with_capacity(total);
+        let mut skipped_tail_cursor = None;
 
-            // In chatgpt profile, eventId must match ^[A-Za-z0-9_-]{1,128}$ to fit webhook-id safely.
-            if self.config.profile == Profile::Chatgpt && !is_valid_event_id(&ev.event_id) {
-                if advance_cursor.is_some() {
-                    skipped_tail_cursor = advance_cursor;
-                }
+        for (idx, event) in events.into_iter().enumerate() {
+            let advance_cursor = (idx + 1 == total).then(|| batch_cursor.clone()).flatten();
+            if self.config.profile == Profile::Chatgpt && !is_valid_event_id(&event.event_id) {
+                skipped_tail_cursor = advance_cursor;
                 continue;
             }
 
-            let Ok(data_json) = serde_json::to_string(&ev.data) else {
-                if advance_cursor.is_some() {
-                    skipped_tail_cursor = advance_cursor;
-                }
+            let Ok(data_json) = serde_json::to_string(&event.data) else {
+                skipped_tail_cursor = advance_cursor;
                 continue;
             };
-
-            let candidate_cursor = advance_cursor.as_deref().or(current_safe_cursor.as_deref());
-            let env_len = serialize_event_envelope(
-                &ev.event_id,
-                &ev.name,
-                &ev.timestamp,
+            let envelope_bytes = serialize_event_envelope(
+                &event.event_id,
+                &event.name,
+                &event.timestamp,
                 &data_json,
-                candidate_cursor,
+                None,
             )
-            .len();
-
-            if env_len > MAX_WEBHOOK_PAYLOAD_BYTES {
-                if advance_cursor.is_some() {
-                    skipped_tail_cursor = advance_cursor;
-                }
+            .len()
+                - 4
+                + cursor_bytes;
+            if envelope_bytes > MAX_WEBHOOK_PAYLOAD_BYTES {
+                skipped_tail_cursor = advance_cursor;
                 continue;
             }
-
-            let Some(lease) = self.pools.outbox.try_acquire(env_len) else {
-                // Dropping `prepared` releases every previously acquired ByteLease without mutating state.
+            let Some(lease) = self.pools.outbox.try_acquire(envelope_bytes) else {
                 return false;
             };
-
             let webhook_id = match self.config.profile {
-                Profile::Chatgpt => ev.event_id.clone(),
+                Profile::Chatgpt => event.event_id.clone(),
                 Profile::Sep3415 => format!(
                     "msg_{}",
-                    random_base64url(18).unwrap_or_else(|_| ev.event_id.clone())
+                    random_base64url(18).unwrap_or_else(|_| event.event_id.clone())
                 ),
             };
-
             prepared.push(OutboxItem::Event {
                 webhook_id,
-                event_id: ev.event_id,
-                name: ev.name,
-                timestamp: ev.timestamp,
+                event_id: event.event_id,
+                name: event.name,
+                timestamp: event.timestamp,
                 data_json,
                 advance_cursor,
                 is_ingest: false,
@@ -2396,32 +2512,28 @@ impl HookdEngine {
             });
         }
 
-        let any_pushed = !prepared.is_empty();
-        let mut dirty = false;
+        if let Some(cursor) = skipped_tail_cursor {
+            let Some(lease) = self.pools.outbox.try_acquire(cursor.len()) else {
+                return false;
+            };
+            prepared.push(OutboxItem::Checkpoint {
+                cursor,
+                _lease: lease,
+            });
+        }
+        if prepared.len()
+            > self
+                .quotas
+                .max_outbox_per_sub
+                .saturating_sub(state.outbox.len())
         {
-            let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(c) = skipped_tail_cursor {
-                if let Some(OutboxItem::Event { advance_cursor, .. }) = prepared.last_mut() {
-                    *advance_cursor = Some(c.clone());
-                    st.ingest_cursor = Some(c);
-                } else {
-                    advance_skipped_cursor(&mut st, c);
-                    dirty = true;
-                }
-            } else if let Some(ref c) = batch_cursor {
-                st.ingest_cursor = Some(c.clone());
-            }
-            for item in prepared {
-                st.outbox.push_back(item);
-            }
+            return false;
         }
-
-        if any_pushed {
-            sub.outbox_notify.notify_one();
+        if let Some(cursor) = batch_cursor {
+            state.ingest_cursor = Some(cursor);
         }
-        if dirty {
-            self.mark_state_dirty();
-        }
+        state.outbox.extend(prepared);
+        sub.outbox_notify.notify_one();
         true
     }
 
@@ -2678,6 +2790,9 @@ enum HeadAction {
     Gap {
         cursor: String,
     },
+    Checkpoint {
+        cursor: String,
+    },
 }
 
 fn clone_outbox_head(item: &OutboxItem) -> HeadAction {
@@ -2703,6 +2818,9 @@ fn clone_outbox_head(item: &OutboxItem) -> HeadAction {
         OutboxItem::Gap { cursor, .. } => HeadAction::Gap {
             cursor: cursor.clone(),
         },
+        OutboxItem::Checkpoint { cursor, .. } => HeadAction::Checkpoint {
+            cursor: cursor.clone(),
+        },
     }
 }
 
@@ -2716,12 +2834,10 @@ fn active_secrets(sub: &SubRuntime) -> (SecretString, Option<SecretString>) {
     (st.secret.clone(), prev)
 }
 
-fn advance_skipped_cursor(st: &mut SubState, cursor: String) {
-    st.ingest_cursor = Some(cursor.clone());
-    match st.outbox.back_mut() {
-        None => st.safe_cursor = Some(cursor),
-        Some(OutboxItem::Event { advance_cursor, .. }) => *advance_cursor = Some(cursor),
-        Some(OutboxItem::Gap { cursor: gap_c, .. }) => *gap_c = cursor,
+fn outbox_cursor(item: &OutboxItem) -> Option<&str> {
+    match item {
+        OutboxItem::Event { advance_cursor, .. } => advance_cursor.as_deref(),
+        OutboxItem::Gap { cursor, .. } | OutboxItem::Checkpoint { cursor, .. } => Some(cursor),
     }
 }
 
@@ -4365,6 +4481,265 @@ mod tests {
         up_handle.abort();
     }
 
+    fn sample_upstream_sub(url: &str) -> Arc<SubRuntime> {
+        let key = SubscriptionKey::new("static:0", url, "task.exited", &Map::new()).unwrap();
+        Arc::new(new_sub_runtime(
+            PersistedSubscription {
+                id: key.subscription_id(),
+                key,
+                arguments: Map::new(),
+                auth_ref: None,
+                granted_scopes: Vec::new(),
+                secret: test_secret(12),
+                prev_secret: None,
+                prev_secret_until: None,
+                refresh_before: unix_now() + 1800,
+                safe_cursor: Some("c0".into()),
+                pending_truncated_for_refresh: false,
+                suspended: false,
+                last_error: None,
+            },
+            SubSource::Upstream {
+                event_name: "task.exited".into(),
+                arguments: Map::new(),
+            },
+            false,
+        ))
+    }
+
+    fn sample_polled_event(event_id: &str, data: Value) -> UpstreamPolledEvent {
+        UpstreamPolledEvent {
+            event_id: event_id.into(),
+            name: "task.exited".into(),
+            timestamp: "2026-11-25T00:00:01Z".into(),
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_admission_caps_gaps_and_rejects_cancelled_or_inactive_consumers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = base_config(
+            dir.path().join("subs.json"),
+            Profile::Chatgpt,
+            None,
+            Some(IngestConfig {
+                tokens: vec![SecretString::new("ptok")],
+                events: vec![sample_ingest_event_cfg()],
+            }),
+            None,
+        );
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            config,
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            None,
+        )
+        .await
+        .unwrap();
+        let sub = sample_upstream_sub("https://hooks.example.com/capacity");
+        let events = (0..63)
+            .map(|i| sample_polled_event(&format!("event_{i}"), json!({})))
+            .collect();
+        assert!(engine.enqueue_polled_batch(&sub, events, Some("c63".into()), None));
+        assert!(engine.enqueue_gap(&sub, "c64".into(), None));
+        let bytes = engine.pools.outbox.used();
+        assert!(!engine.enqueue_single_upstream_event(
+            &sub,
+            sample_polled_event("event_65", json!({})),
+            Some("c65".into()),
+            None,
+        ));
+        assert!(!engine.advance_idle_cursor(&sub, "c66".into(), None));
+        {
+            let mut state = sub.state.lock().unwrap();
+            assert_eq!(state.outbox.len(), 64);
+            assert_eq!(state.ingest_cursor.as_deref(), Some("c64"));
+            assert_eq!(engine.pools.outbox.used(), bytes);
+            state.outbox.clear();
+        }
+        assert_eq!(engine.pools.outbox.used(), 0);
+
+        let (cancel, receiver) = watch::channel(false);
+        *sub.consumer_cancel.lock().unwrap() = Some(cancel);
+        sub.stop_consumer();
+        assert!(!engine.enqueue_gap(&sub, "cancelled".into(), Some(&receiver)));
+        assert!(!engine.enqueue_single_upstream_event(
+            &sub,
+            sample_polled_event("late", json!({})),
+            Some("late".into()),
+            Some(&receiver),
+        ));
+        for mode in 0..4 {
+            {
+                let mut state = sub.state.lock().unwrap();
+                state.removed = mode == 0;
+                state.suspended = mode == 1;
+                state.auth_paused = mode == 2;
+                state.refresh_before = if mode == 3 { 0 } else { unix_now() + 1800 };
+            }
+            assert!(!engine.enqueue_gap(&sub, "inactive".into(), None));
+        }
+        assert_eq!(engine.pools.outbox.used(), 0);
+        assert_eq!(
+            sub.state.lock().unwrap().ingest_cursor.as_deref(),
+            Some("c64")
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipped_tails_use_ordered_checkpoints_and_all_cursor_sizes_are_budgeted() {
+        let callback =
+            spawn_tls_callback(|_headers, _body| async { (StatusCode::OK, b"{}".to_vec()) }).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = base_config(
+            dir.path().join("subs.json"),
+            Profile::Chatgpt,
+            None,
+            Some(IngestConfig {
+                tokens: vec![SecretString::new("ptok")],
+                events: vec![sample_ingest_event_cfg()],
+            }),
+            None,
+        );
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            config,
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(callback.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let sub = sample_upstream_sub(&callback.url);
+        engine
+            .runtime
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(sub.key.clone(), Arc::clone(&sub));
+        assert!(engine.enqueue_single_upstream_event(
+            &sub,
+            sample_polled_event("first", json!({})),
+            None,
+            None,
+        ));
+        let in_flight = clone_outbox_head(sub.state.lock().unwrap().outbox.front().unwrap());
+        assert!(engine.enqueue_single_upstream_event(
+            &sub,
+            sample_polled_event("boot:42", json!({})),
+            Some("c2".into()),
+            None,
+        ));
+        assert!(matches!(
+            in_flight,
+            HeadAction::Event {
+                advance_cursor: None,
+                ..
+            }
+        ));
+        {
+            let state = sub.state.lock().unwrap();
+            assert_eq!(state.outbox.len(), 2);
+            assert!(matches!(
+                state.outbox.front(),
+                Some(OutboxItem::Event {
+                    advance_cursor: None,
+                    ..
+                })
+            ));
+            assert!(
+                matches!(state.outbox.back(), Some(OutboxItem::Checkpoint { cursor, .. }) if cursor == "c2")
+            );
+        }
+        engine.spawn_delivery_worker(Arc::clone(&sub));
+        let captured = wait_for_captured(&callback.captured, 1).await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&captured[0].body).unwrap()["cursor"],
+            "c0"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sub.state.lock().unwrap().safe_cursor.as_deref() == Some("c2") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!sub.state.lock().unwrap().pending_truncated_for_refresh);
+        assert_eq!(engine.pools.outbox.used(), 0);
+        engine.shutdown().await.unwrap();
+
+        let config = base_config(
+            dir.path().join("budget.json"),
+            Profile::Chatgpt,
+            None,
+            Some(IngestConfig {
+                tokens: vec![SecretString::new("ptok")],
+                events: vec![sample_ingest_event_cfg()],
+            }),
+            None,
+        );
+        let engine = HookdEngine::new(
+            config,
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            None,
+        )
+        .await
+        .unwrap();
+        let sub = sample_upstream_sub("https://hooks.example.com/cursors");
+        let long_cursor = "cursor with \"quoted\" text";
+        assert!(engine.enqueue_gap(&sub, long_cursor.into(), None));
+        assert!(engine.enqueue_gap(&sub, "c2".into(), None));
+        assert!(engine.enqueue_single_upstream_event(
+            &sub,
+            sample_polled_event("small", json!({})),
+            None,
+            None,
+        ));
+        {
+            let state = sub.state.lock().unwrap();
+            let OutboxItem::Event {
+                _lease,
+                event_id,
+                name,
+                timestamp,
+                data_json,
+                ..
+            } = state.outbox.back().unwrap()
+            else {
+                panic!("event expected")
+            };
+            assert_eq!(
+                _lease.bytes(),
+                serialize_event_envelope(event_id, name, timestamp, data_json, Some(long_cursor))
+                    .len()
+            );
+        }
+        let base =
+            serialize_event_envelope("large", "task.exited", "2026-11-25T00:00:01Z", "\"\"", None)
+                .len();
+        let event = sample_polled_event(
+            "large",
+            Value::String("x".repeat(MAX_WEBHOOK_PAYLOAD_BYTES - base - 1)),
+        );
+        assert!(engine.enqueue_single_upstream_event(&sub, event, Some("c3".into()), None));
+        {
+            let state = sub.state.lock().unwrap();
+            assert_eq!(state.outbox.len(), 4);
+            assert!(
+                matches!(state.outbox.back(), Some(OutboxItem::Checkpoint { cursor, .. }) if cursor == "c3")
+            );
+        }
+        engine.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn enqueue_polled_batch_atomic_byte_lease_all_or_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4431,7 +4806,7 @@ mod tests {
             },
         ];
 
-        assert!(!engine.enqueue_polled_batch(&sub, batch, Some("c2".into())));
+        assert!(!engine.enqueue_polled_batch(&sub, batch, Some("c2".into()), None));
         assert_eq!(pools.outbox.used(), 0);
         {
             let st = sub.state.lock().unwrap();
@@ -4441,6 +4816,96 @@ mod tests {
         }
 
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_consumer_waits_after_partial_byte_capacity_rejection() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&poll_count);
+        let (url, upstream_task) = spawn_http_mock(move |request| {
+            let count = Arc::clone(&count);
+            async move {
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                let result = if request["method"] == "events/list" {
+                    json!({"events": [{
+                        "name": "task.exited", "delivery": ["poll"],
+                        "inputSchema": {"type": "object"},
+                        "payloadSchema": {"type": "object"}
+                    }]})
+                } else {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    json!({
+                        "events": [{
+                            "eventId": "next", "name": "task.exited",
+                            "timestamp": "2026-11-25T00:00:01Z",
+                            "data": {"message": "x".repeat(400)}
+                        }],
+                        "cursor": "c1", "truncated": false, "hasMore": true,
+                        "nextPollMs": 20
+                    })
+                };
+                Response::builder()
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                            .to_string(),
+                    )))
+                    .unwrap()
+            }
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let config = base_config(
+            directory.path().join("subs.json"),
+            Profile::Sep3415,
+            Some(UpstreamConfig {
+                url,
+                bearer_token: None,
+                passthrough_prefixes: Vec::new(),
+                request_timeout_secs: 5,
+                expose_events: vec![ExposeEventConfig {
+                    name: "task.exited".into(),
+                    disallow_arguments: Vec::new(),
+                }],
+            }),
+            None,
+            None,
+        );
+        let mut quotas = test_quotas();
+        quotas.outbox_byte_budget = 1024;
+        let engine = HookdEngine::new(
+            config,
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            None,
+        )
+        .await
+        .unwrap();
+        let other_subscription_bytes = engine.pools.outbox.try_acquire(900).unwrap();
+        let sub = sample_upstream_sub("https://hooks.example.com/byte-pressure");
+        let (cancel, receiver) = watch::channel(false);
+        let worker =
+            tokio::spawn(Arc::clone(&engine).run_upstream_consumer(Arc::clone(&sub), receiver));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while poll_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+        assert!(sub.state.lock().unwrap().outbox.is_empty());
+        assert_eq!(
+            sub.state.lock().unwrap().ingest_cursor.as_deref(),
+            Some("c0")
+        );
+        cancel.send_replace(true);
+        worker.await.unwrap();
+        drop(other_subscription_bytes);
+        engine.shutdown().await.unwrap();
+        upstream_task.abort();
     }
 
     #[tokio::test]
