@@ -436,7 +436,9 @@ impl HookdEngine {
         let upstream = config
             .upstream
             .as_ref()
-            .map(|config| UpstreamClient::new(config, Arc::clone(&pools.proxy)))
+            .map(|config| {
+                UpstreamClient::new(config, Arc::clone(&pools.proxy), Arc::clone(&pools.control))
+            })
             .transpose()?;
         let auth_client = config
             .auth_context
