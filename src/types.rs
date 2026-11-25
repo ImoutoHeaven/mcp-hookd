@@ -621,6 +621,12 @@ mod tests {
             key(json!(1_000_000_000_000_000_000u64)).unwrap(),
             key(json!(1e18)).unwrap()
         );
+        assert_eq!(
+            key(json!(9_223_372_036_854_775_808u64))
+                .unwrap()
+                .canonical_arguments,
+            r#"{"n":9223372036854776000}"#
+        );
         for value in [
             json!(9_007_199_254_740_992u64),
             json!(9_223_372_036_854_775_808u64),
