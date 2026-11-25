@@ -191,8 +191,13 @@ fn take_sse_frame(
     buf: &mut LeasedBuffer,
     eof: bool,
     budget: &Arc<ByteBudget>,
+    limit: usize,
 ) -> Result<Option<SseText>, UpstreamError> {
-    let (len, tail) = match sse_frame_len(buf.as_slice()) {
+    let frame_len = sse_frame_len(buf.as_slice());
+    if frame_len.unwrap_or(buf.len()) > limit {
+        return Err(UpstreamError::BodyTooLarge { limit });
+    }
+    let (len, tail) = match frame_len {
         Some(len) => (len, false),
         None if eof && buf.len() > 0 => (buf.len(), true),
         None => return Ok(None),
@@ -276,7 +281,9 @@ impl UpstreamEventStream {
     /// Read the next structured event frame, returning None on clean EOF.
     pub async fn next_frame(&mut self) -> Result<Option<UpstreamStreamFrame>, UpstreamError> {
         loop {
-            while let Some(frame) = take_sse_frame(&mut self.buf, self.eof, &self.budget)? {
+            while let Some(frame) =
+                take_sse_frame(&mut self.buf, self.eof, &self.budget, MAX_SSE_FRAME_BYTES)?
+            {
                 if let Some(data) = sse_data(
                     &frame,
                     std::mem::replace(&mut self.at_start, false),
@@ -304,11 +311,6 @@ impl UpstreamEventStream {
             match self.body.frame().await {
                 Some(Ok(frame)) => {
                     if let Ok(chunk) = frame.into_data() {
-                        if self.buf.len() + chunk.len() > MAX_SSE_FRAME_BYTES {
-                            return Err(UpstreamError::BodyTooLarge {
-                                limit: MAX_SSE_FRAME_BYTES,
-                            });
-                        }
                         append_response(&mut self.buf, &chunk)?;
                     }
                 }
@@ -1004,7 +1006,8 @@ async fn read_sse_handshake(
         let mut at_start = true;
         let mut eof = false;
         loop {
-            while let Some(frame) = take_sse_frame(&mut buf, eof, budget)? {
+            while let Some(frame) = take_sse_frame(&mut buf, eof, budget, MAX_HANDSHAKE_BODY_BYTES)?
+            {
                 let first = std::mem::replace(&mut at_start, false);
                 let response = sse_data(&frame, first, budget)?
                     .filter(|data| !data.text.trim().is_empty())
@@ -1254,7 +1257,7 @@ async fn read_first_sse_json_bounded(
         let mut eof = false;
         let mut at_start = true;
         loop {
-            while let Some(frame) = take_sse_frame(&mut buf, eof, budget)? {
+            while let Some(frame) = take_sse_frame(&mut buf, eof, budget, limit)? {
                 if let Some(data) =
                     sse_data(&frame, std::mem::replace(&mut at_start, false), budget)?
                     && !data.text.trim().is_empty()
@@ -1374,7 +1377,9 @@ mod tests {
             let mut data = Vec::new();
             for chunk in [&raw.as_bytes()[..split], &raw.as_bytes()[split..]] {
                 append_response(&mut buf, chunk).unwrap();
-                while let Some(frame) = take_sse_frame(&mut buf, false, &budget).unwrap() {
+                while let Some(frame) =
+                    take_sse_frame(&mut buf, false, &budget, MAX_SSE_FRAME_BYTES).unwrap()
+                {
                     if let Some(value) =
                         sse_data(&frame, std::mem::replace(&mut at_start, false), &budget).unwrap()
                     {
@@ -1431,12 +1436,39 @@ mod tests {
     }
 
     #[test]
+    fn sse_frame_limit_is_independent_of_http_chunk_boundaries() {
+        let bytes = b"data: one\n\ndata: two\n\n";
+        for split in 0..=bytes.len() {
+            let budget = ByteBudget::new(256);
+            let mut buf = response_buffer(&budget);
+            let mut frames = Vec::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                append_response(&mut buf, chunk).unwrap();
+                while let Some(frame) = take_sse_frame(&mut buf, false, &budget, 16).unwrap() {
+                    frames.push(frame.text);
+                }
+            }
+            assert_eq!(frames, ["data: one\n\n", "data: two\n\n"]);
+        }
+
+        let budget = ByteBudget::new(256);
+        let mut buf = response_buffer(&budget);
+        append_response(&mut buf, b"data: seventeen\n\n").unwrap();
+        assert!(matches!(
+            take_sse_frame(&mut buf, false, &budget, 16),
+            Err(UpstreamError::BodyTooLarge { limit: 16 })
+        ));
+    }
+
+    #[test]
     fn continuous_sse_frames_charge_capacity_without_accumulating_history() {
         let budget = ByteBudget::new(128);
         let mut buf = response_buffer(&budget);
         append_response(&mut buf, b"data: first\n\ndata:").unwrap();
         for index in 0..1000 {
-            let frame = take_sse_frame(&mut buf, false, &budget).unwrap().unwrap();
+            let frame = take_sse_frame(&mut buf, false, &budget, MAX_SSE_FRAME_BYTES)
+                .unwrap()
+                .unwrap();
             assert_eq!(budget.used(), buf.capacity() + frame.text.capacity());
             drop(frame);
             assert_eq!(budget.used(), buf.capacity());
