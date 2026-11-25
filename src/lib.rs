@@ -5,6 +5,7 @@ pub mod engine;
 pub mod headers;
 pub mod outbound;
 pub mod schema;
+pub mod server;
 pub mod store;
 pub mod types;
 pub mod upstream;

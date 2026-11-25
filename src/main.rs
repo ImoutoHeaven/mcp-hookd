@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use mcp_hookd::config::Config;
 use mcp_hookd::emit::{DEFAULT_INGEST_URL, EmitOptions, OnInvalid, run_emit};
+use mcp_hookd::server::run_serve;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -50,9 +51,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Serve { config: _ } => {
-            eprintln!("serve not yet implemented");
-            ExitCode::FAILURE
+        Command::Serve { config } => {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    eprintln!("mcp-hookd serve failed to start runtime: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            rt.block_on(run_serve(&config))
         }
         Command::Emit {
             url,
