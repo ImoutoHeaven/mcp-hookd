@@ -154,6 +154,7 @@ pub struct UpstreamEventStream {
     body: Incoming,
     buf: BytesMut,
     eof: bool,
+    at_start: bool,
 }
 
 impl UpstreamEventStream {
@@ -162,6 +163,7 @@ impl UpstreamEventStream {
             body,
             buf: BytesMut::new(),
             eof: false,
+            at_start: true,
         }
     }
 
@@ -169,7 +171,9 @@ impl UpstreamEventStream {
     pub async fn next_frame(&mut self) -> Result<Option<UpstreamStreamFrame>, UpstreamError> {
         loop {
             while let Some(raw_frame) = take_sse_frame(&mut self.buf) {
-                if let Some(data) = extract_sse_data(&raw_frame) {
+                if let Some(data) =
+                    extract_sse_data(&raw_frame, std::mem::replace(&mut self.at_start, false))
+                {
                     if data.trim().is_empty() {
                         continue;
                     }
@@ -332,6 +336,11 @@ impl UpstreamClient {
     ) -> Result<HandshakeResponse, UpstreamError> {
         let dur = timeout.unwrap_or(self.default_timeout);
         let deadline = tokio::time::Instant::now() + dur;
+        let request: Value = serde_json::from_slice(&body)
+            .map_err(|e| UpstreamError::Http(format!("invalid handshake request: {e}")))?;
+        let request_id = request
+            .get("id")
+            .ok_or_else(|| UpstreamError::Http("handshake request is missing id".into()))?;
 
         let resp = self
             .forward_raw(
@@ -347,22 +356,19 @@ impl UpstreamClient {
         let status = resp.status();
         let mut headers = strip_hop_by_hop_response_headers(resp.headers());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let raw_body =
-            read_body_bounded(resp.into_body(), MAX_HANDSHAKE_BODY_BYTES, remaining).await?;
-
-        if !status.is_success() {
-            return Ok(HandshakeResponse {
-                status,
-                headers,
-                body: raw_body,
-            });
-        }
-
         let content_type = media_type(&headers);
-        let transformed = match content_type.as_deref() {
-            Some("application/json") => rewrite_json_handshake(&raw_body, profile)?,
-            Some("text/event-stream") => rewrite_sse_handshake(&raw_body, profile)?,
-            _ => raw_body,
+        let transformed = if status.is_success()
+            && content_type.as_deref() == Some("text/event-stream")
+        {
+            read_sse_handshake(resp.into_body(), request_id, profile, remaining).await?
+        } else {
+            let raw_body =
+                read_body_bounded(resp.into_body(), MAX_HANDSHAKE_BODY_BYTES, remaining).await?;
+            if status.is_success() && content_type.as_deref() == Some("application/json") {
+                rewrite_json_handshake(&raw_body, profile)?
+            } else {
+                raw_body
+            }
         };
 
         headers.remove(header::CONTENT_LENGTH);
@@ -823,124 +829,147 @@ fn rewrite_json_handshake(raw: &Bytes, profile: Profile) -> Result<Bytes, Upstre
     }
 }
 
-fn rewrite_sse_handshake(raw: &Bytes, profile: Profile) -> Result<Bytes, UpstreamError> {
-    let text = std::str::from_utf8(raw).map_err(|e| {
-        UpstreamError::InvalidResponse(format!("handshake SSE is not valid UTF-8: {e}"))
-    })?;
-
-    let mut out = String::with_capacity(text.len() + 128);
-    let mut pos = 0;
-    let mut injected = false;
-
-    while pos < text.len() {
-        let (frame_slice, sep_slice, next_pos) = next_sse_slice(text, pos);
-        if !injected
-            && let Some(data) = extract_sse_data(frame_slice)
-            && !data.trim().is_empty()
-            && let Ok(mut val) = serde_json::from_str::<Value>(&data)
-            && val.get("result").is_some()
-        {
-            if inject_handshake_capabilities(&mut val, profile) {
-                let encoded = serde_json::to_string(&val)
-                    .map_err(|e| UpstreamError::InvalidResponse(e.to_string()))?;
-                write_sse_frame_with_data(&mut out, frame_slice, &encoded);
-            } else {
-                out.push_str(frame_slice);
+async fn read_sse_handshake(
+    mut body: Incoming,
+    request_id: &Value,
+    profile: Profile,
+    timeout: Duration,
+) -> Result<Bytes, UpstreamError> {
+    tokio::time::timeout(timeout, async {
+        let mut buf = BytesMut::new();
+        let mut out = String::new();
+        let mut total_read = 0usize;
+        let mut at_start = true;
+        let mut eof = false;
+        loop {
+            while let Some(frame) = take_sse_frame(&mut buf) {
+                let first = std::mem::replace(&mut at_start, false);
+                let response = extract_sse_data(&frame, first)
+                    .filter(|data| !data.trim().is_empty())
+                    .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+                    .filter(|msg| {
+                        msg.get("id") == Some(request_id)
+                            && (msg.get("result").is_some() || msg.get("error").is_some())
+                    });
+                if let Some(mut response) = response {
+                    if inject_handshake_capabilities(&mut response, profile) {
+                        let encoded = serde_json::to_string(&response)
+                            .map_err(|e| UpstreamError::InvalidResponse(e.to_string()))?;
+                        write_sse_frame_with_data(&mut out, &frame, &encoded, first);
+                    } else {
+                        out.push_str(&frame);
+                    }
+                    return Ok(Bytes::from(out));
+                }
+                out.push_str(&frame);
             }
-            out.push_str(sep_slice);
-            injected = true;
-        } else {
-            out.push_str(frame_slice);
-            out.push_str(sep_slice);
+            if eof {
+                return Err(UpstreamError::InvalidResponse(
+                    "handshake SSE ended without the requested response".into(),
+                ));
+            }
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(chunk) = frame.into_data() {
+                        total_read += chunk.len();
+                        if total_read > MAX_HANDSHAKE_BODY_BYTES {
+                            return Err(UpstreamError::BodyTooLarge {
+                                limit: MAX_HANDSHAKE_BODY_BYTES,
+                            });
+                        }
+                        buf.put_slice(&chunk);
+                    }
+                }
+                Some(Err(e)) => return Err(UpstreamError::Http(e.to_string())),
+                None => {
+                    eof = true;
+                    if !buf.is_empty() {
+                        buf.put_slice(b"\n\n");
+                    }
+                }
+            }
         }
-        pos = next_pos;
-    }
-
-    Ok(Bytes::from(out))
+    })
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
 }
 
-fn next_sse_slice(text: &str, start: usize) -> (&str, &str, usize) {
-    let rest = &text[start..];
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
-            return (&rest[..i], &rest[i..i + 2], start + i + 2);
+fn sse_lines(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
         }
-        if i + 3 < bytes.len()
-            && bytes[i] == b'\r'
-            && bytes[i + 1] == b'\n'
-            && bytes[i + 2] == b'\r'
-            && bytes[i + 3] == b'\n'
-        {
-            return (&rest[..i], &rest[i..i + 4], start + i + 4);
+        let end = rest.find(['\r', '\n']).unwrap_or(rest.len());
+        let mut next = end;
+        if next < rest.len() {
+            next += 1;
+            if rest.as_bytes()[end] == b'\r' && rest.as_bytes().get(next) == Some(&b'\n') {
+                next += 1;
+            }
         }
-        i += 1;
-    }
-    (rest, "", text.len())
+        let line = (&rest[..end], &rest[end..next]);
+        rest = &rest[next..];
+        Some(line)
+    })
 }
 
-fn write_sse_frame_with_data(out: &mut String, original_frame: &str, new_data: &str) {
+fn write_sse_frame_with_data(out: &mut String, frame: &str, new_data: &str, at_start: bool) {
     let mut wrote_data = false;
-    for line in original_frame.split('\n') {
-        let clean = line.strip_suffix('\r').unwrap_or(line);
+    for (index, (line, ending)) in sse_lines(frame).enumerate() {
+        let clean = if at_start && index == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        };
         if clean.starts_with("data:") || clean == "data" {
             if !wrote_data {
+                if clean.len() != line.len() {
+                    out.push('\u{feff}');
+                }
                 out.push_str("data: ");
                 out.push_str(new_data);
-                out.push('\n');
+                out.push_str(ending);
                 wrote_data = true;
             }
         } else {
             out.push_str(line);
-            out.push('\n');
+            out.push_str(ending);
         }
-    }
-    if !wrote_data {
-        out.push_str("data: ");
-        out.push_str(new_data);
-        out.push('\n');
-    }
-    // Remove the trailing '\n' because the caller appends `sep_slice`.
-    if out.ends_with('\n') {
-        out.pop();
     }
 }
 
 fn take_sse_frame(buf: &mut BytesMut) -> Option<String> {
-    let bytes = &buf[..];
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
-            let frame = String::from_utf8_lossy(&bytes[..i]).into_owned();
-            let _ = buf.split_to(i + 2);
-            return Some(frame);
+    let mut line_start = 0;
+    let mut index = 0;
+    while index < buf.len() {
+        if matches!(buf[index], b'\r' | b'\n') {
+            let mut next = index + 1;
+            if buf[index] == b'\r' && buf.get(next) == Some(&b'\n') {
+                next += 1;
+            }
+            if index == line_start {
+                return Some(String::from_utf8_lossy(&buf.split_to(next)).into_owned());
+            }
+            line_start = next;
+            index = next;
+        } else {
+            index += 1;
         }
-        if i + 3 < bytes.len()
-            && bytes[i] == b'\r'
-            && bytes[i + 1] == b'\n'
-            && bytes[i + 2] == b'\r'
-            && bytes[i + 3] == b'\n'
-        {
-            let frame = String::from_utf8_lossy(&bytes[..i]).into_owned();
-            let _ = buf.split_to(i + 4);
-            return Some(frame);
-        }
-        i += 1;
     }
     None
 }
 
-fn extract_sse_data(frame: &str) -> Option<String> {
+fn extract_sse_data(frame: &str, at_start: bool) -> Option<String> {
+    let frame = if at_start {
+        frame.strip_prefix('\u{feff}').unwrap_or(frame)
+    } else {
+        frame
+    };
     let mut data_lines = Vec::new();
-    for raw_line in frame.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if line.starts_with(':') || line.is_empty() {
-            continue;
-        }
+    for (line, _) in sse_lines(frame) {
         if let Some(rest) = line.strip_prefix("data:") {
-            let val = rest.strip_prefix(' ').unwrap_or(rest);
-            data_lines.push(val);
+            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
         } else if line == "data" {
             data_lines.push("");
         }
@@ -1077,9 +1106,11 @@ async fn read_first_sse_json_bounded(
         let mut buf = BytesMut::new();
         let mut total_read = 0usize;
         let mut eof = false;
+        let mut at_start = true;
         loop {
             while let Some(raw_frame) = take_sse_frame(&mut buf) {
-                if let Some(data) = extract_sse_data(&raw_frame)
+                if let Some(data) =
+                    extract_sse_data(&raw_frame, std::mem::replace(&mut at_start, false))
                     && !data.trim().is_empty()
                 {
                     let msg: Value = serde_json::from_str(&data).map_err(|e| {
@@ -1129,10 +1160,12 @@ mod tests {
     use std::sync::Mutex;
     use tokio::net::TcpListener;
 
-    async fn spawn_mock_server<F, Fut>(handler: F) -> (Url, tokio::task::JoinHandle<()>)
+    async fn spawn_mock_server<F, Fut, B>(handler: F) -> (Url, tokio::task::JoinHandle<()>)
     where
         F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Response<Full<Bytes>>> + Send + 'static,
+        Fut: std::future::Future<Output = Response<B>> + Send + 'static,
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1166,6 +1199,79 @@ mod tests {
             expose_events: vec![],
         };
         UpstreamClient::new(&cfg).unwrap()
+    }
+
+    struct OpenSseBody(std::collections::VecDeque<Bytes>);
+
+    impl Body for OpenSseBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+            match self.0.pop_front() {
+                Some(chunk) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk)))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    #[test]
+    fn sse_frames_accept_split_bom_and_mixed_line_endings() {
+        let raw = "\u{feff}data: first\r\rdata: second\r\ndata: line\n\r\n";
+        for split in 0..=raw.len() {
+            let mut buf = BytesMut::new();
+            let mut at_start = true;
+            let mut data = Vec::new();
+            for chunk in [&raw.as_bytes()[..split], &raw.as_bytes()[split..]] {
+                buf.extend_from_slice(chunk);
+                while let Some(frame) = take_sse_frame(&mut buf) {
+                    if let Some(value) =
+                        extract_sse_data(&frame, std::mem::replace(&mut at_start, false))
+                    {
+                        data.push(value);
+                    }
+                }
+            }
+            assert_eq!(data, ["first", "second\nline"], "split at {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_finishes_at_matching_response_on_open_sse() {
+        let (url, _srv) = spawn_mock_server(|_req| async {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header("mcp-session-id", "open-session")
+                .body(OpenSseBody(
+                    [
+                        Bytes::from_static(b"\xef"),
+                        Bytes::from_static(b"\xbb\xbf: priming\r\rdata:\r\n\r"),
+                        Bytes::from_static(b"\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\r\r"),
+                        Bytes::from_static(b"id: answer\r\nevent: message\rdata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}\r\r"),
+                    ]
+                    .into(),
+                ))
+                .unwrap()
+        })
+        .await;
+        let response = make_client(url, None)
+            .forward_handshake(
+                &HeaderMap::new(),
+                Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"),
+                Profile::Chatgpt,
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&response.body).unwrap();
+        assert!(text.starts_with("\u{feff}: priming\r\rdata:\r\n\r\n"));
+        assert!(text.contains("id: answer\r\nevent: message\r"));
+        assert!(text.contains("\"id\":2,\"result\":{}"));
+        assert!(text.contains("\"events\":{}"));
+        assert_eq!(response.headers["mcp-session-id"], "open-session");
     }
 
     #[tokio::test]
