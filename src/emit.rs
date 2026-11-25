@@ -472,7 +472,8 @@ fn parse_ingest_uri(raw: &str) -> Result<(Uri, bool), String> {
         "https" if parsed.has_host() => true,
         _ => return Err(format!("--url must be an http:// or https:// URL: '{raw}'")),
     };
-    let uri = raw
+    let uri = parsed
+        .as_str()
         .parse::<Uri>()
         .map_err(|e| format!("invalid --url URI '{raw}': {e}"))?;
     Ok((uri, is_https))
@@ -679,6 +680,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn ingest_uri_normalizes_unicode_hosts_and_paths() {
+        let (uri, is_https) = parse_ingest_uri("https://bücher.example/通知?q=你好").unwrap();
+        assert!(is_https);
+        assert_eq!(uri.host(), Some("xn--bcher-kva.example"));
+        assert_eq!(
+            uri.path_and_query().unwrap().as_str(),
+            "/%E9%80%9A%E7%9F%A5?q=%E4%BD%A0%E5%A5%BD"
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct RecordedRequest {

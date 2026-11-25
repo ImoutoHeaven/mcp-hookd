@@ -416,7 +416,7 @@ impl OutboundClient {
         subscription_id: &str,
         secret: &SecretString,
     ) -> Result<(), CallbackErrorReason> {
-        validate_callback_url(url, self.allow_loopback)
+        let url = validate_callback_url(url, self.allow_loopback)
             .map_err(|_| CallbackErrorReason::ConnectionRefused)?;
 
         let challenge = random_hex(24).map_err(|_| CallbackErrorReason::ChallengeFailed)?;
@@ -435,7 +435,7 @@ impl OutboundClient {
             .map_err(|_| CallbackErrorReason::ChallengeFailed)?;
 
         let req = build_signed_request(
-            url,
+            &url,
             subscription_id,
             &webhook_id,
             timestamp,
@@ -475,9 +475,10 @@ impl OutboundClient {
         secret: &SecretString,
         prev_secret_if_active: Option<&SecretString>,
     ) -> DeliveryOutcome {
-        if validate_callback_url(url, self.allow_loopback).is_err() {
-            return DeliveryOutcome::Transient(CallbackErrorReason::ConnectionRefused);
-        }
+        let url = match validate_callback_url(url, self.allow_loopback) {
+            Ok(url) => url,
+            Err(_) => return DeliveryOutcome::Transient(CallbackErrorReason::ConnectionRefused),
+        };
 
         let timestamp = unix_now();
         let sig_new = match sign_webhook_v1(secret.expose(), webhook_id, timestamp, raw_body) {
@@ -495,7 +496,7 @@ impl OutboundClient {
         };
 
         let req = match build_signed_request(
-            url,
+            &url,
             subscription_id,
             webhook_id,
             timestamp,
@@ -595,14 +596,17 @@ struct VerificationResponse {
 }
 
 fn build_signed_request(
-    url: &str,
+    url: &Url,
     subscription_id: &str,
     webhook_id: &str,
     timestamp: u64,
     signature: &str,
     body: Bytes,
 ) -> Result<Request<Full<Bytes>>, String> {
-    let uri: Uri = url.parse().map_err(|e| format!("invalid URI: {e}"))?;
+    let uri: Uri = url
+        .as_str()
+        .parse()
+        .map_err(|e| format!("invalid URI: {e}"))?;
     let mut builder = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -847,6 +851,25 @@ mod tests {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_public_unicast_ip(ip), "expected {s} to be allowed");
         }
+    }
+
+    #[test]
+    fn signed_request_uses_normalized_unicode_url() {
+        let parsed = validate_callback_url("https://bücher.example/通知?q=你好", false).unwrap();
+        let request = build_signed_request(
+            &parsed,
+            "sub_example",
+            "msg_example",
+            123,
+            "v1,signature",
+            Bytes::new(),
+        )
+        .unwrap();
+        assert_eq!(request.uri().host(), Some("xn--bcher-kva.example"));
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            "/%E9%80%9A%E7%9F%A5?q=%E4%BD%A0%E5%A5%BD"
+        );
     }
 
     #[test]
