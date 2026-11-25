@@ -1303,6 +1303,7 @@ impl HookdEngine {
         };
 
         let Some(sub) = removed else {
+            self.persist_state().await.map_err(EngineError::Internal)?;
             return match self.config.profile {
                 Profile::Sep3415 => Err(EngineError::NotFound {
                     kind: "subscription",
