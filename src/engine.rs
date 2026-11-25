@@ -1042,8 +1042,12 @@ impl HookdEngine {
         };
 
         let sub = Arc::new(new_sub_runtime(persisted, source, false));
-        if !replay_events.is_empty() {
-            let _ = self.enqueue_polled_batch(&sub, replay_events, replay_cursor);
+        if !replay_events.is_empty()
+            && !self.enqueue_polled_batch(&sub, replay_events, replay_cursor)
+        {
+            return Err(EngineError::ResourceExhausted(
+                "bootstrap replay exceeds outbox capacity".into(),
+            ));
         }
 
         // Re-check quotas under runtime lock before inserting.
@@ -4192,7 +4196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_bootstrap_truncated_discards_residual_events() {
+    async fn subscribe_bootstrap_keeps_truncation_and_memory_admission_atomic() {
         let (up_url, up_handle) = spawn_http_mock(move |req| async move {
             let body = req.into_body().collect().await.unwrap().to_bytes();
             let v: Value = serde_json::from_slice(&body).unwrap();
@@ -4213,7 +4217,7 @@ mod tests {
                 }),
                 "events/poll" => {
                     let cur = v["params"].get("cursor").and_then(Value::as_str);
-                    if cur == Some("stale_c") {
+                    if matches!(cur, Some("stale_c" | "budget_c")) {
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -4225,7 +4229,7 @@ mod tests {
                                     "data": { "x": 1 }
                                 }],
                                 "cursor": "c_fresh",
-                                "truncated": true,
+                                "truncated": cur == Some("stale_c"),
                                 "hasMore": false,
                                 "nextPollMs": 500
                             }
@@ -4286,6 +4290,10 @@ mod tests {
             None,
             None,
         );
+        let cfg_for_budget = Config {
+            state_path: dir.path().join("budget.json"),
+            ..cfg.clone()
+        };
         let quotas = test_quotas();
         let engine = HookdEngine::new(
             cfg,
@@ -4319,6 +4327,38 @@ mod tests {
         // Only the verification challenge should have been sent; residual event was discarded.
         assert_eq!(cb.captured.lock().await.len(), 1);
 
+        engine.shutdown().await.unwrap();
+
+        let mut quotas = test_quotas();
+        quotas.outbox_byte_budget = 1;
+        let engine = HookdEngine::new(
+            cfg_for_budget,
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(cb.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let failure = engine
+            .subscribe(
+                &CallerAuth::StaticSlot(0),
+                SubscribeRequest {
+                    event_name: "task.exited".into(),
+                    arguments: Map::new(),
+                    delivery_mode: "webhook".into(),
+                    delivery_url: cb.url.clone(),
+                    delivery_secret: test_secret(11),
+                    ttl_ms: None,
+                    cursor: Some("budget_c".into()),
+                    max_age_ms: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(failure, EngineError::ResourceExhausted(_)));
+        assert_eq!(engine.active_subscription_count(), 0);
+        assert_eq!(engine.pools.outbox.used(), 0);
+        assert!(engine.snapshot_state().subscriptions.is_empty());
         engine.shutdown().await.unwrap();
         up_handle.abort();
     }
