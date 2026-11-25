@@ -1,0 +1,8 @@
+/target
+/dist
+ci-*.log
+ci-*.txt
+ci-*-report.json
+ci-*-artifacts.zip
+*.swp
+.DS_Store
