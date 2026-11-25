@@ -2409,7 +2409,7 @@ impl HookdEngine {
             (state.auth_ref.clone(), state.granted_scopes.clone())
         };
         let Some(auth_ref) = auth_ref else {
-            self.revoke_subscription(&sub.key, true).await;
+            self.revoke_subscription(sub, true).await;
             return DeliveryAuthorization::Revoked;
         };
         let checked = tokio::select! {
@@ -2426,7 +2426,7 @@ impl HookdEngine {
             }
             AuthCheckOutcome::TransientError(_) => DeliveryAuthorization::Retry,
             AuthCheckOutcome::Active(_) | AuthCheckOutcome::Inactive => {
-                self.revoke_subscription(&sub.key, true).await;
+                self.revoke_subscription(sub, true).await;
                 DeliveryAuthorization::Revoked
             }
         }
@@ -3042,10 +3042,22 @@ impl HookdEngine {
         true
     }
 
-    async fn revoke_subscription(self: &Arc<Self>, key: &SubscriptionKey, send_terminated: bool) {
+    async fn revoke_subscription(
+        self: &Arc<Self>,
+        expected: &Arc<SubRuntime>,
+        send_terminated: bool,
+    ) {
         let removed = {
-            let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
-            rt.subscriptions.remove(key)
+            let mut runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+            if runtime
+                .subscriptions
+                .get(&expected.key)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                runtime.subscriptions.remove(&expected.key)
+            } else {
+                None
+            }
         };
         let Some(sub) = removed else {
             return;
@@ -3123,24 +3135,24 @@ impl HookdEngine {
 
             let refs: Vec<String> = pending_refs.iter().cloned().collect();
             for aref in refs {
+                let subs: Vec<Arc<SubRuntime>> = {
+                    let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+                    rt.subscriptions
+                        .values()
+                        .filter(|s| {
+                            s.state
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .auth_ref
+                                .as_deref()
+                                == Some(aref.as_str())
+                        })
+                        .cloned()
+                        .collect()
+                };
                 match client.check_live(&aref).await {
                     AuthCheckOutcome::Active(checked) => {
                         pending_refs.remove(&aref);
-                        let subs: Vec<Arc<SubRuntime>> = {
-                            let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
-                            rt.subscriptions
-                                .values()
-                                .filter(|s| {
-                                    s.state
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .auth_ref
-                                        .as_deref()
-                                        == Some(aref.as_str())
-                                })
-                                .cloned()
-                                .collect()
-                        };
                         for sub in subs {
                             let (ok_scopes, resumed, suspended) = {
                                 let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -3161,29 +3173,14 @@ impl HookdEngine {
                                     }
                                 }
                             } else {
-                                self.revoke_subscription(&sub.key, true).await;
+                                self.revoke_subscription(&sub, true).await;
                             }
                         }
                     }
                     AuthCheckOutcome::Inactive => {
                         pending_refs.remove(&aref);
-                        let keys: Vec<SubscriptionKey> = {
-                            let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
-                            rt.subscriptions
-                                .values()
-                                .filter(|s| {
-                                    s.state
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .auth_ref
-                                        .as_deref()
-                                        == Some(aref.as_str())
-                                })
-                                .map(|s| s.key.clone())
-                                .collect()
-                        };
-                        for key in keys {
-                            self.revoke_subscription(&key, true).await;
+                        for sub in subs {
+                            self.revoke_subscription(&sub, true).await;
                         }
                     }
                     AuthCheckOutcome::TransientError(_) => {}
@@ -3287,13 +3284,13 @@ impl HookdEngine {
                                     scopes_subset(&st.granted_scopes, &checked.scopes)
                                 };
                                 if !ok {
-                                    self.revoke_subscription(&sub.key, true).await;
+                                    self.revoke_subscription(&sub, true).await;
                                 }
                             }
                         }
                         AuthCheckOutcome::Inactive => {
                             for sub in subs {
-                                self.revoke_subscription(&sub.key, true).await;
+                                self.revoke_subscription(&sub, true).await;
                             }
                         }
                         AuthCheckOutcome::TransientError(_) => {}
@@ -4151,7 +4148,7 @@ mod tests {
             .unwrap()
             .subscriptions
             .insert(revoked.key.clone(), Arc::clone(&revoked));
-        engine.revoke_subscription(&revoked.key, true).await;
+        engine.revoke_subscription(&revoked, true).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(callback.captured.lock().await.is_empty());
         drop(capacity);
@@ -4189,7 +4186,7 @@ mod tests {
             .next()
             .unwrap()
             .clone();
-        engine.revoke_subscription(&current.key, true).await;
+        engine.revoke_subscription(&current, true).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         engine
             .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -4203,6 +4200,91 @@ mod tests {
         drop(capacity);
         assert_eq!(callback.captured.lock().await.len(), 2);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_revocation_cannot_remove_a_replacement_subscription() {
+        let callback =
+            spawn_tls_callback(|_headers, _body| async { (StatusCode::OK, b"{}".to_vec()) }).await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            base_config(
+                directory.path().join("subs.json"),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("producer")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(callback.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let old = sample_upstream_sub(&callback.url);
+        engine
+            .runtime
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(old.key.clone(), Arc::clone(&old));
+        engine
+            .unsubscribe(
+                &CallerAuth::StaticSlot(0),
+                UnsubscribeRequest {
+                    event_name: old.key.event_name.clone(),
+                    arguments: Map::new(),
+                    delivery_mode: Some("webhook".into()),
+                    delivery_url: old.key.url.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let current = sample_upstream_sub(&callback.url);
+        engine
+            .runtime
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(current.key.clone(), Arc::clone(&current));
+        assert!(engine.enqueue_single_upstream_event(
+            &current,
+            sample_polled_event("replacement_event", json!({})),
+            Some("c1".into()),
+            None,
+        ));
+        let bytes = engine.pools.outbox.used();
+        engine.revoke_subscription(&old, true).await;
+        assert!(Arc::ptr_eq(
+            engine
+                .runtime
+                .lock()
+                .unwrap()
+                .subscriptions
+                .get(&current.key)
+                .unwrap(),
+            &current,
+        ));
+        assert!(!current.state.lock().unwrap().removed);
+        assert_eq!(current.state.lock().unwrap().outbox.len(), 1);
+        assert_eq!(engine.pools.outbox.used(), bytes);
+        assert_eq!(engine.tasks.len(), 1);
+        assert!(callback.captured.lock().await.is_empty());
+
+        engine.revoke_subscription(&current, true).await;
+        assert_eq!(engine.active_subscription_count(), 0);
+        assert_eq!(engine.pools.outbox.used(), 0);
+        let captured = wait_for_captured(&callback.captured, 1).await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&captured[0].body).unwrap()["type"],
+            "terminated",
+        );
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
