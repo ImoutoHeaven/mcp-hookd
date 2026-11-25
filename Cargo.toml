@@ -19,6 +19,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "native-tokio"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1", "service"] }
+jsonschema = { version = "0.63.1", default-features = false, features = ["resolve-async", "resolve-http", "resolve-file", "tls-ring", "idna"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }

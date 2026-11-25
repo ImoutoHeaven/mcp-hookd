@@ -1,6 +1,6 @@
 //! Configuration loading, `${VAR}` whole-string expansion, and startup validation.
 
-use crate::schema::build_filter_input_schema;
+use crate::schema::{build_filter_input_schema, validate_schema};
 use crate::types::{MAX_TTL_SECS_DEFAULT, MAX_TTL_SECS_UPPER, MIN_TTL_SECS, Profile, SecretString};
 use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
@@ -516,6 +516,8 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
                         "ingest.events[{i}].description: length must be 1..=400 Unicode characters, got {desc_chars}"
                     ));
                 }
+                validate_schema(&ev.payload_schema)
+                    .map_err(|e| format!("ingest.events[{i}] ('{}'): {e}", ev.name))?;
                 let input_schema = build_filter_input_schema(&ev.payload_schema, &ev.filter_fields)
                     .map_err(|e| format!("ingest.events[{i}] ('{}'): {e}", ev.name))?;
                 events.push(IngestEventConfig {

@@ -1,19 +1,18 @@
-//! Minimal JSON Schema validation, integer normalization, and flat filter schema derivation.
+//! JSON Schema validation, integer normalization, and flat filter schema derivation.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Number, Value, json};
 
-/// Normalize a JSON number to `i64` if it represents an exact integer (rejecting fractional floats).
-pub fn as_exact_i64(val: &Value) -> Option<i64> {
-    let n = val.as_number()?;
-    if let Some(i) = n.as_i64() {
-        return Some(i);
+fn as_exact_integer(value: &Value) -> Option<i128> {
+    let number = value.as_number()?;
+    if let Some(value) = number.as_i64() {
+        return Some(i128::from(value));
     }
-    if let Some(u) = n.as_u64() {
-        return i64::try_from(u).ok();
+    if let Some(value) = number.as_u64() {
+        return Some(i128::from(value));
     }
-    let f = n.as_f64()?;
-    if f.is_finite() && f.fract() == 0.0 && f >= (i64::MIN as f64) && f < (i64::MAX as f64) {
-        Some(f as i64)
+    let value = number.as_f64()?;
+    if value.fract() == 0.0 && value >= i128::MIN as f64 && value < i128::MAX as f64 {
+        Some(value as i128)
     } else {
         None
     }
@@ -22,7 +21,7 @@ pub fn as_exact_i64(val: &Value) -> Option<i64> {
 /// Compare two JSON scalar values, treating exact integer representations as equal.
 pub fn scalar_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(_), Value::Number(_)) => match (as_exact_i64(a), as_exact_i64(b)) {
+        (Value::Number(_), Value::Number(_)) => match (as_exact_integer(a), as_exact_integer(b)) {
             (Some(ia), Some(ib)) => ia == ib,
             _ => a == b,
         },
@@ -88,184 +87,56 @@ pub fn build_filter_input_schema(
     }))
 }
 
-/// Validate `value` against a JSON Schema object (Draft 2020-12 core subset).
-pub fn validate_against_schema(schema: &Value, value: &Value) -> Result<(), String> {
-    validate_node(schema, value, "$", 0)
+/// Check a configured schema against its bundled draft meta-schema without external retrieval.
+pub fn validate_schema(schema: &Value) -> Result<(), String> {
+    let result = match schema.get("$schema").and_then(Value::as_str) {
+        None => jsonschema::draft202012::meta::validate(schema),
+        Some(uri) => match uri.trim_end_matches('#') {
+            "http://json-schema.org/draft-04/schema"
+            | "https://json-schema.org/draft-04/schema" => {
+                jsonschema::draft4::meta::validate(schema)
+            }
+            "http://json-schema.org/draft-06/schema"
+            | "https://json-schema.org/draft-06/schema" => {
+                jsonschema::draft6::meta::validate(schema)
+            }
+            "http://json-schema.org/draft-07/schema"
+            | "https://json-schema.org/draft-07/schema" => {
+                jsonschema::draft7::meta::validate(schema)
+            }
+            "https://json-schema.org/draft/2019-09/schema"
+            | "http://json-schema.org/draft/2019-09/schema" => {
+                jsonschema::draft201909::meta::validate(schema)
+            }
+            "https://json-schema.org/draft/2020-12/schema"
+            | "http://json-schema.org/draft/2020-12/schema" => {
+                jsonschema::draft202012::meta::validate(schema)
+            }
+            // Custom dialects are resolved asynchronously when the schema is compiled.
+            _ => return Ok(()),
+        },
+    };
+    result.map_err(|error| format!("invalid JSON Schema: {error}"))
 }
 
-const MAX_SCHEMA_DEPTH: usize = 32;
-
-fn validate_node(schema: &Value, value: &Value, path: &str, depth: usize) -> Result<(), String> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return Err(format!("{path}: schema validation depth limit exceeded"));
-    }
-    match schema {
-        Value::Bool(true) => return Ok(()),
-        Value::Bool(false) => return Err(format!("{path}: value disallowed by false schema")),
-        Value::Object(_) => {}
-        _ => return Err(format!("{path}: schema must be an object or boolean")),
-    }
-    let obj = schema.as_object().unwrap();
-
-    if let Some(expected_const) = obj.get("const")
-        && !scalar_eq(value, expected_const)
-    {
-        return Err(format!("{path}: value does not match const"));
-    }
-
-    if let Some(Value::Array(allowed)) = obj.get("enum")
-        && !allowed.iter().any(|item| scalar_eq(value, item))
-    {
-        return Err(format!("{path}: value is not in enum"));
-    }
-
-    if let Some(type_val) = obj.get("type") {
-        let matches = match type_val {
-            Value::String(t) => matches_type(t, value),
-            Value::Array(arr) => arr
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|t| matches_type(t, value)),
-            _ => false,
-        };
-        if !matches {
-            return Err(format!("{path}: type mismatch"));
-        }
-    }
-
-    if let Some(Value::Array(all_of)) = obj.get("allOf") {
-        for sub in all_of {
-            validate_node(sub, value, path, depth + 1)?;
-        }
-    }
-    if let Some(Value::Array(any_of)) = obj.get("anyOf")
-        && !any_of
-            .iter()
-            .any(|sub| validate_node(sub, value, path, depth + 1).is_ok())
-    {
-        return Err(format!("{path}: value did not match anyOf"));
-    }
-    if let Some(Value::Array(one_of)) = obj.get("oneOf") {
-        let count = one_of
-            .iter()
-            .filter(|sub| validate_node(sub, value, path, depth + 1).is_ok())
-            .count();
-        if count != 1 {
-            return Err(format!("{path}: value matched {count} schemas in oneOf"));
-        }
-    }
-    if let Some(not_schema) = obj.get("not")
-        && validate_node(not_schema, value, path, depth + 1).is_ok()
-    {
-        return Err(format!("{path}: value matched negated schema"));
-    }
-
-    match value {
-        Value::String(s) => {
-            let char_len = s.chars().count();
-            if let Some(min_len) = obj.get("minLength").and_then(Value::as_u64)
-                && (char_len as u64) < min_len
-            {
-                return Err(format!("{path}: string shorter than minLength {min_len}"));
-            }
-            if let Some(max_len) = obj.get("maxLength").and_then(Value::as_u64)
-                && (char_len as u64) > max_len
-            {
-                return Err(format!("{path}: string longer than maxLength {max_len}"));
-            }
-        }
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if let Some(min) = obj.get("minimum").and_then(Value::as_f64)
-                    && f < min
-                {
-                    return Err(format!("{path}: number below minimum {min}"));
-                }
-                if let Some(max) = obj.get("maximum").and_then(Value::as_f64)
-                    && f > max
-                {
-                    return Err(format!("{path}: number above maximum {max}"));
-                }
-                if let Some(ex_min) = obj.get("exclusiveMinimum").and_then(Value::as_f64)
-                    && f <= ex_min
-                {
-                    return Err(format!("{path}: number not greater than {ex_min}"));
-                }
-                if let Some(ex_max) = obj.get("exclusiveMaximum").and_then(Value::as_f64)
-                    && f >= ex_max
-                {
-                    return Err(format!("{path}: number not less than {ex_max}"));
-                }
-            }
-        }
-        Value::Array(items) => {
-            if let Some(min_items) = obj.get("minItems").and_then(Value::as_u64)
-                && (items.len() as u64) < min_items
-            {
-                return Err(format!("{path}: array has fewer than {min_items} items"));
-            }
-            if let Some(max_items) = obj.get("maxItems").and_then(Value::as_u64)
-                && (items.len() as u64) > max_items
-            {
-                return Err(format!("{path}: array has more than {max_items} items"));
-            }
-            if let Some(item_schema) = obj.get("items") {
-                for (i, item) in items.iter().enumerate() {
-                    let sub_path = format!("{path}[{i}]");
-                    validate_node(item_schema, item, &sub_path, depth + 1)?;
-                }
-            }
-        }
-        Value::Object(map) => {
-            if let Some(Value::Array(required)) = obj.get("required") {
-                for req in required.iter().filter_map(Value::as_str) {
-                    if !map.contains_key(req) {
-                        return Err(format!("{path}: missing required property '{req}'"));
-                    }
-                }
-            }
-            let props = obj.get("properties").and_then(Value::as_object);
-            let addl = obj.get("additionalProperties");
-            for (k, v) in map {
-                let sub_path = format!("{path}.{k}");
-                if let Some(prop_schema) = props.and_then(|p| p.get(k)) {
-                    validate_node(prop_schema, v, &sub_path, depth + 1)?;
-                } else if let Some(addl_schema) = addl {
-                    match addl_schema {
-                        Value::Bool(false) => {
-                            return Err(format!("{sub_path}: additional property not allowed"));
-                        }
-                        Value::Bool(true) => {}
-                        other => validate_node(other, v, &sub_path, depth + 1)?,
-                    }
-                }
-            }
-        }
-        Value::Null | Value::Bool(_) => {}
-    }
-
-    Ok(())
+/// Validate with the declared draft, resolving external references asynchronously.
+pub async fn validate_against_schema(schema: &Value, value: &Value) -> Result<(), String> {
+    let validator = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        jsonschema::async_validator_for(schema),
+    )
+    .await
+    .map_err(|_| "JSON Schema resolution timed out after 30 seconds".to_owned())?
+    .map_err(|error| format!("invalid JSON Schema: {error}"))?;
+    validator.validate(value).map_err(|error| error.to_string())
 }
 
-fn matches_type(ty: &str, value: &Value) -> bool {
-    match ty {
-        "null" => value.is_null(),
-        "boolean" => value.is_boolean(),
-        "string" => value.is_string(),
-        "array" => value.is_array(),
-        "object" => value.is_object(),
-        "number" => value.is_number(),
-        "integer" => as_exact_i64(value).is_some(),
-        _ => false,
-    }
-}
-
-/// Normalize integer filter arguments in-place so `1.0` becomes `1`, while rejecting non-integer floats.
-pub fn normalize_filter_arguments(
+/// Normalize whole integer arguments without narrowing their supported range.
+pub async fn normalize_filter_arguments(
     input_schema: &Value,
     args: &Map<String, Value>,
 ) -> Result<Map<String, Value>, String> {
-    validate_against_schema(input_schema, &Value::Object(args.clone()))?;
+    validate_against_schema(input_schema, &Value::Object(args.clone())).await?;
     let props = input_schema.get("properties").and_then(Value::as_object);
     let mut normalized = Map::with_capacity(args.len());
     for (k, v) in args {
@@ -275,9 +146,13 @@ pub fn normalize_filter_arguments(
             .and_then(Value::as_str)
             == Some("integer");
         if is_integer_prop && !v.is_null() {
-            let int_val =
-                as_exact_i64(v).ok_or_else(|| format!("argument '{k}' must be an integer"))?;
-            normalized.insert(k.clone(), Value::Number(int_val.into()));
+            let integer = as_exact_integer(v).and_then(|integer| {
+                i64::try_from(integer)
+                    .map(Number::from)
+                    .or_else(|_| u64::try_from(integer).map(Number::from))
+                    .ok()
+            });
+            normalized.insert(k.clone(), integer.map_or_else(|| v.clone(), Value::Number));
         } else {
             normalized.insert(k.clone(), v.clone());
         }
@@ -312,18 +187,136 @@ mod tests {
         assert!(build_filter_input_schema(&payload, &["missing".into()]).is_err());
     }
 
-    #[test]
-    fn integer_normalization_accepts_whole_float_and_rejects_fractional() {
+    #[tokio::test]
+    async fn integer_normalization_accepts_whole_float_and_rejects_fractional() {
         let schema = json!({
             "type": "object",
             "properties": {"pr": {"type": "integer"}},
             "additionalProperties": false
         });
         let ok_args = json!({"pr": 42.0}).as_object().unwrap().clone();
-        let norm = normalize_filter_arguments(&schema, &ok_args).unwrap();
+        let norm = normalize_filter_arguments(&schema, &ok_args).await.unwrap();
         assert_eq!(norm["pr"], json!(42));
 
         let bad_args = json!({"pr": 42.5}).as_object().unwrap().clone();
-        assert!(normalize_filter_arguments(&schema, &bad_args).is_err());
+        assert!(
+            normalize_filter_arguments(&schema, &bad_args)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn validates_standard_keywords_and_declared_drafts() {
+        for (schema, valid, invalid) in [
+            (
+                json!({"type": "object", "properties": {"repo": {"$ref": "#/$defs/repo"}},
+                       "required": ["repo"], "$defs": {"repo": {"type": "string", "pattern": "^[A-Z]+$"}}}),
+                json!({"repo": "ABC"}),
+                json!({"repo": "abc"}),
+            ),
+            (
+                json!({"type": "number", "multipleOf": 0.25}),
+                json!(1.5),
+                json!(1.6),
+            ),
+            (
+                json!({"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}],
+                       "items": false}),
+                json!(["repo", 2]),
+                json!([2, "repo"]),
+            ),
+            (
+                json!({"type": "object", "properties": {"n": {"type": "integer"}},
+                       "if": {"required": ["n"]}, "then": {"required": ["label"]},
+                       "unevaluatedProperties": false}),
+                json!({}),
+                json!({"n": 2}),
+            ),
+            (
+                json!({"$schema": "http://json-schema.org/draft-04/schema#",
+                       "minimum": 3, "exclusiveMinimum": true}),
+                json!(4),
+                json!(3),
+            ),
+            (
+                json!({"$schema": "http://json-schema.org/draft-07/schema#",
+                       "items": [{"type": "integer"}, {"type": "string"}],
+                       "additionalItems": false}),
+                json!([2, "repo"]),
+                json!([2, 3]),
+            ),
+        ] {
+            assert!(validate_schema(&schema).is_ok(), "{schema}");
+            assert!(
+                validate_against_schema(&schema, &valid).await.is_ok(),
+                "{schema}"
+            );
+            assert!(
+                validate_against_schema(&schema, &invalid).await.is_err(),
+                "{schema}"
+            );
+        }
+        assert!(validate_schema(&json!({"type": "unknown"})).is_err());
+        assert!(validate_schema(&json!({"minimum": "3"})).is_err());
+        assert!(validate_schema(&json!({"$ref": "https://example.com/schema.json"})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn integer_validation_and_equality_preserve_u64_precision() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"n": {"type": "integer", "minimum": 9_007_199_254_740_993u64}}
+        });
+        let args = json!({"n": u64::MAX}).as_object().unwrap().clone();
+        assert_eq!(
+            normalize_filter_arguments(&schema, &args).await.unwrap()["n"],
+            json!(u64::MAX)
+        );
+        assert!(
+            validate_against_schema(&schema, &json!({"n": 9_007_199_254_740_992u64}))
+                .await
+                .is_err()
+        );
+        assert!(scalar_eq(
+            &json!(9_223_372_036_854_775_808u64),
+            &json!(9_223_372_036_854_775_808.0)
+        ));
+        assert!(!scalar_eq(
+            &json!(9_007_199_254_740_993u64),
+            &json!(9_007_199_254_740_992.0)
+        ));
+        assert!(!scalar_eq(&json!(u64::MAX), &json!(u64::MAX as f64)));
+    }
+
+    #[tokio::test]
+    async fn resolves_external_references_without_blocking_the_runtime() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let body = r#"{"type":"string","pattern":"^[A-Z]+$"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let schema = json!({"$ref": format!("http://{address}/schema.json")});
+        assert!(
+            validate_against_schema(&schema, &json!("ABC"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_against_schema(&schema, &json!("abc"))
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
     }
 }
