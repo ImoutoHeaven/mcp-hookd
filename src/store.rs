@@ -260,6 +260,11 @@ impl StoreHandle {
         self.store.path()
     }
 
+    #[cfg(test)]
+    pub(crate) fn save_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.store.save_lock)
+    }
+
     /// Queue a state snapshot for group-commit persistence.
     pub fn mark_dirty(&self, state: PersistedState) {
         {

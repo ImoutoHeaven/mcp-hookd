@@ -274,6 +274,16 @@ enum OutboxItem {
     },
 }
 
+struct PendingRefresh {
+    refresh_before: u64,
+    secret: SecretString,
+    prev_secret: Option<SecretString>,
+    prev_secret_until: Option<u64>,
+    resume_suspended: bool,
+    resume_auth_paused: bool,
+    captured_truncated: bool,
+}
+
 struct SubState {
     auth_ref: Option<String>,
     granted_scopes: Vec<String>,
@@ -290,6 +300,8 @@ struct SubState {
     first_failure_at: Option<Instant>,
     auth_paused: bool,
     removed: bool,
+    registration_pending: bool,
+    pending_refresh: Option<PendingRefresh>,
     outbox: VecDeque<OutboxItem>,
 }
 
@@ -307,6 +319,7 @@ struct SubRuntime {
 impl SubRuntime {
     fn to_persisted(&self) -> PersistedSubscription {
         let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let refresh = st.pending_refresh.as_ref();
         PersistedSubscription {
             id: self.id.clone(),
             key: self.key.clone(),
@@ -317,13 +330,13 @@ impl SubRuntime {
             },
             auth_ref: st.auth_ref.clone(),
             granted_scopes: st.granted_scopes.clone(),
-            secret: st.secret.clone(),
-            prev_secret: st.prev_secret.clone(),
-            prev_secret_until: st.prev_secret_until,
-            refresh_before: st.refresh_before,
+            secret: refresh.map_or(&st.secret, |r| &r.secret).clone(),
+            prev_secret: refresh.map_or(&st.prev_secret, |r| &r.prev_secret).clone(),
+            prev_secret_until: refresh.map_or(st.prev_secret_until, |r| r.prev_secret_until),
+            refresh_before: refresh.map_or(st.refresh_before, |r| r.refresh_before),
             safe_cursor: st.safe_cursor.clone(),
             pending_truncated_for_refresh: st.pending_truncated_for_refresh,
-            suspended: st.suspended,
+            suspended: st.suspended && !refresh.is_some_and(|r| r.resume_suspended),
             last_error: st.last_error,
         }
     }
@@ -348,6 +361,155 @@ impl SubRuntime {
         self.cancel_tx.send_replace(true);
         self.outbox_notify.notify_waiters();
         self.space_notify.notify_waiters();
+    }
+}
+
+struct RefreshGuard<'a> {
+    engine: &'a HookdEngine,
+    sub: Arc<SubRuntime>,
+    committed: bool,
+}
+
+impl RefreshGuard<'_> {
+    fn commit(&mut self) -> Result<bool, EngineError> {
+        let runtime = self
+            .engine
+            .runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.engine.ensure_running()?;
+        if !runtime
+            .subscriptions
+            .get(&self.sub.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.sub))
+        {
+            return Err(EngineError::NotFound {
+                kind: "subscription",
+                message: "subscription was removed while refreshing".into(),
+            });
+        }
+        let mut state = self.sub.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.removed {
+            return Err(EngineError::NotFound {
+                kind: "subscription",
+                message: "subscription was removed while refreshing".into(),
+            });
+        }
+        let refresh = state
+            .pending_refresh
+            .take()
+            .ok_or_else(|| EngineError::Internal("refresh transaction is missing".into()))?;
+        let resume_suspended = refresh.resume_suspended && state.suspended;
+        let resume_auth = refresh.resume_auth_paused && state.auth_paused;
+        state.refresh_before = refresh.refresh_before;
+        state.secret = refresh.secret;
+        state.prev_secret = refresh.prev_secret;
+        state.prev_secret_until = refresh.prev_secret_until;
+        if resume_suspended {
+            state.suspended = false;
+            state.consecutive_failures = 0;
+            state.first_failure_at = None;
+        }
+        if resume_auth {
+            state.auth_paused = false;
+        }
+        self.committed = true;
+        Ok(resume_suspended || resume_auth)
+    }
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let dirty = {
+            let runtime = self
+                .engine
+                .runtime
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut state = self.sub.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(refresh) = state.pending_refresh.take() {
+                state.pending_truncated_for_refresh |= refresh.captured_truncated;
+            }
+            runtime
+                .subscriptions
+                .get(&self.sub.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.sub))
+        };
+        if dirty {
+            self.engine.mark_state_dirty();
+        }
+    }
+}
+
+struct RegistrationGuard<'a> {
+    engine: &'a HookdEngine,
+    sub: Arc<SubRuntime>,
+    committed: bool,
+}
+
+impl RegistrationGuard<'_> {
+    fn commit(&mut self) -> Result<(), EngineError> {
+        let runtime = self
+            .engine
+            .runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.engine.ensure_running()?;
+        if !runtime
+            .subscriptions
+            .get(&self.sub.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.sub))
+        {
+            return Err(EngineError::NotFound {
+                kind: "subscription",
+                message: "subscription was removed while registering".into(),
+            });
+        }
+        let mut state = self.sub.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.removed {
+            return Err(EngineError::NotFound {
+                kind: "subscription",
+                message: "subscription was removed while registering".into(),
+            });
+        }
+        state.registration_pending = false;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RegistrationGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let dirty = {
+            let mut runtime = self
+                .engine
+                .runtime
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let still_current = runtime
+                .subscriptions
+                .get(&self.sub.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.sub));
+            if still_current {
+                runtime.subscriptions.remove(&self.sub.key);
+            }
+            {
+                let mut state = self.sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.removed = true;
+                state.outbox.clear();
+            }
+            self.sub.cancel_all();
+            still_current
+        };
+        if dirty {
+            self.engine.mark_state_dirty();
+        }
     }
 }
 
@@ -869,50 +1031,44 @@ impl HookdEngine {
                 .await?;
             }
 
-            // Re-verify subscription was not concurrently removed/expired while awaiting verification.
             let refresh_outcome = {
-                let rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
+                let runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
                 self.ensure_running()?;
-                let still_live = rt
+                let still_live = runtime
                     .subscriptions
                     .get(&key)
-                    .is_some_and(|cur| Arc::ptr_eq(cur, &sub));
+                    .is_some_and(|current| Arc::ptr_eq(current, &sub));
                 if still_live {
-                    let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                    if st.removed {
+                    let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.removed {
                         None
                     } else {
-                        let was_suspended = st.suspended;
-                        let was_paused = st.auth_paused;
-                        let last_error = st.last_error;
-                        st.refresh_before = refresh_before;
-                        st.auth_paused = false;
-                        if secret_changed {
-                            let old_secret =
-                                std::mem::replace(&mut st.secret, req.delivery_secret.clone());
-                            st.prev_secret = Some(old_secret);
-                            st.prev_secret_until =
-                                Some(now.saturating_add(self.quotas.dual_secret_window_secs));
-                        }
-                        if was_suspended {
-                            st.suspended = false;
-                            st.consecutive_failures = 0;
-                            st.first_failure_at = None;
-                        }
-                        let truncated_flag = if is_ingest {
-                            false
-                        } else {
-                            std::mem::take(&mut st.pending_truncated_for_refresh)
-                        };
-                        let need_restart_consumer = (was_suspended || was_paused)
-                            && matches!(sub.source, SubSource::Upstream { .. });
+                        let was_suspended = state.suspended;
+                        let last_error = state.last_error;
+                        let truncated =
+                            !is_ingest && std::mem::take(&mut state.pending_truncated_for_refresh);
+                        state.pending_refresh = Some(PendingRefresh {
+                            refresh_before,
+                            secret: req.delivery_secret.clone(),
+                            prev_secret: if secret_changed {
+                                Some(state.secret.clone())
+                            } else {
+                                state.prev_secret.clone()
+                            },
+                            prev_secret_until: if secret_changed {
+                                Some(now.saturating_add(self.quotas.dual_secret_window_secs))
+                            } else {
+                                state.prev_secret_until
+                            },
+                            resume_suspended: was_suspended,
+                            resume_auth_paused: state.auth_paused,
+                            captured_truncated: truncated,
+                        });
                         Some((
                             was_suspended,
-                            was_paused,
                             last_error,
-                            st.safe_cursor.clone(),
-                            truncated_flag,
-                            need_restart_consumer,
+                            state.safe_cursor.clone(),
+                            truncated,
                         ))
                     }
                 } else {
@@ -920,29 +1076,25 @@ impl HookdEngine {
                 }
             };
 
-            if let Some((
-                was_suspended,
-                was_paused,
-                last_error,
-                safe_cursor,
-                truncated_flag,
-                need_restart_consumer,
-            )) = refresh_outcome
-            {
+            if let Some((was_suspended, last_error, safe_cursor, truncated)) = refresh_outcome {
+                let mut transaction = RefreshGuard {
+                    engine: self,
+                    sub: Arc::clone(&sub),
+                    committed: false,
+                };
                 self.persist_state().await.map_err(EngineError::Internal)?;
-
-                if was_suspended || was_paused {
+                let resumed = transaction.commit()?;
+                if resumed {
                     sub.outbox_notify.notify_one();
+                    if matches!(sub.source, SubSource::Upstream { .. }) {
+                        self.spawn_upstream_consumer(Arc::clone(&sub));
+                    }
                 }
-                if need_restart_consumer {
-                    self.spawn_upstream_consumer(Arc::clone(&sub));
-                }
-
                 return Ok(SubscribeResponse {
                     id: sub_id,
                     refresh_before,
                     cursor: if is_ingest { None } else { safe_cursor },
-                    truncated: truncated_flag,
+                    truncated,
                     delivery_status: Some(DeliveryStatus {
                         active: !was_suspended,
                         last_error,
@@ -1058,6 +1210,11 @@ impl HookdEngine {
             ));
         }
 
+        sub.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .registration_pending = true;
+
         // Re-check quotas under runtime lock before inserting.
         {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
@@ -1080,24 +1237,13 @@ impl HookdEngine {
             rt.subscriptions.insert(key.clone(), Arc::clone(&sub));
         }
 
-        if let Err(err) = self.persist_state().await {
-            let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
-            if rt
-                .subscriptions
-                .get(&key)
-                .is_some_and(|cur| Arc::ptr_eq(cur, &sub))
-            {
-                rt.subscriptions.remove(&key);
-            }
-            drop(rt);
-            {
-                let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                st.removed = true;
-                st.outbox.clear();
-            }
-            sub.cancel_all();
-            return Err(EngineError::Internal(err));
-        }
+        let mut transaction = RegistrationGuard {
+            engine: self,
+            sub: Arc::clone(&sub),
+            committed: false,
+        };
+        self.persist_state().await.map_err(EngineError::Internal)?;
+        transaction.commit()?;
 
         self.spawn_delivery_worker(Arc::clone(&sub));
         if !is_ingest {
@@ -2376,6 +2522,7 @@ impl HookdEngine {
         !*self.shutdown_tx.borrow()
             && !consumer_cancel.is_some_and(|cancel| *cancel.borrow())
             && !state.removed
+            && !state.registration_pending
             && !state.suspended
             && !state.auth_paused
             && state.refresh_before > unix_now()
@@ -2648,18 +2795,23 @@ impl HookdEngine {
                                 .collect()
                         };
                         for sub in subs {
-                            let (ok_scopes, suspended) = {
-                                let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                                let ok = scopes_subset(&st.granted_scopes, &checked.scopes);
-                                if ok {
-                                    st.auth_paused = false;
+                            let (ok_scopes, resumed, suspended) = {
+                                let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                                let ok = scopes_subset(&state.granted_scopes, &checked.scopes);
+                                let resumed = ok && state.auth_paused;
+                                if resumed {
+                                    state.auth_paused = false;
                                 }
-                                (ok, st.suspended)
+                                (ok, resumed, state.suspended)
                             };
                             if ok_scopes {
-                                sub.outbox_notify.notify_one();
-                                if !suspended && matches!(sub.source, SubSource::Upstream { .. }) {
-                                    self.spawn_upstream_consumer(Arc::clone(&sub));
+                                if resumed {
+                                    sub.outbox_notify.notify_one();
+                                    if !suspended
+                                        && matches!(sub.source, SubSource::Upstream { .. })
+                                    {
+                                        self.spawn_upstream_consumer(Arc::clone(&sub));
+                                    }
                                 }
                             } else {
                                 self.revoke_subscription(&sub.key, true).await;
@@ -2913,6 +3065,8 @@ fn new_sub_runtime(sub: PersistedSubscription, source: SubSource, auth_paused: b
             first_failure_at: None,
             auth_paused,
             removed: false,
+            registration_pending: false,
+            pending_refresh: None,
             outbox: VecDeque::new(),
         }),
         outbox_notify: Notify::new(),
@@ -3518,6 +3672,248 @@ mod tests {
         let (_, persisted) = StateStore::open(path).unwrap();
         assert!(persisted.subscriptions.is_empty());
         assert!(persisted.verified_endpoints.is_empty());
+    }
+
+    fn hold_store_writes(
+        store: &StoreHandle,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let save_lock = store.save_lock();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _guard = save_lock.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        ready_rx.recv().unwrap();
+        (release_tx, thread)
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_removes_provisional_state_and_retry_starts_delivery() {
+        let callback = spawn_tls_callback(|_headers, body| async move {
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            (
+                StatusCode::OK,
+                json!({"challenge": payload["challenge"]})
+                    .to_string()
+                    .into_bytes(),
+            )
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("subs.json");
+        let quotas = test_quotas();
+        let engine = HookdEngine::new(
+            base_config(
+                path.clone(),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("producer")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(callback.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let request = SubscribeRequest {
+            event_name: "ci.build_failed".into(),
+            arguments: Map::new(),
+            delivery_mode: "webhook".into(),
+            delivery_url: callback.url.clone(),
+            delivery_secret: test_secret(16),
+            ttl_ms: None,
+            cursor: None,
+            max_age_ms: None,
+        };
+        let (release, writer) = hold_store_writes(&engine.store);
+        let mut pending = Box::pin(engine.subscribe(&CallerAuth::StaticSlot(0), request.clone()));
+        tokio::select! {
+            result = &mut pending => panic!("registration finished before persistence: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let provisional = engine.runtime.lock().unwrap().subscriptions.values()
+                        .any(|sub| sub.state.lock().unwrap().registration_pending);
+                    if provisional {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }) => result.unwrap(),
+        }
+        assert_eq!(engine.active_subscription_count(), 1);
+        let admitted = engine
+            .ingest_event(
+                0,
+                br#"{"eventId":"before_commit","name":"ci.build_failed","data":{"repo":"demo"}}"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted.matched, Some(0));
+        drop(pending);
+        assert_eq!(engine.active_subscription_count(), 0);
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        engine.store.flush().await.unwrap();
+        let (_, persisted) = StateStore::open(path).unwrap();
+        assert!(persisted.subscriptions.is_empty());
+
+        engine
+            .subscribe(&CallerAuth::StaticSlot(0), request)
+            .await
+            .unwrap();
+        engine
+            .ingest_event(
+                0,
+                br#"{"eventId":"after_commit","name":"ci.build_failed","data":{"repo":"demo"}}"#,
+            )
+            .await
+            .unwrap();
+        let delivered = wait_for_captured(&callback.captured, 2).await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&delivered[1].body).unwrap()["eventId"],
+            "after_commit"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_failed_refresh_preserves_independent_runtime_updates() {
+        let (url, upstream_task) = spawn_http_mock(|request| async move {
+            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            Response::builder()
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(
+                    json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "result": {"events": [{
+                            "name": "task.exited", "delivery": ["poll"],
+                            "inputSchema": {"type": "object"},
+                            "payloadSchema": {"type": "object"}
+                        }]}
+                    })
+                    .to_string(),
+                )))
+                .unwrap()
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        for fail_write in [false, true] {
+            let path = directory.path().join(if fail_write {
+                "failure.json"
+            } else {
+                "cancel.json"
+            });
+            let quotas = test_quotas();
+            let engine = HookdEngine::new(
+                base_config(
+                    path.clone(),
+                    Profile::Chatgpt,
+                    Some(UpstreamConfig {
+                        url: url.clone(),
+                        bearer_token: None,
+                        passthrough_prefixes: Vec::new(),
+                        request_timeout_secs: 5,
+                        expose_events: vec![ExposeEventConfig {
+                            name: "task.exited".into(),
+                            disallow_arguments: Vec::new(),
+                        }],
+                    }),
+                    None,
+                    None,
+                ),
+                quotas.clone(),
+                MemoryPools::from_quotas(&quotas),
+                None,
+            )
+            .await
+            .unwrap();
+            let sub = sample_upstream_sub("https://hooks.example.com/refresh");
+            let old_expiry = {
+                let mut state = sub.state.lock().unwrap();
+                state.suspended = true;
+                state.auth_paused = true;
+                state.consecutive_failures = 7;
+                state.pending_truncated_for_refresh = !fail_write;
+                state.refresh_before
+            };
+            engine
+                .runtime
+                .lock()
+                .unwrap()
+                .subscriptions
+                .insert(sub.key.clone(), Arc::clone(&sub));
+            engine.persist_state().await.unwrap();
+            let (release, writer) = hold_store_writes(&engine.store);
+            let mut pending = Box::pin(engine.subscribe(
+                &CallerAuth::StaticSlot(0),
+                SubscribeRequest {
+                    event_name: "task.exited".into(),
+                    arguments: Map::new(),
+                    delivery_mode: "webhook".into(),
+                    delivery_url: sub.key.url.clone(),
+                    delivery_secret: test_secret(12),
+                    ttl_ms: Some(Some(600_000)),
+                    cursor: None,
+                    max_age_ms: None,
+                },
+            ));
+            tokio::select! {
+                result = &mut pending => panic!("refresh finished before persistence: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if sub.state.lock().unwrap().pending_refresh.is_some() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }) => result.unwrap(),
+            }
+            {
+                let mut state = sub.state.lock().unwrap();
+                assert!(state.suspended);
+                assert!(state.auth_paused);
+                assert_eq!(state.refresh_before, old_expiry);
+                assert!(!state.pending_truncated_for_refresh);
+                state.auth_paused = false;
+                state.pending_truncated_for_refresh = true;
+            }
+            if fail_write {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                release.send(()).unwrap();
+                writer.join().unwrap();
+                assert!(matches!(pending.await, Err(EngineError::Internal(_))));
+                std::fs::remove_dir(&path).unwrap();
+            } else {
+                drop(pending);
+                release.send(()).unwrap();
+                writer.join().unwrap();
+            }
+            {
+                let state = sub.state.lock().unwrap();
+                assert!(state.pending_refresh.is_none());
+                assert!(state.suspended);
+                assert!(!state.auth_paused);
+                assert!(state.pending_truncated_for_refresh);
+                assert_eq!(state.consecutive_failures, 7);
+                assert_eq!(state.refresh_before, old_expiry);
+            }
+            engine.persist_state().await.unwrap();
+            let (_, persisted) = StateStore::open(path).unwrap();
+            assert!(persisted.subscriptions[0].suspended);
+            assert!(persisted.subscriptions[0].pending_truncated_for_refresh);
+            assert_eq!(persisted.subscriptions[0].refresh_before, old_expiry);
+            engine.shutdown().await.unwrap();
+        }
+        upstream_task.abort();
     }
 
     #[tokio::test]
