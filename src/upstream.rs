@@ -453,11 +453,16 @@ impl UpstreamClient {
             .get("id")
             .ok_or_else(|| UpstreamError::Http("handshake request is missing id".into()))?;
 
+        let mut upstream_headers = inbound_headers.clone();
+        upstream_headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
         let resp = self
             .forward_raw(
                 Method::POST,
                 None,
-                inbound_headers,
+                &upstream_headers,
                 Full::new(body),
                 true,
                 Some(dur),
@@ -1591,6 +1596,63 @@ mod tests {
             .unwrap();
         let text_sep = std::str::from_utf8(&resp_sep.body).unwrap();
         assert!(!text_sep.contains(r#""events""#));
+    }
+
+    #[tokio::test]
+    async fn handshakes_request_identity_while_raw_proxy_preserves_compression() {
+        const PLAIN: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}}"#;
+        const GZIP: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x15\xca\x41\x0e\xc0\x10\x10\x05\xd0\xbb\xfc\x35\x0d\x12\x1b\x07\xe9\x5e\xd5\x62\x1a\x31\x62\x74\x25\xee\x5e\x7d\xeb\x37\xf1\x08\xd7\xde\x12\x02\xdc\x61\xa0\x40\x37\x82\x55\xe8\x59\xde\x32\x10\x26\x5a\xe7\xc1\x89\xcb\x99\xbb\x10\xd7\x3f\x1a\xe7\xb5\xb5\xda\xf9\xfd\x53\x6c\xf1\xa2\x42\x83\xb2\xec\xbe\xd6\xfa\x00\xb6\x48\x50\xfb\x54\x00\x00\x00";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let (url, _srv) = spawn_mock_server(move |req| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let encoding = req.headers()[header::ACCEPT_ENCODING].clone();
+                recorded.lock().unwrap().push(encoding.clone());
+                let _ = req.into_body().collect().await.unwrap();
+                let response = Response::builder().header(header::CONTENT_TYPE, "application/json");
+                if encoding == "gzip" {
+                    response
+                        .header(header::CONTENT_ENCODING, "gzip")
+                        .body(Full::new(Bytes::from_static(GZIP)))
+                        .unwrap()
+                } else {
+                    assert_eq!(encoding, "identity");
+                    response.body(Full::new(Bytes::from_static(PLAIN))).unwrap()
+                }
+            }
+        })
+        .await;
+        let client = make_client(url, None);
+        let mut inbound = HeaderMap::new();
+        inbound.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let response = client
+            .forward_handshake(
+                &inbound,
+                Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#),
+                Profile::Chatgpt,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(response.headers.get(header::CONTENT_ENCODING).is_none());
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["capabilities"]["events"], json!({}));
+
+        let raw = client
+            .forward_raw(
+                Method::GET,
+                Some("/t/encoded"),
+                &inbound,
+                Full::new(Bytes::new()),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(raw.into_body().collect().await.unwrap().to_bytes(), GZIP);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["identity", "gzip"]);
     }
 
     #[tokio::test]
