@@ -605,6 +605,42 @@ fn lookup_argument<'a>(
     Ok(val)
 }
 
+fn exact_header_integer(text: &str) -> Option<i128> {
+    let negative = text.starts_with('-');
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(index) => (&unsigned[..index], Some(&unsigned[index + 1..])),
+        None => (unsigned, None),
+    };
+    let Some(end) = mantissa
+        .bytes()
+        .rposition(|byte| matches!(byte, b'1'..=b'9'))
+        .map(|index| index + 1)
+    else {
+        return Some(0);
+    };
+    let fraction = mantissa
+        .find('.')
+        .map_or(0, |index| mantissa.len() - index - 1);
+    let trailing = mantissa[end..].bytes().filter(u8::is_ascii_digit).count();
+    let exponent = exponent
+        .map_or(Some(0), |value| value.parse::<i64>().ok())?
+        .checked_sub(i64::try_from(fraction).ok()?)?
+        .checked_add(i64::try_from(trailing).ok()?)?;
+    let mut coefficient = 0_i128;
+    for digit in mantissa[..end].bytes().filter(u8::is_ascii_digit) {
+        coefficient = coefficient
+            .checked_mul(10)?
+            .checked_add(i128::from(digit - b'0'))?;
+    }
+    let integer = coefficient.checked_mul(10_i128.checked_pow(u32::try_from(exponent).ok()?)?)?;
+    if negative {
+        integer.checked_neg()
+    } else {
+        Some(integer)
+    }
+}
+
 fn header_matches_scalar(decoded: &str, arg_val: &Value) -> bool {
     match arg_val {
         Value::String(s) => decoded == s,
@@ -619,13 +655,15 @@ fn header_matches_scalar(decoded: &str, arg_val: &Value) -> bool {
             let Some(hdr_num) = hdr_val.as_number() else {
                 return false;
             };
-            match (as_exact_i128(arg_val), as_exact_i128(&hdr_val)) {
-                (Some(a), Some(b)) => a == b,
-                (Some(_), None) | (None, Some(_)) => false,
-                (None, None) => match (n.as_f64(), hdr_num.as_f64()) {
-                    (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a == b,
-                    _ => false,
-                },
+            if let Some(integer) = as_exact_i128(arg_val) {
+                return exact_header_integer(decoded) == Some(integer);
+            }
+            if as_exact_i128(&hdr_val).is_some() {
+                return false;
+            }
+            match (n.as_f64(), hdr_num.as_f64()) {
+                (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a == b,
+                _ => false,
             }
         }
         Value::Null | Value::Array(_) | Value::Object(_) => false,
@@ -978,6 +1016,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn integer_headers_compare_decimal_and_exponent_spellings_without_rounding() {
+        let big = json!(1_000_000_000_000_000_000_u64);
+        for header in ["1e18", "1000000000000000000.0", "10000000000000000000e-1"] {
+            assert!(header_matches_scalar(header, &big), "{header}");
+        }
+        for header in ["1000000000000000001.0", "1.000000000000000001e18", "1e17"] {
+            assert!(!header_matches_scalar(header, &big), "{header}");
+        }
+        assert!(header_matches_scalar(
+            "-9.223372036854775808e18",
+            &json!(i64::MIN),
+        ));
+        assert!(header_matches_scalar(
+            "18446744073709551615.0",
+            &json!(u64::MAX),
+        ));
+        assert!(!header_matches_scalar(
+            "18446744073709551614.0",
+            &json!(u64::MAX),
+        ));
+        assert!(header_matches_scalar("-0.000e+200", &json!(0)));
+        assert!(!header_matches_scalar("1e-1", &json!(0)));
+        assert!(!header_matches_scalar("1e39", &json!(0)));
     }
 
     #[test]
