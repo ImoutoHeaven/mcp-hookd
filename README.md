@@ -15,6 +15,8 @@ Local Producers / mcp-hookd emit --------------> mcp-hookd (POST /v1/events)
 
 Subscriptions persist in a local JSON state file (`state_path`) protected with `0600` permissions on Unix. When `auth_context` is enabled, `mcp-hookd` periodically rechecks delegated OAuth grants against the gateway's loopback check endpoint and drops revoked subscriptions.
 
+The serialized state file has a 16 MiB limit for both reads and writes. A write that exceeds this limit fails and leaves the previous file intact; startup rejects an oversized file. State includes normalized business arguments separately from their canonical subscription key, plus cursors and endpoint verification records. Their lengths determine how many subscriptions fit within this limit; the 256-subscription cap does not guarantee that every set of 256 subscriptions will fit.
+
 ## Commands
 
 Requires Rust 1.92 or newer.
