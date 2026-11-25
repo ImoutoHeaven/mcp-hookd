@@ -16,8 +16,8 @@ use crate::types::{
     random_base64url, random_bytes, sha256_bytes, sha256_hex, unix_now, utc_rfc3339_now,
 };
 use crate::upstream::{
-    UpstreamClient, UpstreamError, UpstreamEventDescriptor, UpstreamPolledEvent,
-    UpstreamStreamFrame,
+    UpstreamClient, UpstreamError, UpstreamEventDescriptor, UpstreamEventStream,
+    UpstreamPolledEvent, UpstreamStreamFrame,
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -238,7 +238,13 @@ enum EventKind {
         disallow_arguments: Vec<String>,
         supports_webhook: bool,
         supports_push: bool,
+        supports_poll: bool,
     },
+}
+
+struct StartedStream {
+    stream: UpstreamEventStream,
+    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Clone, Debug)]
@@ -757,7 +763,7 @@ impl HookdEngine {
             };
             engine.spawn_delivery_worker(Arc::clone(&sub));
             if !paused && !suspended && matches!(sub.source, SubSource::Upstream { .. }) {
-                engine.spawn_upstream_consumer(Arc::clone(&sub));
+                engine.spawn_upstream_consumer(Arc::clone(&sub), None);
             }
         }
 
@@ -1087,7 +1093,7 @@ impl HookdEngine {
                 if resumed {
                     sub.outbox_notify.notify_one();
                     if matches!(sub.source, SubSource::Upstream { .. }) {
-                        self.spawn_upstream_consumer(Arc::clone(&sub));
+                        self.spawn_upstream_consumer(Arc::clone(&sub), None);
                     }
                 }
                 return Ok(SubscribeResponse {
@@ -1135,8 +1141,31 @@ impl HookdEngine {
         .await?;
 
         // Bootstrap cursor and optional replay batch for upstream bridge events.
+        let mut started_stream = None;
+        let mut stream_cursor = None;
+        let push_only = matches!(
+            event_kind,
+            EventKind::Upstream {
+                supports_push: true,
+                supports_poll: false,
+                ..
+            }
+        );
         let (safe_cursor, response_cursor, truncated, replay_events, replay_cursor) = if is_ingest {
             (None, None, false, Vec::new(), None)
+        } else if push_only {
+            let (started, cursor, truncated) = self
+                .bootstrap_push_stream(&req, &normalized_args, &input_schema)
+                .await?;
+            let safe = if truncated || req.cursor.is_none() {
+                cursor.clone().or(req.cursor.clone())
+            } else {
+                req.cursor.clone()
+            };
+            let response = safe.clone();
+            stream_cursor = cursor.or(safe.clone());
+            started_stream = Some(started);
+            (safe, response, truncated, Vec::new(), None)
         } else {
             let upstream = self
                 .upstream
@@ -1202,6 +1231,12 @@ impl HookdEngine {
         };
 
         let sub = Arc::new(new_sub_runtime(persisted, source, false));
+        if push_only {
+            sub.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .ingest_cursor = stream_cursor;
+        }
         if !replay_events.is_empty()
             && !self.enqueue_polled_batch(&sub, replay_events, replay_cursor, None)
         {
@@ -1247,7 +1282,7 @@ impl HookdEngine {
 
         self.spawn_delivery_worker(Arc::clone(&sub));
         if !is_ingest {
-            self.spawn_upstream_consumer(Arc::clone(&sub));
+            self.spawn_upstream_consumer(Arc::clone(&sub), started_stream);
         }
 
         Ok(SubscribeResponse {
@@ -1704,11 +1739,13 @@ impl HookdEngine {
             .unwrap_or_default();
         let supports_webhook = transformed.delivery.iter().any(|m| m == "webhook");
         let supports_push = transformed.delivery.iter().any(|m| m == "push");
+        let supports_poll = ev.delivery.is_empty() || ev.delivery.iter().any(|m| m == "poll");
         Ok(EventKind::Upstream {
             input_schema: transformed.input_schema,
             disallow_arguments,
             supports_webhook,
             supports_push,
+            supports_poll,
         })
     }
 
@@ -1862,6 +1899,79 @@ impl HookdEngine {
         self.store.flush().await
     }
 
+    async fn bootstrap_push_stream(
+        &self,
+        request: &SubscribeRequest,
+        arguments: &Map<String, Value>,
+        input_schema: &Value,
+    ) -> Result<(StartedStream, Option<String>, bool), EngineError> {
+        let permit = Arc::clone(&self.upstream_stream_sem)
+            .try_acquire_owned()
+            .map_err(|_| EngineError::ResourceExhausted("upstream stream limit reached".into()))?;
+        let upstream = self
+            .upstream
+            .as_ref()
+            .ok_or_else(|| EngineError::Internal("upstream not configured".into()))?;
+        let timeout = Duration::from_secs(
+            self.config
+                .upstream
+                .as_ref()
+                .expect("upstream client has configuration")
+                .request_timeout_secs,
+        );
+        let mut shutdown = self.shutdown_tx.subscribe();
+        self.ensure_running()?;
+        let start = async {
+            let mut stream = upstream
+                .open_event_stream(
+                    &request.event_name,
+                    Some(arguments),
+                    input_schema,
+                    request.cursor.as_deref(),
+                    request.max_age_ms,
+                    None,
+                )
+                .await?;
+            match stream.next_frame().await? {
+                Some(UpstreamStreamFrame::Active {
+                    cursor, truncated, ..
+                }) => Ok((
+                    StartedStream {
+                        stream,
+                        _permit: permit,
+                    },
+                    cursor,
+                    truncated,
+                )),
+                Some(UpstreamStreamFrame::Error {
+                    code,
+                    message,
+                    data,
+                })
+                | Some(UpstreamStreamFrame::Terminated {
+                    code,
+                    message,
+                    data,
+                }) => Err(UpstreamError::JsonRpc {
+                    code: code.unwrap_or(-32603),
+                    message,
+                    data,
+                }),
+                _ => Err(UpstreamError::InvalidResponse(
+                    "upstream event stream did not start with an active notification".into(),
+                )),
+            }
+        };
+        tokio::select! {
+            result = tokio::time::timeout(timeout, start) => {
+                result
+                    .map_err(|_| EngineError::Internal("upstream stream bootstrap timed out".into()))?
+                    .map_err(map_upstream_subscribe_error)
+            }
+            _ = shutdown.changed() => Err(EngineError::ResourceExhausted("server is shutting down".into())),
+        }
+    }
+
     fn spawn_delivery_worker(self: &Arc<Self>, sub: Arc<SubRuntime>) {
         let engine = Arc::clone(self);
         self.spawn_task(async move {
@@ -1869,7 +1979,11 @@ impl HookdEngine {
         });
     }
 
-    fn spawn_upstream_consumer(self: &Arc<Self>, sub: Arc<SubRuntime>) {
+    fn spawn_upstream_consumer(
+        self: &Arc<Self>,
+        sub: Arc<SubRuntime>,
+        started_stream: Option<StartedStream>,
+    ) {
         let (tx, rx) = watch::channel(false);
         {
             let state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1886,7 +2000,7 @@ impl HookdEngine {
         }
         let eng = Arc::clone(self);
         self.spawn_task(async move {
-            eng.run_upstream_consumer(sub, rx).await;
+            eng.run_upstream_consumer(sub, rx, started_stream).await;
         });
     }
 
@@ -2220,6 +2334,7 @@ impl HookdEngine {
         self: Arc<Self>,
         sub: Arc<SubRuntime>,
         mut consumer_cancel: watch::Receiver<bool>,
+        mut started_stream: Option<StartedStream>,
     ) {
         let Some(ref upstream) = self.upstream else {
             return;
@@ -2265,6 +2380,7 @@ impl HookdEngine {
                 }
             };
             if need_wait {
+                drop(started_stream.take());
                 tokio::select! {
                     () = sub.space_notify.notified() => {}
                     () = tokio::time::sleep(Duration::from_millis(200)) => {}
@@ -2281,12 +2397,13 @@ impl HookdEngine {
                 _ = consumer_cancel.changed() => return,
                 _ = shutdown_rx.changed() => return,
             };
-            let (supports_push, input_schema) = match resolved_event {
+            let (supports_push, supports_poll, input_schema) = match resolved_event {
                 Ok(EventKind::Upstream {
                     supports_push,
+                    supports_poll,
                     input_schema,
                     ..
-                }) => (supports_push, input_schema),
+                }) => (supports_push, supports_poll, input_schema),
                 _ => {
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_millis(300)) => {}
@@ -2298,138 +2415,157 @@ impl HookdEngine {
                 }
             };
 
-            let mut use_poll = true;
-            if supports_push
-                && let Ok(_stream_permit) = self.upstream_stream_sem.clone().try_acquire_owned()
-            {
-                let cursor = {
-                    let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                    st.ingest_cursor.clone()
-                };
-                let opening_stream = upstream.open_event_stream(
-                    event_name,
-                    Some(arguments),
-                    &input_schema,
-                    cursor.as_deref(),
-                    None,
-                    None,
-                );
-                let opened_stream = tokio::select! {
-                    result = opening_stream => result,
+            if !supports_push && !supports_poll {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(300)) => {}
                     _ = cancel_rx.changed() => return,
                     _ = consumer_cancel.changed() => return,
                     _ = shutdown_rx.changed() => return,
-                };
-                match opened_stream {
-                    Ok(mut stream) => {
-                        use_poll = false;
-                        loop {
-                            let next = tokio::select! {
-                                frame = stream.next_frame() => frame,
+                }
+                continue;
+            }
+            let mut use_poll = supports_poll;
+            let mut ready_stream = started_stream.take();
+            if ready_stream.is_none() && supports_push {
+                if let Ok(permit) = Arc::clone(&self.upstream_stream_sem).try_acquire_owned() {
+                    let cursor = {
+                        let state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.ingest_cursor.clone()
+                    };
+                    let opening_stream = upstream.open_event_stream(
+                        event_name,
+                        Some(arguments),
+                        &input_schema,
+                        cursor.as_deref(),
+                        None,
+                        None,
+                    );
+                    let opened_stream = tokio::select! {
+                        result = opening_stream => result,
+                        _ = cancel_rx.changed() => return,
+                        _ = consumer_cancel.changed() => return,
+                        _ = shutdown_rx.changed() => return,
+                    };
+                    match opened_stream {
+                        Ok(stream) => {
+                            ready_stream = Some(StartedStream {
+                                stream,
+                                _permit: permit,
+                            })
+                        }
+                        Err(UpstreamError::JsonRpc {
+                            code: -32025 | -32026,
+                            ..
+                        }) if supports_poll => {}
+                        Err(_) => {
+                            use_poll = false;
+                            tokio::select! {
+                                () = tokio::time::sleep(Duration::from_millis(300)) => {}
                                 _ = cancel_rx.changed() => return,
                                 _ = consumer_cancel.changed() => return,
                                 _ = shutdown_rx.changed() => return,
-                            };
-                            match next {
-                                Ok(Some(UpstreamStreamFrame::Active {
-                                    cursor, truncated, ..
-                                })) => {
-                                    if truncated {
-                                        if let Some(c) = cursor
-                                            && !self.enqueue_gap(&sub, c, Some(&consumer_cancel))
-                                        {
-                                            backpressure_paused = true;
-                                            break;
-                                        }
-                                    } else if let Some(c) = cursor
-                                        && !self.advance_idle_cursor(
-                                            &sub,
-                                            c,
-                                            Some(&consumer_cancel),
-                                        )
-                                    {
-                                        backpressure_paused = true;
-                                        break;
-                                    }
-                                }
-                                Ok(Some(UpstreamStreamFrame::Heartbeat { cursor })) => {
-                                    if let Some(c) = cursor
-                                        && !self.advance_idle_cursor(
-                                            &sub,
-                                            c,
-                                            Some(&consumer_cancel),
-                                        )
-                                    {
-                                        backpressure_paused = true;
-                                        break;
-                                    }
-                                }
-                                Ok(Some(UpstreamStreamFrame::Event {
-                                    event_id,
-                                    name,
-                                    timestamp,
-                                    data,
-                                    cursor,
-                                })) => {
-                                    let ev = UpstreamPolledEvent {
-                                        event_id,
-                                        name,
-                                        timestamp,
-                                        data,
-                                    };
-                                    if !self.enqueue_single_upstream_event(
-                                        &sub,
-                                        ev,
-                                        cursor,
-                                        Some(&consumer_cancel),
-                                    ) {
-                                        backpressure_paused = true;
-                                        break;
-                                    }
-                                }
-                                Ok(Some(UpstreamStreamFrame::Error { .. }))
-                                | Ok(Some(UpstreamStreamFrame::Terminated { .. }))
-                                | Ok(None)
-                                | Err(_) => {
+                            }
+                        }
+                    }
+                } else if !supports_poll {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+                        _ = cancel_rx.changed() => return,
+                        _ = consumer_cancel.changed() => return,
+                        _ = shutdown_rx.changed() => return,
+                    }
+                }
+            }
+
+            if let Some(StartedStream {
+                mut stream,
+                _permit: permit,
+            }) = ready_stream
+            {
+                use_poll = false;
+                loop {
+                    let next = tokio::select! {
+                        frame = stream.next_frame() => frame,
+                        _ = cancel_rx.changed() => return,
+                        _ = consumer_cancel.changed() => return,
+                        _ = shutdown_rx.changed() => return,
+                    };
+                    match next {
+                        Ok(Some(UpstreamStreamFrame::Active {
+                            cursor, truncated, ..
+                        })) => {
+                            if truncated {
+                                if let Some(c) = cursor
+                                    && !self.enqueue_gap(&sub, c, Some(&consumer_cancel))
+                                {
+                                    backpressure_paused = true;
                                     break;
                                 }
-                            }
-                            if sub
-                                .state
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .outbox
-                                .len()
-                                >= self.quotas.max_outbox_per_sub
+                            } else if let Some(c) = cursor
+                                && !self.advance_idle_cursor(&sub, c, Some(&consumer_cancel))
                             {
                                 backpressure_paused = true;
                                 break;
                             }
                         }
-                        if !backpressure_paused {
-                            tokio::select! {
-                                () = tokio::time::sleep(Duration::from_millis(200)) => {}
-                                _ = cancel_rx.changed() => return,
-                                _ = consumer_cancel.changed() => return,
-                                _ = shutdown_rx.changed() => return,
+                        Ok(Some(UpstreamStreamFrame::Heartbeat { cursor })) => {
+                            if let Some(c) = cursor
+                                && !self.advance_idle_cursor(&sub, c, Some(&consumer_cancel))
+                            {
+                                backpressure_paused = true;
+                                break;
                             }
                         }
-                    }
-                    Err(UpstreamError::JsonRpc {
-                        code: -32025 | -32026,
-                        ..
-                    }) => {
-                        // Fall back to independent events/poll loop.
-                        use_poll = true;
-                    }
-                    Err(_) => {
-                        use_poll = false;
-                        tokio::select! {
-                            () = tokio::time::sleep(Duration::from_millis(300)) => {}
-                            _ = cancel_rx.changed() => return,
-                            _ = consumer_cancel.changed() => return,
-                            _ = shutdown_rx.changed() => return,
+                        Ok(Some(UpstreamStreamFrame::Event {
+                            event_id,
+                            name,
+                            timestamp,
+                            data,
+                            cursor,
+                        })) => {
+                            let ev = UpstreamPolledEvent {
+                                event_id,
+                                name,
+                                timestamp,
+                                data,
+                            };
+                            if !self.enqueue_single_upstream_event(
+                                &sub,
+                                ev,
+                                cursor,
+                                Some(&consumer_cancel),
+                            ) {
+                                backpressure_paused = true;
+                                break;
+                            }
                         }
+                        Ok(Some(UpstreamStreamFrame::Error { .. }))
+                        | Ok(Some(UpstreamStreamFrame::Terminated { .. }))
+                        | Ok(None)
+                        | Err(_) => {
+                            break;
+                        }
+                    }
+                    if sub
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .outbox
+                        .len()
+                        >= self.quotas.max_outbox_per_sub
+                    {
+                        backpressure_paused = true;
+                        break;
+                    }
+                }
+                drop(stream);
+                drop(permit);
+                if !backpressure_paused {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+                        _ = cancel_rx.changed() => return,
+                        _ = consumer_cancel.changed() => return,
+                        _ = shutdown_rx.changed() => return,
                     }
                 }
             }
@@ -2811,7 +2947,7 @@ impl HookdEngine {
                                     if !suspended
                                         && matches!(sub.source, SubSource::Upstream { .. })
                                     {
-                                        self.spawn_upstream_consumer(Arc::clone(&sub));
+                                        self.spawn_upstream_consumer(Arc::clone(&sub), None);
                                     }
                                 }
                             } else {
@@ -3303,10 +3439,12 @@ mod tests {
         OutboundClient::from_connector(connector, true, Duration::from_secs(60))
     }
 
-    async fn spawn_http_mock<F, Fut>(handler: F) -> (Url, JoinHandle<()>)
+    async fn spawn_http_mock<F, Fut, B>(handler: F) -> (Url, JoinHandle<()>)
     where
         F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Response<Full<Bytes>>> + Send + 'static,
+        Fut: std::future::Future<Output = Response<B>> + Send + 'static,
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4891,6 +5029,273 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_only_bootstrap_keeps_its_stream_and_resumes_from_active_cursor() {
+        struct TestBody {
+            bytes: Option<Bytes>,
+            keep_open: bool,
+        }
+        impl http_body::Body for TestBody {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+                if let Some(bytes) = self.bytes.take() {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
+                } else if self.keep_open {
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(None)
+                }
+            }
+        }
+
+        let mode = Arc::new(AtomicUsize::new(0));
+        let streams = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cursors = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let current_mode = Arc::clone(&mode);
+        let stream_count = Arc::clone(&streams);
+        let poll_count = Arc::clone(&polls);
+        let requested_cursors = Arc::clone(&cursors);
+        let (url, upstream_task) = spawn_http_mock(move |request| {
+            let mode = Arc::clone(&current_mode);
+            let streams = Arc::clone(&stream_count);
+            let polls = Arc::clone(&poll_count);
+            let cursors = Arc::clone(&requested_cursors);
+            async move {
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                let (body, keep_open, content_type) = match request["method"].as_str().unwrap() {
+                    "events/list" => (
+                        json!({
+                            "jsonrpc": "2.0", "id": request["id"],
+                            "result": {"events": [{
+                                "name": "task.exited", "delivery": ["push"],
+                                "inputSchema": {"type": "object"},
+                                "payloadSchema": {"type": "object"}
+                            }]}
+                        })
+                        .to_string(),
+                        false,
+                        "application/json",
+                    ),
+                    "events/stream" => {
+                        let sequence = streams.fetch_add(1, Ordering::SeqCst);
+                        cursors
+                            .lock()
+                            .unwrap()
+                            .push(request["params"]["cursor"].clone());
+                        let mode = mode.load(Ordering::SeqCst);
+                        if mode == 2 {
+                            (": waiting\n\n".into(), true, "text/event-stream")
+                        } else {
+                            let active = json!({
+                                "jsonrpc": "2.0", "method": "notifications/events/active",
+                                "params": {"cursor": "c0", "truncated": false}
+                            });
+                            let event = json!({
+                                "jsonrpc": "2.0", "method": "notifications/events/event",
+                                "params": {
+                                    "eventId": "after_active", "name": "task.exited",
+                                    "timestamp": "2026-11-25T00:00:01Z",
+                                    "data": {}, "cursor": "c1"
+                                }
+                            });
+                            let disconnect = mode == 1 && sequence == 0;
+                            let body = if disconnect {
+                                format!("data: {active}\n\n")
+                            } else {
+                                format!("data: {active}\n\ndata: {event}\n\n")
+                            };
+                            (body, !disconnect, "text/event-stream")
+                        }
+                    }
+                    "events/poll" => {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "error": {"code": -32026, "message": "push delivery only"}
+                            })
+                            .to_string(),
+                            false,
+                            "application/json",
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                Response::builder()
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .body(TestBody {
+                        bytes: Some(Bytes::from(body)),
+                        keep_open,
+                    })
+                    .unwrap()
+            }
+        })
+        .await;
+        let deliveries = Arc::new(Semaphore::new(0));
+        let release_delivery = Arc::clone(&deliveries);
+        let callback = spawn_tls_callback(move |_headers, bytes| {
+            let delivery = Arc::clone(&release_delivery);
+            async move {
+                let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                if payload["type"] == "verification" {
+                    (
+                        StatusCode::OK,
+                        json!({"challenge": payload["challenge"]})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                } else {
+                    delivery.acquire().await.unwrap().forget();
+                    (StatusCode::OK, b"{}".to_vec())
+                }
+            }
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let request = SubscribeRequest {
+            event_name: "task.exited".into(),
+            arguments: Map::new(),
+            delivery_mode: "webhook".into(),
+            delivery_url: callback.url.clone(),
+            delivery_secret: test_secret(18),
+            ttl_ms: None,
+            cursor: None,
+            max_age_ms: None,
+        };
+        for scenario in 0..4 {
+            mode.store(
+                usize::from(scenario == 2) + usize::from(scenario == 3) * 2,
+                Ordering::SeqCst,
+            );
+            streams.store(0, Ordering::SeqCst);
+            cursors.lock().unwrap().clear();
+            let mut quotas = test_quotas();
+            if scenario == 1 {
+                quotas.max_upstream_streams = 0;
+            }
+            let engine = HookdEngine::new(
+                base_config(
+                    directory.path().join(format!("scenario-{scenario}.json")),
+                    Profile::Sep3415,
+                    Some(UpstreamConfig {
+                        url: url.clone(),
+                        bearer_token: None,
+                        passthrough_prefixes: Vec::new(),
+                        request_timeout_secs: 1,
+                        expose_events: vec![ExposeEventConfig {
+                            name: "task.exited".into(),
+                            disallow_arguments: Vec::new(),
+                        }],
+                    }),
+                    None,
+                    None,
+                ),
+                quotas.clone(),
+                MemoryPools::from_quotas(&quotas),
+                Some(loopback_outbound(callback.roots.clone())),
+            )
+            .await
+            .unwrap();
+            let mut request = request.clone();
+            if scenario == 2 {
+                request.cursor = Some("client_start".into());
+            } else if scenario == 0 {
+                request.max_age_ms = Some(5000);
+            }
+            let result = engine.subscribe(&CallerAuth::StaticSlot(0), request).await;
+            match scenario {
+                0 | 2 => {
+                    let subscribed = result.unwrap();
+                    assert_eq!(
+                        subscribed.cursor.as_deref(),
+                        Some(if scenario == 0 { "c0" } else { "client_start" })
+                    );
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let captured = callback.captured.lock().await;
+                            let count = captured
+                                .iter()
+                                .filter(|request| {
+                                    serde_json::from_slice::<Value>(&request.body).unwrap()["type"]
+                                        == "event"
+                                })
+                                .count();
+                            if count >= if scenario == 0 { 1 } else { 2 } {
+                                break;
+                            }
+                            drop(captured);
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        streams.load(Ordering::SeqCst),
+                        if scenario == 0 { 1 } else { 2 }
+                    );
+                    if scenario == 2 {
+                        assert_eq!(
+                            *cursors.lock().unwrap(),
+                            vec![json!("client_start"), json!("c0")]
+                        );
+                    }
+                    let sub = engine
+                        .runtime
+                        .lock()
+                        .unwrap()
+                        .subscriptions
+                        .values()
+                        .next()
+                        .unwrap()
+                        .clone();
+                    assert_eq!(
+                        sub.state.lock().unwrap().safe_cursor.as_deref(),
+                        Some(if scenario == 0 { "c0" } else { "client_start" })
+                    );
+                    deliveries.add_permits(1);
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while sub.state.lock().unwrap().safe_cursor.as_deref() != Some("c1") {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                1 => {
+                    assert!(matches!(result, Err(EngineError::ResourceExhausted(_))));
+                    assert_eq!(streams.load(Ordering::SeqCst), 0);
+                    assert_eq!(engine.active_subscription_count(), 0);
+                }
+                3 => {
+                    assert!(matches!(result, Err(EngineError::Internal(_))));
+                    assert_eq!(engine.active_subscription_count(), 0);
+                    assert_eq!(
+                        engine.upstream_stream_sem.available_permits(),
+                        quotas.max_upstream_streams
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            engine
+                .shutdown_until(tokio::time::Instant::now())
+                .await
+                .unwrap();
+            assert_eq!(
+                engine.upstream_stream_sem.available_permits(),
+                quotas.max_upstream_streams
+            );
+        }
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn subscribe_bootstrap_keeps_truncation_and_memory_admission_atomic() {
         let (up_url, up_handle) = spawn_http_mock(move |req| async move {
             let body = req.into_body().collect().await.unwrap().to_bytes();
@@ -5462,8 +5867,11 @@ mod tests {
         let other_subscription_bytes = engine.pools.outbox.try_acquire(900).unwrap();
         let sub = sample_upstream_sub("https://hooks.example.com/byte-pressure");
         let (cancel, receiver) = watch::channel(false);
-        let worker =
-            tokio::spawn(Arc::clone(&engine).run_upstream_consumer(Arc::clone(&sub), receiver));
+        let worker = tokio::spawn(Arc::clone(&engine).run_upstream_consumer(
+            Arc::clone(&sub),
+            receiver,
+            None,
+        ));
         tokio::time::timeout(Duration::from_secs(2), async {
             while poll_count.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
