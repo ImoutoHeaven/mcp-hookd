@@ -1873,10 +1873,26 @@ impl HookdEngine {
             entry.count += 1;
         }
 
-        self.outbound
-            .verify_callback(url, sub_id, secret)
-            .await
-            .map_err(EngineError::CallbackEndpoint)?;
+        let mut shutdown = self.shutdown_tx.subscribe();
+        self.ensure_running()?;
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                return Err(EngineError::ResourceExhausted("server is shutting down".into()));
+            }
+            permit = self.global_delivery_sem.acquire() => permit
+                .map_err(|_| EngineError::ResourceExhausted("outbound delivery is unavailable".into()))?,
+        };
+        self.ensure_running()?;
+        let verified = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                return Err(EngineError::ResourceExhausted("server is shutting down".into()));
+            }
+            result = self.outbound.verify_callback(url, sub_id, secret) => result,
+        };
+        drop(permit);
+        verified.map_err(EngineError::CallbackEndpoint)?;
 
         {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
@@ -3016,25 +3032,42 @@ impl HookdEngine {
         self.mark_state_dirty();
 
         if send_terminated && self.config.profile == Profile::Sep3415 {
-            let outbound = self.outbound.clone();
+            let engine = Arc::clone(self);
             let url = sub.key.url.clone();
             let sub_id = sub.id.clone();
             self.spawn_task(async move {
+                let mut shutdown = engine.shutdown_tx.subscribe();
+                if *shutdown.borrow() {
+                    return;
+                }
+                let _permit = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => return,
+                    permit = engine.global_delivery_sem.acquire() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    },
+                };
+                if *shutdown.borrow() {
+                    return;
+                }
                 let wid = format!(
                     "msg_{}",
                     random_base64url(18).unwrap_or_else(|_| "terminated".into())
                 );
                 let body = r#"{"type":"terminated","reason":"authorization_revoked"}"#;
-                let _ = outbound
-                    .post_webhook(
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {}
+                    _ = engine.outbound.post_webhook(
                         &url,
                         &sub_id,
                         &wid,
                         body.as_bytes(),
                         &secret,
                         prev_secret.as_ref(),
-                    )
-                    .await;
+                    ) => {}
+                }
             });
         }
     }
@@ -4006,6 +4039,135 @@ mod tests {
             ));
             engine.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn verification_and_termination_share_delivery_capacity_and_cancel_their_waits() {
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let callback_release = Arc::clone(&release);
+        let callback_active = Arc::clone(&active);
+        let callback_peak = Arc::clone(&peak);
+        let callback = spawn_tls_callback(move |_headers, body| {
+            let release = Arc::clone(&callback_release);
+            let active = Arc::clone(&callback_active);
+            let peak = Arc::clone(&callback_peak);
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                release.acquire().await.unwrap().forget();
+                active.fetch_sub(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                (
+                    StatusCode::OK,
+                    json!({"challenge": body["challenge"]})
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
+        })
+        .await;
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut quotas = test_quotas();
+        quotas.max_global_deliveries = 1;
+        let engine = HookdEngine::new(
+            base_config(
+                directory.path().join("subs.json"),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("producer")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(callback.roots.clone())),
+        )
+        .await
+        .unwrap();
+        let capacity = Arc::clone(&engine.global_delivery_sem)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let request = SubscribeRequest {
+            event_name: "ci.build_failed".into(),
+            arguments: Map::new(),
+            delivery_mode: "webhook".into(),
+            delivery_url: callback.url.clone(),
+            delivery_secret: test_secret(19),
+            ttl_ms: None,
+            cursor: None,
+            max_age_ms: None,
+        };
+        let subscribing_engine = Arc::clone(&engine);
+        let first_request = request.clone();
+        let subscribing = tokio::spawn(async move {
+            subscribing_engine
+                .subscribe(&CallerAuth::StaticSlot(0), first_request)
+                .await
+        });
+        let revoked = sample_upstream_sub(&callback.url);
+        engine
+            .runtime
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(revoked.key.clone(), Arc::clone(&revoked));
+        engine.revoke_subscription(&revoked.key, true).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(callback.captured.lock().await.is_empty());
+        drop(capacity);
+        assert_eq!(wait_for_captured(&callback.captured, 1).await.len(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(callback.captured.lock().await.len(), 1);
+        release.add_permits(1);
+        assert_eq!(wait_for_captured(&callback.captured, 2).await.len(), 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        release.add_permits(1);
+        subscribing.await.unwrap().unwrap();
+
+        let capacity = Arc::clone(&engine.global_delivery_sem)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let subscribing_engine = Arc::clone(&engine);
+        let refreshing = tokio::spawn(async move {
+            subscribing_engine
+                .subscribe(
+                    &CallerAuth::StaticSlot(0),
+                    SubscribeRequest {
+                        delivery_secret: test_secret(20),
+                        ..request
+                    },
+                )
+                .await
+        });
+        let current = engine
+            .runtime
+            .lock()
+            .unwrap()
+            .subscriptions
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        engine.revoke_subscription(&current.key, true).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        engine
+            .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            refreshing.await.unwrap(),
+            Err(EngineError::ResourceExhausted(_))
+        ));
+        assert_eq!(engine.tasks.len(), 0);
+        drop(capacity);
+        assert_eq!(callback.captured.lock().await.len(), 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
