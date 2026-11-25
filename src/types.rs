@@ -310,6 +310,17 @@ impl ByteLease {
         self.bytes
     }
 
+    pub fn split(&mut self, bytes: usize) -> Option<Self> {
+        if bytes > self.bytes {
+            return None;
+        }
+        self.bytes -= bytes;
+        Some(Self {
+            budget: Arc::clone(&self.budget),
+            bytes,
+        })
+    }
+
     pub fn grow(&mut self, additional: usize) -> bool {
         if additional == 0 {
             return true;
@@ -687,6 +698,30 @@ mod tests {
         assert!(lease.grow(40));
         assert!(!lease.grow(1));
         drop(lease);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn byte_lease_split_transfers_ownership_without_double_charging() {
+        let budget = ByteBudget::new(10);
+        let mut parent = budget.try_acquire(10).unwrap();
+        let mut child = parent.split(4).unwrap();
+        assert_eq!(parent.bytes(), 6);
+        assert_eq!(child.bytes(), 4);
+        assert_eq!(budget.used(), 10);
+        assert!(parent.split(7).is_none());
+        assert_eq!(parent.bytes(), 6);
+        drop(parent.split(0).unwrap());
+        assert_eq!(budget.used(), 10);
+
+        drop(parent);
+        assert_eq!(budget.used(), 4);
+        assert!(child.grow(6));
+        assert_eq!(budget.used(), 10);
+        let transferred = child.split(10).unwrap();
+        drop(child);
+        assert_eq!(budget.used(), 10);
+        drop(transferred);
         assert_eq!(budget.used(), 0);
     }
 
