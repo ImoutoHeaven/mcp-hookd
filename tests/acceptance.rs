@@ -2024,3 +2024,122 @@ async fn unsubscribe_retry_persists_removal_after_transient_io_failure() {
         server.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn polling_respects_bootstrap_and_rejected_batch_delays() {
+    const POLL_DELAY_MS: u64 = 300;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded_calls = Arc::clone(&calls);
+    let (upstream_addr, _upstream_task) = spawn_http_mock(move |request| {
+        let calls = Arc::clone(&recorded_calls);
+        async move {
+            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "events/list" => json!({
+                    "events": [{
+                        "name": "task.exited", "delivery": ["poll"],
+                        "inputSchema": { "type": "object" },
+                        "payloadSchema": { "type": "object" }
+                    }]
+                }),
+                "events/poll" => {
+                    let first = {
+                        let mut calls = calls.lock().unwrap();
+                        calls.push((
+                            std::time::Instant::now(),
+                            request["params"]["cursor"].clone(),
+                        ));
+                        calls.len() == 1
+                    };
+                    let events = if first {
+                        Vec::new()
+                    } else {
+                        vec![json!({
+                            "eventId": "normal_event", "name": "task.exited",
+                            "timestamp": "2026-11-25T00:00:00Z", "data": { "exitCode": 0 }
+                        })]
+                    };
+                    json!({
+                        "events": events,
+                        "cursor": if first { "c0" } else { "c1" },
+                        "truncated": false, "hasMore": false, "nextPollMs": POLL_DELAY_MS
+                    })
+                }
+                method => panic!("unexpected upstream method {method}"),
+            };
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(
+                    json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }).to_string(),
+                )))
+                .unwrap()
+        }
+    })
+    .await;
+    let callback = MockTlsCallbackServer::start(standard_challenge_responder).await;
+    let directory = TempDir::new().unwrap();
+    let config = base_config(
+        directory.path().join("subscriptions.json"),
+        Profile::Sep3415,
+        Some(UpstreamConfig {
+            url: Url::parse(&format!("http://{upstream_addr}/mcp")).unwrap(),
+            bearer_token: None,
+            passthrough_prefixes: Vec::new(),
+            request_timeout_secs: 5,
+            expose_events: vec![ExposeEventConfig {
+                name: "task.exited".into(),
+                disallow_arguments: Vec::new(),
+            }],
+        }),
+        None,
+        None,
+    );
+    let server = start_server(
+        config,
+        QuotaConfig {
+            allow_loopback_callbacks: true,
+            outbox_byte_budget: 1,
+            ..Default::default()
+        },
+        Some(callback.outbound_client()),
+    )
+    .await
+    .unwrap();
+    let client = http_client();
+    let base_url = format!("http://{}", server.local_addr());
+    let (status, _, subscribed) = mcp_post_modern(
+        &client,
+        &base_url,
+        "inbound-tok-1",
+        "events/subscribe",
+        1,
+        json!({
+            "name": "task.exited",
+            "delivery": { "mode": "webhook", "url": callback.url("/poll-delay"), "secret": test_whsec(24) }
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(subscribed["result"]["id"].is_string(), "{subscribed}");
+    wait_until(Duration::from_secs(5), || {
+        let calls = Arc::clone(&calls);
+        async move { calls.lock().unwrap().len() >= 3 }
+    })
+    .await;
+    let observed = calls.lock().unwrap()[..3].to_vec();
+    assert_eq!(observed[0].1, Value::Null);
+    assert_eq!(observed[1].1, "c0");
+    assert_eq!(observed[2].1, "c0");
+    for (index, pair) in observed.windows(2).enumerate() {
+        let elapsed = pair[1].0.duration_since(pair[0].0);
+        assert!(
+            elapsed >= Duration::from_millis(POLL_DELAY_MS),
+            "poll interval {index} was {elapsed:?}, shorter than {POLL_DELAY_MS}ms"
+        );
+    }
+    assert_eq!(server.engine().pools().outbox.used(), 0);
+    assert_eq!(callback.requests.lock().await.len(), 1);
+    server.shutdown().await.unwrap();
+}
