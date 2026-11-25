@@ -1866,3 +1866,61 @@ async fn passthrough_response_obeys_proxy_byte_budget() {
     assert_eq!(server.engine().pools().proxy.used(), 0);
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn shutdown_closes_inflight_http_before_returning() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_upstream = Arc::clone(&started);
+    let (up_addr, _up_task) = spawn_http_mock(move |_req| {
+        let started = Arc::clone(&started_upstream);
+        async move {
+            started.notify_one();
+            std::future::pending::<Response<Full<Bytes>>>().await
+        }
+    })
+    .await;
+    let dir = TempDir::new().unwrap();
+    let cfg = base_config(
+        dir.path().join("subscriptions.json"),
+        Profile::Sep3415,
+        Some(UpstreamConfig {
+            url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+            bearer_token: None,
+            passthrough_prefixes: vec!["/t/".into()],
+            request_timeout_secs: 30,
+            expose_events: vec![],
+        }),
+        None,
+        None,
+    );
+    let server = start_server(
+        cfg,
+        QuotaConfig {
+            drain_timeout_secs: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let request = Request::builder()
+        .uri(format!("http://{}/t/slow", server.local_addr()))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let call = tokio::spawn(async move { http_client().request(request).await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+}

@@ -121,6 +121,7 @@ pub struct RunningServer {
     bound_addr: SocketAddr,
     engine: Arc<HookdEngine>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
     accept_task: JoinHandle<()>,
     conn_tracker: TaskTracker,
 }
@@ -134,18 +135,22 @@ impl RunningServer {
         &self.engine
     }
 
-    /// Stop accepting new connections, and drain active HTTP connections and the engine
-    /// concurrently within a single shared `drain_timeout_secs` window.
+    /// Stop new work, drain HTTP until the shared deadline, then persist the engine.
     pub async fn shutdown(self) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.engine.quotas().drain_timeout_secs);
+        self.engine.begin_shutdown();
         self.cancel.cancel();
         let _ = self.accept_task.await;
         self.conn_tracker.close();
-        let drain = Duration::from_secs(self.engine.quotas().drain_timeout_secs);
-        let (_, engine_res) = tokio::join!(
-            tokio::time::timeout(drain, self.conn_tracker.wait()),
-            self.engine.shutdown(),
-        );
-        engine_res
+        if tokio::time::timeout_at(deadline, self.conn_tracker.wait())
+            .await
+            .is_err()
+        {
+            self.force_cancel.cancel();
+            self.conn_tracker.wait().await;
+        }
+        self.engine.shutdown_until(deadline).await
     }
 }
 
@@ -172,8 +177,10 @@ pub async fn start_server(
     });
 
     let cancel = CancellationToken::new();
+    let force_cancel = CancellationToken::new();
     let conn_tracker = TaskTracker::new();
     let accept_cancel = cancel.clone();
+    let accept_force_cancel = force_cancel.clone();
     let accept_tracker = conn_tracker.clone();
 
     let accept_task = tokio::spawn(async move {
@@ -191,6 +198,7 @@ pub async fn start_server(
             };
             let state = Arc::clone(&state);
             let conn_cancel = accept_cancel.clone();
+            let conn_force_cancel = accept_force_cancel.clone();
             accept_tracker.spawn(async move {
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req| {
@@ -200,10 +208,16 @@ pub async fn start_server(
                 let conn = http1::Builder::new().serve_connection(io, svc);
                 tokio::pin!(conn);
                 tokio::select! {
+                    biased;
+                    _ = conn_force_cancel.cancelled() => {}
                     _ = conn.as_mut() => {}
                     _ = conn_cancel.cancelled() => {
                         conn.as_mut().graceful_shutdown();
-                        let _ = conn.await;
+                        tokio::select! {
+                            biased;
+                            _ = conn_force_cancel.cancelled() => {}
+                            _ = conn => {}
+                        }
                     }
                 }
             });
@@ -214,6 +228,7 @@ pub async fn start_server(
         bound_addr,
         engine,
         cancel,
+        force_cancel,
         accept_task,
         conn_tracker,
     })
