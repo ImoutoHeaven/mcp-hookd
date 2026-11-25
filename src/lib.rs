@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod emit;
+pub mod engine;
 pub mod headers;
 pub mod outbound;
 pub mod schema;
