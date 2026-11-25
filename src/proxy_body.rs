@@ -176,6 +176,54 @@ where
     }
 }
 
+pub(crate) struct PrefixedBody<B> {
+    prefix: Option<Bytes>,
+    rest: B,
+}
+
+impl<B> PrefixedBody<B> {
+    pub(crate) fn new(prefix: Bytes, rest: B) -> Self {
+        Self {
+            prefix: (!prefix.is_empty()).then_some(prefix),
+            rest,
+        }
+    }
+}
+
+impl<B> Body for PrefixedBody<B>
+where
+    B: Body<Data = Bytes, Error = io::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            return Poll::Ready(Some(Ok(Frame::data(prefix))));
+        }
+        Pin::new(&mut this.rest).poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let rest_hint = self.rest.size_hint();
+        let prefix_len = self.prefix.as_ref().map_or(0, |b| b.len() as u64);
+        let mut out = SizeHint::new();
+        out.set_lower(rest_hint.lower().saturating_add(prefix_len));
+        if let Some(upper) = rest_hint.upper().and_then(|u| u.checked_add(prefix_len)) {
+            out.set_upper(upper);
+        }
+        out
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_none() && self.rest.is_end_stream()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,18 +9,22 @@ use http::{HeaderValue, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::{Connected, Connection, capture_connection};
+use hyper_util::client::legacy::connect::{
+    CaptureConnection, Connected, Connection, capture_connection,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -33,8 +37,19 @@ pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
+const VERIFY_IP_RATE_WINDOW: Duration = Duration::from_secs(60);
+const VERIFY_IP_RATE_LIMIT: usize = 20;
+const MAX_VERIFY_IP_ENTRIES: usize = 4096;
+
 pub type DnsFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
 pub type DnsResolver = Arc<dyn Fn(&str, u16) -> DnsFuture + Send + Sync>;
+
+/// Result of a synchronous callback verification challenge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifyError {
+    Callback(CallbackErrorReason),
+    RateLimited(String),
+}
 
 /// Result of a single webhook delivery attempt (spec §6.4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,15 +113,68 @@ fn is_public_unicast_v6(v6: Ipv6Addr) -> bool {
     match s[0] {
         0x2001 => {
             let blocked = s[1] == 0x0000 // 2001::/32 Teredo
-                || s[1] == 0x0db8 // 2001:db8::/32 documentation
                 || (s[1] == 0x0002 && s[2] == 0x0000) // 2001:2::/48 benchmarking
+                || s[1] == 0x0003 // 2001:3::/32 AMT
+                || (s[1] == 0x0004 && s[2] == 0x0112) // 2001:4:112::/48 AS112-v6
                 || (s[1] & 0xfff0) == 0x0010 // 2001:10::/28 ORCHID
-                || (s[1] & 0xfff0) == 0x0020; // 2001:20::/28 ORCHIDv2
+                || (s[1] & 0xfff0) == 0x0020 // 2001:20::/28 ORCHIDv2
+                || (s[1] & 0xfff0) == 0x0030 // 2001:30::/28 DRIP
+                || s[1] == 0x0db8; // 2001:db8::/32 documentation
             !blocked
         }
-        0x2002 => false,                     // 2002::/16 6to4
-        0x3fff => (s[1] & 0xf000) != 0x0000, // 3fff::/20 documentation
+        0x2002 => false,                               // 2002::/16 6to4
+        0x2620 => !(s[1] == 0x004f && s[2] == 0x8000), // 2620:4f:8000::/48 Direct Delegation AS112
+        0x3fff => (s[1] & 0xf000) != 0x0000,           // 3fff::/20 documentation
         _ => true,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum IpVerifyPrefix {
+    V4([u8; 4]),
+    V6([u16; 4]),
+}
+
+fn ip_verify_prefix(ip: IpAddr) -> IpVerifyPrefix {
+    match ip {
+        IpAddr::V4(v4) => IpVerifyPrefix::V4(v4.octets()),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpVerifyPrefix::V4(v4.octets()),
+            None => {
+                let s = v6.segments();
+                IpVerifyPrefix::V6([s[0], s[1], s[2], s[3]])
+            }
+        },
+    }
+}
+
+struct IpRateBucket {
+    window_start: Instant,
+    count: usize,
+}
+
+#[derive(Default)]
+struct IpVerifyLimiter {
+    buckets: HashMap<IpVerifyPrefix, IpRateBucket>,
+}
+
+impl IpVerifyLimiter {
+    fn check_and_record(&mut self, prefix: IpVerifyPrefix) -> Result<(), &'static str> {
+        let now = Instant::now();
+        self.buckets
+            .retain(|_, b| now.saturating_duration_since(b.window_start) < VERIFY_IP_RATE_WINDOW);
+        if !self.buckets.contains_key(&prefix) && self.buckets.len() >= MAX_VERIFY_IP_ENTRIES {
+            return Err("callback target IP verification rate table is full");
+        }
+        let entry = self.buckets.entry(prefix).or_insert(IpRateBucket {
+            window_start: now,
+            count: 0,
+        });
+        if entry.count >= VERIFY_IP_RATE_LIMIT {
+            return Err("callback target IP verification rate limit exceeded");
+        }
+        entry.count += 1;
+        Ok(())
     }
 }
 
@@ -140,9 +208,14 @@ pub fn validate_callback_url(raw: &str, allow_loopback: bool) -> Result<Url, Str
     Ok(url)
 }
 
+tokio::task_local! {
+    static VERIFY_DIALED: Arc<AtomicBool>;
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConnMeta {
     created_at: Instant,
+    peer_ip: IpAddr,
 }
 
 #[derive(Debug)]
@@ -151,6 +224,7 @@ pub enum OutboundConnectError {
     Dns(io::Error),
     DnsEmpty,
     DisallowedIp(IpAddr),
+    RateLimited(&'static str),
     Tcp(io::Error),
     Tls(io::Error),
 }
@@ -162,6 +236,7 @@ impl fmt::Display for OutboundConnectError {
             Self::Dns(e) => write!(f, "DNS resolution failed: {e}"),
             Self::DnsEmpty => f.write_str("DNS returned no addresses"),
             Self::DisallowedIp(ip) => write!(f, "resolved IP {ip} is not allowed"),
+            Self::RateLimited(msg) => f.write_str(msg),
             Self::Tcp(e) => write!(f, "TCP connect failed: {e}"),
             Self::Tls(e) => write!(f, "TLS handshake failed: {e}"),
         }
@@ -181,12 +256,14 @@ impl Error for OutboundConnectError {
 pub struct SafeHttpsStream {
     inner: TokioIo<TlsStream<TcpStream>>,
     created_at: Instant,
+    peer_ip: IpAddr,
 }
 
 impl Connection for SafeHttpsStream {
     fn connected(&self) -> Connected {
         Connected::new().extra(ConnMeta {
             created_at: self.created_at,
+            peer_ip: self.peer_ip,
         })
     }
 }
@@ -276,6 +353,7 @@ pub struct SafeHttpsConnector {
     tls_config: Arc<ClientConfig>,
     allow_loopback: bool,
     resolver: DnsResolver,
+    verify_ip_limiter: Option<Arc<Mutex<IpVerifyLimiter>>>,
 }
 
 impl SafeHttpsConnector {
@@ -294,7 +372,13 @@ impl SafeHttpsConnector {
             tls_config,
             allow_loopback,
             resolver,
+            verify_ip_limiter: None,
         })
+    }
+
+    fn with_verify_ip_limiter(mut self, limiter: Arc<Mutex<IpVerifyLimiter>>) -> Self {
+        self.verify_ip_limiter = Some(limiter);
+        self
     }
 }
 
@@ -311,6 +395,7 @@ impl Service<Uri> for SafeHttpsConnector {
         let tls_config = Arc::clone(&self.tls_config);
         let allow_loopback = self.allow_loopback;
         let resolver = Arc::clone(&self.resolver);
+        let verify_ip_limiter = self.verify_ip_limiter.clone();
 
         Box::pin(async move {
             if dst.scheme_str() != Some("https") {
@@ -338,20 +423,34 @@ impl Service<Uri> for SafeHttpsConnector {
                 }
             }
 
+            let verify_dialed = VERIFY_DIALED.try_with(Arc::clone).ok();
+            let mut checked_prefixes = Vec::new();
             let mut last_err = None;
-            let mut tcp = None;
+            let mut connected_tcp = None;
             for addr in addrs {
+                if let (Some(limiter), Some(dialed)) = (&verify_ip_limiter, &verify_dialed) {
+                    let prefix = ip_verify_prefix(addr.ip());
+                    if !checked_prefixes.contains(&prefix) {
+                        limiter
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .check_and_record(prefix)
+                            .map_err(OutboundConnectError::RateLimited)?;
+                        checked_prefixes.push(prefix);
+                    }
+                    dialed.store(true, Ordering::Release);
+                }
                 match TcpStream::connect(addr).await {
                     Ok(stream) => {
                         let _ = stream.set_nodelay(true);
-                        tcp = Some(stream);
+                        connected_tcp = Some((stream, addr.ip()));
                         break;
                     }
                     Err(e) => last_err = Some(e),
                 }
             }
-            let tcp = match tcp {
-                Some(s) => s,
+            let (tcp, peer_ip) = match connected_tcp {
+                Some(pair) => pair,
                 None => {
                     return Err(OutboundConnectError::Tcp(last_err.unwrap_or_else(|| {
                         io::Error::new(io::ErrorKind::NotConnected, "no reachable address")
@@ -370,6 +469,7 @@ impl Service<Uri> for SafeHttpsConnector {
             Ok(SafeHttpsStream {
                 inner: TokioIo::new(tls_stream),
                 created_at,
+                peer_ip,
             })
         })
     }
@@ -379,6 +479,7 @@ impl Service<Uri> for SafeHttpsConnector {
 #[derive(Clone)]
 pub struct OutboundClient {
     client: Client<SafeHttpsConnector, Full<Bytes>>,
+    verify_ip_limiter: Arc<Mutex<IpVerifyLimiter>>,
     allow_loopback: bool,
     conn_max_lifetime: Duration,
 }
@@ -398,12 +499,15 @@ impl OutboundClient {
         allow_loopback: bool,
         conn_max_lifetime: Duration,
     ) -> Self {
+        let verify_ip_limiter = Arc::new(Mutex::new(IpVerifyLimiter::default()));
+        let shared_connector = connector.with_verify_ip_limiter(Arc::clone(&verify_ip_limiter));
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .build(connector);
+            .build(shared_connector);
         Self {
             client,
+            verify_ip_limiter,
             allow_loopback,
             conn_max_lifetime,
         }
@@ -415,24 +519,26 @@ impl OutboundClient {
         url: &str,
         subscription_id: &str,
         secret: &SecretString,
-    ) -> Result<(), CallbackErrorReason> {
+    ) -> Result<(), VerifyError> {
         let url = validate_callback_url(url, self.allow_loopback)
-            .map_err(|_| CallbackErrorReason::ConnectionRefused)?;
+            .map_err(|_| VerifyError::Callback(CallbackErrorReason::ConnectionRefused))?;
 
-        let challenge = random_hex(24).map_err(|_| CallbackErrorReason::ChallengeFailed)?;
+        let challenge = random_hex(24)
+            .map_err(|_| VerifyError::Callback(CallbackErrorReason::ChallengeFailed))?;
         let webhook_id = format!(
             "msg_verification_{}",
-            random_hex(16).map_err(|_| CallbackErrorReason::ChallengeFailed)?
+            random_hex(16)
+                .map_err(|_| VerifyError::Callback(CallbackErrorReason::ChallengeFailed))?
         );
         let body = serde_json::to_vec(&VerificationRequest {
             kind: "verification",
             challenge: &challenge,
         })
-        .map_err(|_| CallbackErrorReason::ChallengeFailed)?;
+        .map_err(|_| VerifyError::Callback(CallbackErrorReason::ChallengeFailed))?;
 
         let timestamp = unix_now();
         let signature = sign_webhook_v1(secret.expose(), &webhook_id, timestamp, &body)
-            .map_err(|_| CallbackErrorReason::ChallengeFailed)?;
+            .map_err(|_| VerifyError::Callback(CallbackErrorReason::ChallengeFailed))?;
 
         let req = build_signed_request(
             &url,
@@ -442,26 +548,43 @@ impl OutboundClient {
             &signature,
             Bytes::from(body),
         )
-        .map_err(|_| CallbackErrorReason::ConnectionRefused)?;
+        .map_err(|_| VerifyError::Callback(CallbackErrorReason::ConnectionRefused))?;
 
-        let (status, resp_bytes) = self
-            .send_with_bounded_body(req, VERIFY_TIMEOUT, MAX_VERIFY_RESP_BYTES, true)
+        let dialed = Arc::new(AtomicBool::new(false));
+        let (status, resp_bytes, peer_ip, captured) = VERIFY_DIALED
+            .scope(
+                Arc::clone(&dialed),
+                self.send_with_bounded_body(req, VERIFY_TIMEOUT, MAX_VERIFY_RESP_BYTES, true),
+            )
             .await?;
+        if !dialed.load(Ordering::Acquire)
+            && let Some(ip) = peer_ip
+            && let Err(msg) = self
+                .verify_ip_limiter
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .check_and_record(ip_verify_prefix(ip))
+        {
+            if let Some(conn) = captured.connection_metadata().as_ref() {
+                conn.poison();
+            }
+            return Err(VerifyError::RateLimited(msg.to_owned()));
+        }
 
         if status.is_success() {
             let parsed: VerificationResponse = serde_json::from_slice(&resp_bytes)
-                .map_err(|_| CallbackErrorReason::ChallengeFailed)?;
+                .map_err(|_| VerifyError::Callback(CallbackErrorReason::ChallengeFailed))?;
             if constant_time_bytes_eq(parsed.challenge.as_bytes(), challenge.as_bytes()) {
                 Ok(())
             } else {
-                Err(CallbackErrorReason::ChallengeFailed)
+                Err(VerifyError::Callback(CallbackErrorReason::ChallengeFailed))
             }
         } else if status.is_client_error() {
-            Err(CallbackErrorReason::Http4xx)
+            Err(VerifyError::Callback(CallbackErrorReason::Http4xx))
         } else if status.is_server_error() {
-            Err(CallbackErrorReason::Http5xx)
+            Err(VerifyError::Callback(CallbackErrorReason::Http5xx))
         } else {
-            Err(CallbackErrorReason::ChallengeFailed)
+            Err(VerifyError::Callback(CallbackErrorReason::ChallengeFailed))
         }
     }
 
@@ -511,8 +634,11 @@ impl OutboundClient {
             .send_with_bounded_body(req, DELIVERY_TIMEOUT, MAX_DELIVERY_RESP_BYTES, false)
             .await
         {
-            Ok((status, _)) => classify_delivery_status(status),
-            Err(reason) => DeliveryOutcome::Transient(reason),
+            Ok((status, _, _, _)) => classify_delivery_status(status),
+            Err(VerifyError::Callback(reason)) => DeliveryOutcome::Transient(reason),
+            Err(VerifyError::RateLimited(_)) => {
+                DeliveryOutcome::Transient(CallbackErrorReason::ConnectionRefused)
+            }
         }
     }
 
@@ -522,7 +648,7 @@ impl OutboundClient {
         timeout_dur: Duration,
         max_resp_bytes: usize,
         collect_body: bool,
-    ) -> Result<(StatusCode, Vec<u8>), CallbackErrorReason> {
+    ) -> Result<(StatusCode, Vec<u8>, Option<IpAddr>, CaptureConnection), VerifyError> {
         let captured = capture_connection(&mut req);
         let fut = async {
             let res = self
@@ -531,7 +657,9 @@ impl OutboundClient {
                 .await
                 .map_err(|e| classify_client_error(&e))?;
             let status = res.status();
-            let created_at = res.extensions().get::<ConnMeta>().map(|m| m.created_at);
+            let meta = res.extensions().get::<ConnMeta>().copied();
+            let created_at = meta.map(|m| m.created_at);
+            let peer_ip = meta.map(|m| m.peer_ip);
             let poison_if_expired = || {
                 if let Some(t0) = created_at
                     && t0.elapsed() >= self.conn_max_lifetime
@@ -566,18 +694,19 @@ impl OutboundClient {
             poison_if_expired();
 
             if exceeded && collect_body {
-                return Err(CallbackErrorReason::ChallengeFailed);
+                return Err(VerifyError::Callback(CallbackErrorReason::ChallengeFailed));
             }
-            Ok((status, collected))
+            Ok((status, collected, peer_ip))
         };
 
         match tokio::time::timeout(timeout_dur, fut).await {
-            Ok(res) => res,
+            Ok(Ok((status, collected, peer_ip))) => Ok((status, collected, peer_ip, captured)),
+            Ok(Err(err)) => Err(err),
             Err(_) => {
                 if let Some(conn) = captured.connection_metadata().as_ref() {
                     conn.poison();
                 }
-                Err(CallbackErrorReason::Timeout)
+                Err(VerifyError::Callback(CallbackErrorReason::Timeout))
             }
         }
     }
@@ -652,21 +781,26 @@ fn classify_delivery_status(status: StatusCode) -> DeliveryOutcome {
     }
 }
 
-fn classify_client_error(err: &(dyn Error + 'static)) -> CallbackErrorReason {
+fn classify_client_error(err: &(dyn Error + 'static)) -> VerifyError {
     let mut cur: Option<&(dyn Error + 'static)> = Some(err);
     while let Some(e) = cur {
         if let Some(ce) = e.downcast_ref::<OutboundConnectError>() {
             return match ce {
-                OutboundConnectError::Tls(_) => CallbackErrorReason::TlsError,
-                _ => CallbackErrorReason::ConnectionRefused,
+                OutboundConnectError::Tls(_) => {
+                    VerifyError::Callback(CallbackErrorReason::TlsError)
+                }
+                OutboundConnectError::RateLimited(msg) => {
+                    VerifyError::RateLimited((*msg).to_owned())
+                }
+                _ => VerifyError::Callback(CallbackErrorReason::ConnectionRefused),
             };
         }
         if e.downcast_ref::<rustls::Error>().is_some() {
-            return CallbackErrorReason::TlsError;
+            return VerifyError::Callback(CallbackErrorReason::TlsError);
         }
         cur = e.source();
     }
-    CallbackErrorReason::ConnectionRefused
+    VerifyError::Callback(CallbackErrorReason::ConnectionRefused)
 }
 
 #[cfg(test)]
@@ -680,7 +814,7 @@ mod tests {
     use hyper::service::service_fn;
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
     use tokio_rustls::TlsAcceptor;
@@ -707,7 +841,7 @@ mod tests {
         }
     }
 
-    async fn spawn_tls_server<F>(san: &str, responder: F) -> TestTlsServer
+    async fn spawn_tls_server_on<F>(bind_ip: &str, san: &str, responder: F) -> TestTlsServer
     where
         F: Fn(http::HeaderMap, Bytes) -> (StatusCode, Vec<u8>) + Send + Sync + 'static,
     {
@@ -727,7 +861,7 @@ mod tests {
                 .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind((bind_ip, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_bg = Arc::clone(&requests);
@@ -779,6 +913,13 @@ mod tests {
         }
     }
 
+    async fn spawn_tls_server<F>(san: &str, responder: F) -> TestTlsServer
+    where
+        F: Fn(http::HeaderMap, Bytes) -> (StatusCode, Vec<u8>) + Send + Sync + 'static,
+    {
+        spawn_tls_server_on("127.0.0.1", san, responder).await
+    }
+
     #[test]
     fn ip_classification_rejects_all_iana_non_global_and_allows_public() {
         let blocked = [
@@ -819,9 +960,17 @@ mod tests {
             "2001::1",
             "2001:db8::1",
             "2001:2::1",
+            "2001:3::1",
+            "2001:3:ffff::1",
+            "2001:4:112::1",
+            "2001:4:112:ffff::1",
             "2001:10::1",
             "2001:20::1",
+            "2001:30::1",
+            "2001:3f:ffff::1",
             "2002:c000:0201::1",
+            "2620:4f:8000::1",
+            "2620:4f:8000:ffff::1",
             "3fff::1",
             "3fff:0fff::1",
             "4000::1",
@@ -844,7 +993,9 @@ mod tests {
             "::ffff:1.1.1.1",
             "2606:4700:4700::1111",
             "2001:4860:4860::8888",
-            "2001:30::1",
+            "2001:4:113::1",
+            "2001:40::1",
+            "2620:4f:8001::1",
             "3fff:1000::1",
         ];
         for s in allowed {
@@ -985,13 +1136,13 @@ mod tests {
             client
                 .verify_callback(&url, "sub_wrong", &test_secret(1))
                 .await,
-            Err(CallbackErrorReason::ChallengeFailed)
+            Err(VerifyError::Callback(CallbackErrorReason::ChallengeFailed))
         );
         assert_eq!(
             client
                 .verify_callback(&url, "sub_big", &test_secret(1))
                 .await,
-            Err(CallbackErrorReason::ChallengeFailed)
+            Err(VerifyError::Callback(CallbackErrorReason::ChallengeFailed))
         );
     }
 
@@ -1101,8 +1252,247 @@ mod tests {
             client
                 .verify_callback(&url, "sub_tls", &test_secret(9))
                 .await,
-            Err(CallbackErrorReason::TlsError)
+            Err(VerifyError::Callback(CallbackErrorReason::TlsError))
         );
+    }
+
+    #[tokio::test]
+    async fn verify_callback_rate_limits_resolved_ipv4_and_ipv6_subnets() {
+        let server = spawn_tls_server("hook.example.test", |_headers, body| {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let ch = v["challenge"].as_str().unwrap();
+            (
+                StatusCode::OK,
+                serde_json::to_vec(&serde_json::json!({ "challenge": ch })).unwrap(),
+            )
+        })
+        .await;
+        let addr = server.addr;
+        let dns_calls = Arc::new(AtomicUsize::new(0));
+        let dns_calls_bg = Arc::clone(&dns_calls);
+        let resolver: DnsResolver = Arc::new(move |_, _| {
+            dns_calls_bg.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(vec![addr]) })
+        });
+        let connector =
+            SafeHttpsConnector::with_roots_and_resolver(server.roots.clone(), true, resolver)
+                .unwrap();
+        let client = OutboundClient::from_connector(connector, true, Duration::from_secs(60));
+        let url = format!("https://hook.example.test:{}/cb", addr.port());
+        let secret = test_secret(5);
+
+        // First call dials via SafeHttpsConnector; remaining 19 reuse the Keep-Alive pool socket
+        // and charge ConnMeta.peer_ip via !dialed without double-counting the initial dial.
+        for i in 0..VERIFY_IP_RATE_LIMIT {
+            client
+                .verify_callback(&url, &format!("sub_{i}"), &secret)
+                .await
+                .unwrap();
+        }
+        assert_eq!(dns_calls.load(Ordering::SeqCst), 1);
+
+        assert!(matches!(
+            client.verify_callback(&url, "sub_overflow", &secret).await,
+            Err(VerifyError::RateLimited(_))
+        ));
+        let reqs_after_first_overflow = server.requests.lock().await.len();
+        assert_eq!(reqs_after_first_overflow, VERIFY_IP_RATE_LIMIT + 1);
+
+        // Pooled connection was poisoned on rate-limit overflow; subsequent call blocks pre-connect.
+        assert!(matches!(
+            client
+                .verify_callback(&url, "sub_overflow_2", &secret)
+                .await,
+            Err(VerifyError::RateLimited(_))
+        ));
+        assert_eq!(dns_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            server.requests.lock().await.len(),
+            reqs_after_first_overflow
+        );
+
+        // Different interface IDs in the same IPv6 /64 share one bucket.
+        let mut limiter = IpVerifyLimiter::default();
+        for host_id in 0..VERIFY_IP_RATE_LIMIT {
+            let ip: IpAddr = format!("2606:4700:4700:1111::{host_id:x}").parse().unwrap();
+            limiter.check_and_record(ip_verify_prefix(ip)).unwrap();
+        }
+        let same_subnet: IpAddr = "2606:4700:4700:1111::ffff".parse().unwrap();
+        assert!(
+            limiter
+                .check_and_record(ip_verify_prefix(same_subnet))
+                .is_err()
+        );
+        let other_subnet: IpAddr = "2606:4700:4700:1112::1".parse().unwrap();
+        assert!(
+            limiter
+                .check_and_record(ip_verify_prefix(other_subnet))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_callback_rate_limits_multi_record_fallback_and_dns_rebinding() {
+        let echo_challenge = |_headers: http::HeaderMap, body: Bytes| {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let ch = v["challenge"].as_str().unwrap();
+            (
+                StatusCode::OK,
+                serde_json::to_vec(&serde_json::json!({ "challenge": ch })).unwrap(),
+            )
+        };
+        let victim = spawn_tls_server_on("127.0.0.1", "*.evil.test", echo_challenge).await;
+        let victim_addr = victim.addr;
+
+        // Bind a TCP socket without listening so connect() deterministically returns ECONNREFUSED.
+        let dead_sock = tokio::net::TcpSocket::new_v4().unwrap();
+        dead_sock
+            .bind(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 1, 250)),
+                0,
+            ))
+            .unwrap();
+        let dead_port = dead_sock.local_addr().unwrap().port();
+
+        // 1. Multi-A fallback: [unreachable_distinct_ip, victim_ip] must charge victim_ip on fallback.
+        let resolver_fallback: DnsResolver = Arc::new(move |host, _port| {
+            let idx: u8 = host
+                .strip_prefix('h')
+                .and_then(|s| s.strip_suffix(".evil.test"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let unreachable = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 1, idx.saturating_add(1))),
+                dead_port,
+            );
+            Box::pin(async move { Ok(vec![unreachable, victim_addr]) })
+        });
+        let connector = SafeHttpsConnector::with_roots_and_resolver(
+            victim.roots.clone(),
+            true,
+            resolver_fallback,
+        )
+        .unwrap();
+        let client = OutboundClient::from_connector(connector, true, Duration::from_secs(60));
+        let secret = test_secret(7);
+
+        for i in 0..VERIFY_IP_RATE_LIMIT {
+            let url = format!("https://h{i}.evil.test:{}/cb", victim_addr.port());
+            client
+                .verify_callback(&url, &format!("sub_fb_{i}"), &secret)
+                .await
+                .unwrap();
+        }
+        assert_eq!(victim.requests.lock().await.len(), VERIFY_IP_RATE_LIMIT);
+
+        let overflow_url = format!(
+            "https://h{VERIFY_IP_RATE_LIMIT}.evil.test:{}/cb",
+            victim_addr.port()
+        );
+        assert!(matches!(
+            client
+                .verify_callback(&overflow_url, "sub_fb_overflow", &secret)
+                .await,
+            Err(VerifyError::RateLimited(_))
+        ));
+        assert_eq!(victim.requests.lock().await.len(), VERIFY_IP_RATE_LIMIT);
+
+        // 2. DNS rebinding: rebind.evil.test switches from 127.0.0.2 to saturated 127.0.0.3.
+        let ck_shared = rcgen::generate_simple_self_signed(vec!["*.evil.test".to_owned()]).unwrap();
+        let cert_der: CertificateDer<'static> = ck_shared.cert.der().clone();
+        let mut combined_roots = RootCertStore::empty();
+        combined_roots.add(cert_der.clone()).unwrap();
+        let spawn_with_cert = |bind_ip: &'static str| {
+            let cert_der = cert_der.clone();
+            let key_bytes = ck_shared.key_pair.serialize_der();
+            async move {
+                let server_cfg = ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert_der],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes)),
+                )
+                .unwrap();
+                let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+                let listener = TcpListener::bind((bind_ip, 0)).await.unwrap();
+                let laddr = listener.local_addr().unwrap();
+                let handle = tokio::spawn(async move {
+                    while let Ok((tcp, _)) = listener.accept().await {
+                        let acceptor = acceptor.clone();
+                        tokio::spawn(async move {
+                            let Ok(tls) = acceptor.accept(tcp).await else {
+                                return;
+                            };
+                            let svc = service_fn(move |req: Request<Incoming>| async move {
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                                let ch = v["challenge"].as_str().unwrap();
+                                let out =
+                                    serde_json::to_vec(&serde_json::json!({ "challenge": ch }))
+                                        .unwrap();
+                                Ok::<_, hyper::Error>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(http::header::CONTENT_TYPE, "application/json")
+                                        .body(Full::new(Bytes::from(out)))
+                                        .unwrap(),
+                                )
+                            });
+                            let _ = http1::Builder::new()
+                                .keep_alive(true)
+                                .serve_connection(TokioIo::new(tls), svc)
+                                .await;
+                        });
+                    }
+                });
+                (laddr, handle)
+            }
+        };
+        let (addr_old, h_old) = spawn_with_cert("127.0.0.2").await;
+        let (addr_victim2, h_victim2) = spawn_with_cert("127.0.0.3").await;
+        let rebind_step2 = Arc::new(AtomicUsize::new(0));
+        let rebind_step2_bg = Arc::clone(&rebind_step2);
+        let resolver_rebind2: DnsResolver = Arc::new(move |host, _port| {
+            let is_rebind = host == "rebind.evil.test";
+            let step = rebind_step2_bg.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if is_rebind && step == 0 {
+                    Ok(vec![addr_old])
+                } else {
+                    Ok(vec![addr_victim2])
+                }
+            })
+        });
+        let connector2 =
+            SafeHttpsConnector::with_roots_and_resolver(combined_roots, true, resolver_rebind2)
+                .unwrap();
+        // Zero conn_max_lifetime forces fresh DNS dial on each call instead of reusing pooled socket.
+        let client2 = OutboundClient::from_connector(connector2, true, Duration::ZERO);
+
+        client2
+            .verify_callback("https://rebind.evil.test/cb", "sub_rb_0", &secret)
+            .await
+            .unwrap();
+        for i in 0..VERIFY_IP_RATE_LIMIT {
+            client2
+                .verify_callback("https://saturate.evil.test/cb", &format!("s_{i}"), &secret)
+                .await
+                .unwrap();
+        }
+        rebind_step2.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            client2
+                .verify_callback("https://rebind.evil.test/cb", "sub_rb_rebound", &secret)
+                .await,
+            Err(VerifyError::RateLimited(_))
+        ));
+
+        h_old.abort();
+        h_victim2.abort();
     }
 
     #[tokio::test]

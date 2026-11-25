@@ -33,6 +33,8 @@ pub struct PersistedSubscription {
     pub refresh_before: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_since_ms: Option<u64>,
     #[serde(default)]
     pub pending_truncated_for_refresh: bool,
     #[serde(default)]
@@ -832,6 +834,7 @@ mod tests {
             prev_secret_until: Some(refresh_before + 300),
             refresh_before,
             safe_cursor: Some("cur_42".into()),
+            bootstrap_since_ms: None,
             pending_truncated_for_refresh: true,
             suspended: false,
             last_error: Some(CallbackErrorReason::Timeout),

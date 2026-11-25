@@ -1,7 +1,6 @@
-//! Single-port HTTP facade: route isolation, MCP protocol branching, passthrough proxy,
+//! Single-port HTTP facade: route isolation, streaming MCP method dispatch, passthrough proxy,
 //! `/v1/events` ingest endpoint, and graceful shutdown (spec §2, §4, §5).
 
-use crate::auth::{AuthCheckOutcome, intersect_scopes};
 use crate::config::Config;
 use crate::engine::{
     CallerAuth, EngineError, HookdEngine, PassthroughResolution, SubscribeRequest,
@@ -12,7 +11,7 @@ use crate::headers::{
     validate_passthrough_path,
 };
 use crate::outbound::OutboundClient;
-use crate::proxy_body::{LeasedBuffer, ProxyBody};
+use crate::proxy_body::{LeasedBuffer, PrefixedBody, ProxyBody};
 use crate::types::{
     ByteBudget, LATEST_LEGACY_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSIONS, LEGACY_SESSION_IDLE_SECS,
     MAX_INGEST_BODY_BYTES, MAX_LEGACY_SESSIONS, MAX_REQUEST_BODY_BYTES, MemoryPools,
@@ -46,6 +45,7 @@ use tokio_util::task::TaskTracker;
 
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_FALLBACK_MAX_BYTES: usize = 64 * 1024;
+const MAX_JSON_SCAN_NESTING: usize = 4096;
 
 type RespBody = BoxBody<Bytes, io::Error>;
 
@@ -286,7 +286,6 @@ async fn handle_request(state: Arc<ServerState>, req: Request<Incoming>) -> Resp
     let raw_path = req.uri().path().to_owned();
     let method = req.method().clone();
 
-    // 1. Unauthenticated health probe.
     if raw_path == "/healthz" {
         return match method {
             Method::GET => json_response(StatusCode::OK, &json!({ "ok": true })),
@@ -295,7 +294,6 @@ async fn handle_request(state: Arc<ServerState>, req: Request<Incoming>) -> Resp
         };
     }
 
-    // 2. External producer ingest endpoint (only registered when `ingest` is configured).
     if raw_path == "/v1/events" {
         if state.engine.config().ingest.is_none() {
             return empty_response(StatusCode::NOT_FOUND);
@@ -303,7 +301,6 @@ async fn handle_request(state: Arc<ServerState>, req: Request<Incoming>) -> Resp
         return handle_ingest(state, req).await;
     }
 
-    // 3. Primary MCP facade endpoint.
     if raw_path == state.engine.config().resource_path {
         return handle_mcp(state, req).await;
     }
@@ -312,7 +309,6 @@ async fn handle_request(state: Arc<ServerState>, req: Request<Incoming>) -> Resp
         return empty_response(StatusCode::NOT_FOUND);
     }
 
-    // 4. Configured passthrough prefixes (e.g. `/t/`).
     if let Some(up_cfg) = state.engine.config().upstream.as_ref()
         && !up_cfg.passthrough_prefixes.is_empty()
     {
@@ -424,6 +420,7 @@ async fn handle_passthrough(state: Arc<ServerState>, req: Request<Incoming>) -> 
 
 async fn handle_mcp(state: Arc<ServerState>, req: Request<Incoming>) -> Response<RespBody> {
     let cfg = state.engine.config();
+    let profile = cfg.profile;
 
     let Some(token_slot) = verify_bearer_token(req.headers(), &cfg.inbound_tokens) else {
         return unauthorized_response();
@@ -440,14 +437,29 @@ async fn handle_mcp(state: Arc<ServerState>, req: Request<Incoming>) -> Response
 
     let caller = match extract_caller_auth(req.headers(), token_slot, cfg.auth_context.is_some()) {
         Ok(c) => c,
-        Err(()) => return empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(()) => return empty_response(StatusCode::BAD_REQUEST),
     };
 
     match *req.method() {
-        Method::GET => handle_mcp_get(state, req).await,
-        Method::DELETE => handle_mcp_delete(state, req).await,
+        Method::GET => {
+            if let Err(err) = state.engine.verify_caller(&caller, false).await {
+                return auth_error_response(profile, None, err);
+            }
+            handle_mcp_get(state, req).await
+        }
+        Method::DELETE => {
+            if let Err(err) = state.engine.verify_caller(&caller, false).await {
+                return auth_error_response(profile, None, err);
+            }
+            handle_mcp_delete(state, req).await
+        }
         Method::POST => handle_mcp_post(state, req, caller).await,
-        _ => method_not_allowed("POST, GET, DELETE"),
+        _ => {
+            if let Err(err) = state.engine.verify_caller(&caller, false).await {
+                return auth_error_response(profile, None, err);
+            }
+            method_not_allowed("POST, GET, DELETE")
+        }
     }
 }
 
@@ -473,6 +485,25 @@ async fn handle_mcp_get(state: Arc<ServerState>, req: Request<Incoming>) -> Resp
 }
 
 async fn handle_mcp_delete(state: Arc<ServerState>, req: Request<Incoming>) -> Response<RespBody> {
+    if let Some(upstream) = state.engine.upstream_client() {
+        let (parts, incoming) = req.into_parts();
+        return match upstream
+            .forward_raw(
+                Method::DELETE,
+                None,
+                &parts.headers,
+                ProxyBody::new(incoming, Arc::clone(&state.engine.pools().proxy)),
+                true,
+                None,
+            )
+            .await
+        {
+            Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
+            Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
+            Err(_) => empty_response(StatusCode::BAD_GATEWAY),
+        };
+    }
+
     let session_id = match single_header_str(req.headers(), "mcp-session-id") {
         HeaderExtract::Missing => None,
         HeaderExtract::Single(s) if !s.is_empty() => Some(s.to_owned()),
@@ -490,24 +521,6 @@ async fn handle_mcp_delete(state: Arc<ServerState>, req: Request<Incoming>) -> R
             empty_response(StatusCode::BAD_REQUEST)
         };
     };
-
-    if let Some(upstream) = state.engine.upstream_client() {
-        return match upstream
-            .forward_raw(
-                Method::DELETE,
-                None,
-                req.headers(),
-                Empty::<Bytes>::new(),
-                true,
-                None,
-            )
-            .await
-        {
-            Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
-            Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
-            Err(_) => empty_response(StatusCode::BAD_GATEWAY),
-        };
-    }
 
     let removed = state
         .legacy_sessions
@@ -541,15 +554,487 @@ struct RpcContext<'a> {
     params: Option<&'a Value>,
 }
 
+fn is_intercepted_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "server/discover"
+            | "events/list"
+            | "events/poll"
+            | "events/stream"
+            | "events/subscribe"
+            | "events/unsubscribe"
+    )
+}
+
+async fn forward_post_to_upstream<B>(
+    state: &ServerState,
+    headers: &HeaderMap,
+    body: B,
+) -> Response<RespBody>
+where
+    B: Body<Data = Bytes> + Send + Sync + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let Some(upstream) = state.engine.upstream_client() else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    match upstream
+        .forward_raw(Method::POST, None, headers, body, true, None)
+        .await
+    {
+        Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
+        Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
+        Err(_) => empty_response(StatusCode::BAD_GATEWAY),
+    }
+}
+
 async fn handle_mcp_post(
     state: Arc<ServerState>,
     req: Request<Incoming>,
     caller: CallerAuth,
 ) -> Response<RespBody> {
-    if !is_json_content_type(req.headers()) {
-        return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let has_upstream = state.engine.upstream_client().is_some();
+    let profile = state.engine.config().profile;
+    let live_from_hdr = header_mentions_method(req.headers(), "events/subscribe");
+
+    if has_non_identity_content_encoding(req.headers()) {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
+        if !has_upstream || header_targets_intercepted_method(req.headers()) {
+            return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        let (parts, incoming) = req.into_parts();
+        let body = ProxyBody::new(incoming, Arc::clone(&state.engine.pools().proxy));
+        return forward_post_to_upstream(&state, &parts.headers, body).await;
     }
+
+    if !is_json_content_type(req.headers()) {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
+        if !has_upstream {
+            return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        let (parts, incoming) = req.into_parts();
+        let body = ProxyBody::new(incoming, Arc::clone(&state.engine.pools().proxy));
+        return forward_post_to_upstream(&state, &parts.headers, body).await;
+    }
+
+    if !has_upstream {
+        return handle_mcp_post_local_only(state, req, caller).await;
+    }
+
+    let prefer_control = matches!(
+        single_header_str(req.headers(), "mcp-method"),
+        HeaderExtract::Single("events/unsubscribe")
+    );
+    let (parts, incoming) = req.into_parts();
+
+    let scanned = match scan_or_buffer_json_body(
+        incoming,
+        MAX_REQUEST_BODY_BYTES,
+        state.engine.pools(),
+        prefer_control,
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(BodyReadError::TooLarge) => return empty_response(StatusCode::PAYLOAD_TOO_LARGE),
+        Err(BodyReadError::Timeout) => return empty_response(StatusCode::REQUEST_TIMEOUT),
+        Err(BodyReadError::BudgetExhausted) => {
+            return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(BodyReadError::Io(_)) => {
+            if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+                return auth_error_response(profile, None, err);
+            }
+            return jsonrpc_error(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32700,
+                "Parse error",
+                None,
+            );
+        }
+    };
+
+    match scanned {
+        ScannedPostBody::PassthroughStream {
+            prefix,
+            rest,
+            eof,
+            captured_id,
+        } => {
+            if let Err(err) = state.engine.verify_caller(&caller, false).await {
+                return auth_error_response(profile, captured_id, err);
+            }
+            if eof {
+                forward_post_to_upstream(&state, &parts.headers, Full::new(prefix)).await
+            } else {
+                let body = PrefixedBody::new(
+                    prefix,
+                    ProxyBody::new(rest, Arc::clone(&state.engine.pools().proxy)),
+                );
+                forward_post_to_upstream(&state, &parts.headers, body).await
+            }
+        }
+        ScannedPostBody::Malformed { captured_id } => {
+            if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+                return auth_error_response(profile, captured_id, err);
+            }
+            jsonrpc_error(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32700,
+                "Parse error",
+                None,
+            )
+        }
+        ScannedPostBody::DuplicateMethod { captured_id } => {
+            if let Err(err) = state.engine.verify_caller(&caller, true).await {
+                return auth_error_response(profile, captured_id, err);
+            }
+            jsonrpc_error(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32600,
+                "Invalid Request: duplicate method field",
+                None,
+            )
+        }
+        ScannedPostBody::Buffered(raw_body) => {
+            handle_buffered_upstream_post(state, parts.headers, raw_body, caller).await
+        }
+    }
+}
+
+async fn handle_buffered_upstream_post(
+    state: Arc<ServerState>,
+    req_headers: HeaderMap,
+    raw_body: Bytes,
+    caller: CallerAuth,
+) -> Response<RespBody> {
+    let profile = state.engine.config().profile;
+    let live_from_hdr = header_mentions_method(&req_headers, "events/subscribe");
+
+    let Ok(text) = std::str::from_utf8(&raw_body) else {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
+        return jsonrpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32700,
+            "Parse error",
+            None,
+        );
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
+        return jsonrpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32700,
+            "Parse error",
+            None,
+        );
+    };
+
+    let Some(obj) = parsed.as_object() else {
+        if let Err(err) = state.engine.verify_caller(&caller, false).await {
+            return auth_error_response(profile, None, err);
+        }
+        return forward_post_to_upstream(&state, &req_headers, Full::new(raw_body)).await;
+    };
+
+    let method = match obj.get("method") {
+        None => {
+            let valid_id = obj.get("id").filter(|v| is_valid_jsonrpc_id(v)).cloned();
+            if let Err(err) = state.engine.verify_caller(&caller, false).await {
+                return auth_error_response(profile, valid_id, err);
+            }
+            return forward_post_to_upstream(&state, &req_headers, Full::new(raw_body)).await;
+        }
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => {
+            let valid_id = obj.get("id").filter(|v| is_valid_jsonrpc_id(v)).cloned();
+            if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+                return auth_error_response(profile, valid_id, err);
+            }
+            return jsonrpc_error(
+                StatusCode::BAD_REQUEST,
+                Value::Null,
+                -32600,
+                "Invalid Request: method must be a string",
+                None,
+            );
+        }
+    };
+
+    if !is_intercepted_method(method) {
+        let valid_id = obj.get("id").filter(|v| is_valid_jsonrpc_id(v)).cloned();
+        if let Err(err) = state.engine.verify_caller(&caller, false).await {
+            return auth_error_response(profile, valid_id, err);
+        }
+        return forward_post_to_upstream(&state, &req_headers, Full::new(raw_body)).await;
+    }
+
+    let valid_id = obj.get("id").filter(|v| is_valid_jsonrpc_id(v)).cloned();
+    let live = method == "events/subscribe";
+    if let Err(err) = state.engine.verify_caller(&caller, live).await {
+        return auth_error_response(profile, valid_id, err);
+    }
+
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return jsonrpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            "Invalid Request: missing or unsupported jsonrpc version",
+            None,
+        );
+    }
+
+    let req_id: Option<Value> = match obj.get("id") {
+        None => None,
+        Some(id_val) => {
+            if is_valid_jsonrpc_id(id_val) {
+                Some(id_val.clone())
+            } else {
+                return jsonrpc_error(
+                    StatusCode::BAD_REQUEST,
+                    Value::Null,
+                    -32600,
+                    "Invalid Request: id must be a non-null string or integer",
+                    None,
+                );
+            }
+        }
+    };
+    let params = obj.get("params");
+
+    match method {
+        "initialize" | "server/discover" => {
+            if req_id.is_none() {
+                return jsonrpc_error(
+                    StatusCode::BAD_REQUEST,
+                    Value::Null,
+                    -32600,
+                    &format!("{method} must be a JSON-RPC request with id"),
+                    None,
+                );
+            }
+            let Some(upstream) = state.engine.upstream_client() else {
+                return empty_response(StatusCode::BAD_GATEWAY);
+            };
+            match upstream
+                .forward_handshake(&req_headers, raw_body, profile, None)
+                .await
+            {
+                Ok(hs) => {
+                    let mut builder = Response::builder().status(hs.status);
+                    if let Some(h) = builder.headers_mut() {
+                        *h = hs.headers;
+                    }
+                    builder
+                        .body(hs.body)
+                        .unwrap_or_else(|_| empty_response(StatusCode::BAD_GATEWAY))
+                }
+                Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
+                Err(_) => empty_response(StatusCode::BAD_GATEWAY),
+            }
+        }
+        "events/poll" | "events/stream" => {
+            let Some(id) = req_id else {
+                return jsonrpc_error(
+                    StatusCode::BAD_REQUEST,
+                    Value::Null,
+                    -32600,
+                    "events/* must be a JSON-RPC request with id",
+                    None,
+                );
+            };
+            match single_header_str(&req_headers, "mcp-method") {
+                HeaderExtract::Missing => {}
+                HeaderExtract::Single(m) if m == method => {}
+                _ => {
+                    return jsonrpc_error(
+                        StatusCode::BAD_REQUEST,
+                        id,
+                        -32020,
+                        "Mcp-Method header is duplicate or does not match method",
+                        None,
+                    );
+                }
+            }
+            handle_upstream_events_passthrough(&state, &req_headers, raw_body, id, params).await
+        }
+        "events/list" | "events/subscribe" | "events/unsubscribe" => {
+            if !accepts_json_and_sse(&req_headers) {
+                return empty_response(StatusCode::NOT_ACCEPTABLE);
+            }
+            let err_id = req_id.clone().unwrap_or(Value::Null);
+            let mode = match classify_protocol(&req_headers, method, req_id.is_some(), params) {
+                Ok(m) => m,
+                Err((code, msg)) => {
+                    return jsonrpc_error(StatusCode::BAD_REQUEST, err_id, code, &msg, None);
+                }
+            };
+            let ctx = RpcContext {
+                req_headers: &req_headers,
+                raw_body,
+                method,
+                req_id,
+                params,
+            };
+            handle_events_method(state, ctx, mode, caller).await
+        }
+        _ => unreachable!(),
+    }
+}
+
+async fn validate_event_params_and_routing_headers<'a>(
+    state: &ServerState,
+    req_headers: &HeaderMap,
+    id: &Value,
+    params: Option<&'a Value>,
+) -> Result<(&'a str, Option<&'a Map<String, Value>>), Response<RespBody>> {
+    let profile = state.engine.config().profile;
+    let Some(params_obj) = params.and_then(Value::as_object) else {
+        return Err(jsonrpc_error(
+            StatusCode::OK,
+            id.clone(),
+            -32602,
+            "params must be a JSON object",
+            None,
+        ));
+    };
+    let Some(event_name) = params_obj.get("name").and_then(Value::as_str) else {
+        return Err(jsonrpc_error(
+            StatusCode::OK,
+            id.clone(),
+            -32602,
+            "params.name must be a string",
+            None,
+        ));
+    };
+    let args_map = match params_obj.get("arguments") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(m)) => Some(m),
+        Some(_) => {
+            return Err(jsonrpc_error(
+                StatusCode::OK,
+                id.clone(),
+                -32602,
+                "params.arguments must be an object",
+                None,
+            ));
+        }
+    };
+
+    let disallowed = state
+        .engine
+        .config()
+        .upstream
+        .as_ref()
+        .and_then(|u| u.expose_events.iter().find(|e| e.name == event_name))
+        .map(|e| e.disallow_arguments.as_slice())
+        .unwrap_or(&[]);
+
+    let input_schema = if req_headers
+        .keys()
+        .any(|name| name.as_str().starts_with("mcp-param-"))
+    {
+        match state.engine.routing_input_schema(event_name).await {
+            Ok(schema) => schema,
+            Err(err) => return Err(engine_error_response(id.clone(), profile, err)),
+        }
+    } else {
+        None
+    };
+
+    if let Err(msg) = validate_optional_event_routing_headers(
+        req_headers,
+        event_name,
+        args_map,
+        disallowed,
+        input_schema.as_ref(),
+    ) {
+        return Err(jsonrpc_error(
+            StatusCode::BAD_REQUEST,
+            id.clone(),
+            -32020,
+            &msg,
+            None,
+        ));
+    }
+
+    Ok((event_name, args_map))
+}
+
+async fn handle_upstream_events_passthrough(
+    state: &ServerState,
+    req_headers: &HeaderMap,
+    raw_body: Bytes,
+    id: Value,
+    params: Option<&Value>,
+) -> Response<RespBody> {
+    let profile = state.engine.config().profile;
+    let (event_name, args_map) =
+        match validate_event_params_and_routing_headers(state, req_headers, &id, params).await {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+    match state
+        .engine
+        .resolve_event_for_passthrough(event_name, args_map)
+        .await
+    {
+        Ok(PassthroughResolution::IngestUnsupported) => jsonrpc_error(
+            StatusCode::OK,
+            id,
+            profile.unsupported_code(),
+            &format!("event '{event_name}' only supports webhook delivery"),
+            None,
+        ),
+        Ok(PassthroughResolution::DisallowedArgument(arg)) => jsonrpc_error(
+            StatusCode::OK,
+            id,
+            -32602,
+            &format!("argument '{arg}' is disallowed for event '{event_name}'"),
+            None,
+        ),
+        Ok(PassthroughResolution::UpstreamAllowed) => {
+            forward_post_to_upstream(state, req_headers, Full::new(raw_body)).await
+        }
+        Ok(PassthroughResolution::NotFound) => jsonrpc_error(
+            StatusCode::OK,
+            id,
+            profile.not_found_code(),
+            &format!("event '{event_name}' not found"),
+            Some(json!({ "kind": "event" })),
+        ),
+        Err(err) => engine_error_response(id, profile, err),
+    }
+}
+
+async fn handle_mcp_post_local_only(
+    state: Arc<ServerState>,
+    req: Request<Incoming>,
+    caller: CallerAuth,
+) -> Response<RespBody> {
+    let profile = state.engine.config().profile;
+    let live_from_hdr = header_mentions_method(req.headers(), "events/subscribe");
+
     if !accepts_json_and_sse(req.headers()) {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
         return empty_response(StatusCode::NOT_ACCEPTABLE);
     }
 
@@ -575,6 +1060,9 @@ async fn handle_mcp_post(
             return empty_response(StatusCode::SERVICE_UNAVAILABLE);
         }
         Err(BodyReadError::Io(_)) => {
+            if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+                return auth_error_response(profile, None, err);
+            }
             return jsonrpc_error(
                 StatusCode::BAD_REQUEST,
                 Value::Null,
@@ -586,6 +1074,9 @@ async fn handle_mcp_post(
     };
 
     let Ok(text) = std::str::from_utf8(&raw_body) else {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
         return jsonrpc_error(
             StatusCode::BAD_REQUEST,
             Value::Null,
@@ -595,6 +1086,9 @@ async fn handle_mcp_post(
         );
     };
     let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
         return jsonrpc_error(
             StatusCode::BAD_REQUEST,
             Value::Null,
@@ -605,6 +1099,9 @@ async fn handle_mcp_post(
     };
 
     let Some(obj) = parsed.as_object() else {
+        if let Err(err) = state.engine.verify_caller(&caller, live_from_hdr).await {
+            return auth_error_response(profile, None, err);
+        }
         return jsonrpc_error(
             StatusCode::BAD_REQUEST,
             Value::Null,
@@ -613,6 +1110,13 @@ async fn handle_mcp_post(
             None,
         );
     };
+
+    let valid_id = obj.get("id").filter(|v| is_valid_jsonrpc_id(v)).cloned();
+    let live = obj.get("method").and_then(Value::as_str) == Some("events/subscribe");
+    if let Err(err) = state.engine.verify_caller(&caller, live).await {
+        return auth_error_response(profile, valid_id, err);
+    }
+
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return jsonrpc_error(
             StatusCode::BAD_REQUEST,
@@ -689,7 +1193,6 @@ fn classify_protocol(
     let proto_hdr = single_header_str(headers, "mcp-protocol-version");
     let method_hdr = single_header_str(headers, "mcp-method");
 
-    // Branch 1: `initialize` request without session id -> legacy handshake negotiation.
     if session_id.is_none() && is_request && method == "initialize" {
         match proto_hdr {
             HeaderExtract::Missing => {}
@@ -725,7 +1228,6 @@ fn classify_protocol(
         return Ok(ProtocolMode::LegacyHandshake);
     }
 
-    // Branch 2: request/notification carrying `Mcp-Session-Id` -> legacy session mode.
     if let Some(sid) = session_id {
         let protocol_version = match proto_hdr {
             HeaderExtract::Missing => None,
@@ -765,7 +1267,6 @@ fn classify_protocol(
         });
     }
 
-    // Branch 3: modern stateless mode.
     let hdr_ver = match proto_hdr {
         HeaderExtract::Single(v) if !v.is_empty() => v,
         _ => {
@@ -854,25 +1355,6 @@ async fn handle_initialize(
     };
     let profile = state.engine.config().profile;
 
-    if let Some(upstream) = state.engine.upstream_client() {
-        return match upstream
-            .forward_handshake(ctx.req_headers, ctx.raw_body, profile, None)
-            .await
-        {
-            Ok(hs) => {
-                let mut builder = Response::builder().status(hs.status);
-                if let Some(h) = builder.headers_mut() {
-                    *h = hs.headers;
-                }
-                builder
-                    .body(full_body(hs.body))
-                    .unwrap_or_else(|_| empty_response(StatusCode::BAD_GATEWAY))
-            }
-            Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
-            Err(_) => empty_response(StatusCode::BAD_GATEWAY),
-        };
-    }
-
     if matches!(mode, ProtocolMode::LegacySession { .. }) {
         return jsonrpc_error(
             StatusCode::BAD_REQUEST,
@@ -953,25 +1435,6 @@ async fn handle_server_discover(
         );
     }
     let profile = state.engine.config().profile;
-
-    if let Some(upstream) = state.engine.upstream_client() {
-        return match upstream
-            .forward_handshake(ctx.req_headers, ctx.raw_body, profile, None)
-            .await
-        {
-            Ok(hs) => {
-                let mut builder = Response::builder().status(hs.status);
-                if let Some(h) = builder.headers_mut() {
-                    *h = hs.headers;
-                }
-                builder
-                    .body(full_body(hs.body))
-                    .unwrap_or_else(|_| empty_response(StatusCode::BAD_GATEWAY))
-            }
-            Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
-            Err(_) => empty_response(StatusCode::BAD_GATEWAY),
-        };
-    }
 
     let mut caps = Map::new();
     caps.insert(
@@ -1088,74 +1551,11 @@ async fn handle_events_method(
         }
     };
 
-    if matches!(
-        method,
-        "events/poll" | "events/stream" | "events/subscribe" | "events/unsubscribe"
-    ) {
-        let params_obj = match params.and_then(Value::as_object) {
-            Some(o) => o,
-            None => {
-                return jsonrpc_error(
-                    StatusCode::OK,
-                    id,
-                    -32602,
-                    "params must be a JSON object",
-                    None,
-                );
-            }
-        };
-        let Some(event_name) = params_obj.get("name").and_then(Value::as_str) else {
-            return jsonrpc_error(
-                StatusCode::OK,
-                id,
-                -32602,
-                "params.name must be a string",
-                None,
-            );
-        };
-        let args_map = match params_obj.get("arguments") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(m)) => Some(m),
-            Some(_) => {
-                return jsonrpc_error(
-                    StatusCode::OK,
-                    id,
-                    -32602,
-                    "params.arguments must be an object",
-                    None,
-                );
-            }
-        };
-
-        let disallowed = state
-            .engine
-            .config()
-            .upstream
-            .as_ref()
-            .and_then(|u| u.expose_events.iter().find(|e| e.name == event_name))
-            .map(|e| e.disallow_arguments.as_slice())
-            .unwrap_or(&[]);
-
-        let input_schema = if req_headers
-            .keys()
-            .any(|name| name.as_str().starts_with("mcp-param-"))
-        {
-            match state.engine.routing_input_schema(event_name).await {
-                Ok(schema) => schema,
-                Err(err) => return engine_error_response(id, profile, err),
-            }
-        } else {
-            None
-        };
-        if let Err(msg) = validate_optional_event_routing_headers(
-            req_headers,
-            event_name,
-            args_map,
-            disallowed,
-            input_schema.as_ref(),
-        ) {
-            return jsonrpc_error(StatusCode::BAD_REQUEST, id, -32020, &msg, None);
-        }
+    if matches!(method, "events/subscribe" | "events/unsubscribe")
+        && let Err(resp) =
+            validate_event_params_and_routing_headers(&state, req_headers, &id, params).await
+    {
+        return resp;
     }
 
     match method {
@@ -1199,97 +1599,7 @@ async fn handle_events_method(
             }
         }
         "events/poll" | "events/stream" => {
-            if let CallerAuth::Delegated {
-                auth_ref,
-                header_scopes,
-            } = &caller
-                && let Some(auth_client) = state.engine.auth_client()
-            {
-                match auth_client.check_cached(auth_ref).await {
-                    AuthCheckOutcome::Active(checked) => {
-                        let effective = intersect_scopes(header_scopes, &checked.scopes);
-                        if checked.resource != auth_client.expected_resource()
-                            || checked.expires_at <= unix_now()
-                            || effective.is_empty()
-                        {
-                            return engine_error_response(
-                                id,
-                                profile,
-                                EngineError::Forbidden("delegated authorization rejected".into()),
-                            );
-                        }
-                    }
-                    AuthCheckOutcome::Inactive => {
-                        return engine_error_response(
-                            id,
-                            profile,
-                            EngineError::Forbidden("delegated authorization inactive".into()),
-                        );
-                    }
-                    AuthCheckOutcome::TransientError(msg) => {
-                        return engine_error_response(id, profile, EngineError::Internal(msg));
-                    }
-                }
-            }
-            let params_obj = params.and_then(Value::as_object).unwrap();
-            let event_name = params_obj.get("name").and_then(Value::as_str).unwrap();
-            let args_map = params_obj.get("arguments").and_then(Value::as_object);
-            match state
-                .engine
-                .resolve_event_for_passthrough(event_name, args_map)
-                .await
-            {
-                Ok(PassthroughResolution::NotFound) => jsonrpc_error(
-                    StatusCode::OK,
-                    id,
-                    profile.not_found_code(),
-                    &format!("event '{event_name}' not found"),
-                    Some(json!({ "kind": "event" })),
-                ),
-                Ok(PassthroughResolution::IngestUnsupported) => jsonrpc_error(
-                    StatusCode::OK,
-                    id,
-                    -32026,
-                    &format!("event '{event_name}' only supports webhook delivery"),
-                    None,
-                ),
-                Ok(PassthroughResolution::DisallowedArgument(arg)) => jsonrpc_error(
-                    StatusCode::OK,
-                    id,
-                    -32602,
-                    &format!("argument '{arg}' is disallowed for event '{event_name}'"),
-                    None,
-                ),
-                Ok(PassthroughResolution::UpstreamAllowed) => {
-                    let Some(upstream) = state.engine.upstream_client() else {
-                        return jsonrpc_error(
-                            StatusCode::OK,
-                            id,
-                            profile.not_found_code(),
-                            &format!("event '{event_name}' not found"),
-                            Some(json!({ "kind": "event" })),
-                        );
-                    };
-                    match upstream
-                        .forward_raw(
-                            Method::POST,
-                            None,
-                            req_headers,
-                            Full::new(raw_body),
-                            true,
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(resp) => {
-                            relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy))
-                        }
-                        Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
-                        Err(_) => empty_response(StatusCode::BAD_GATEWAY),
-                    }
-                }
-                Err(err) => engine_error_response(id, profile, err),
-            }
+            handle_upstream_events_passthrough(&state, req_headers, raw_body, id, params).await
         }
         "events/subscribe" => {
             let sub_req = match parse_subscribe_request(params.and_then(Value::as_object).unwrap())
@@ -1330,31 +1640,7 @@ async fn handle_other_method(
     ctx: RpcContext<'_>,
     mode: ProtocolMode,
 ) -> Response<RespBody> {
-    let RpcContext {
-        req_headers,
-        raw_body,
-        method,
-        req_id,
-        ..
-    } = ctx;
-    if let Some(upstream) = state.engine.upstream_client() {
-        return match upstream
-            .forward_raw(
-                Method::POST,
-                None,
-                req_headers,
-                Full::new(raw_body),
-                true,
-                None,
-            )
-            .await
-        {
-            Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
-            Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
-            Err(_) => empty_response(StatusCode::BAD_GATEWAY),
-        };
-    }
-
+    let RpcContext { method, req_id, .. } = ctx;
     let is_legacy = match &mode {
         ProtocolMode::LegacySession { session_id, .. } => {
             let alive = state
@@ -1559,6 +1845,13 @@ fn verify_bearer_token(headers: &HeaderMap, tokens: &[SecretString]) -> Option<u
     matched
 }
 
+fn is_valid_oauth_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+}
+
 fn extract_caller_auth(
     headers: &HeaderMap,
     token_slot: usize,
@@ -1575,14 +1868,57 @@ fn extract_caller_auth(
         HeaderExtract::Single(s) => s,
         _ => return Err(()),
     };
-    let header_scopes = scope_raw
-        .split_whitespace()
-        .map(ToOwned::to_owned)
-        .collect();
+    let mut header_scopes = Vec::new();
+    for tok in scope_raw.split_whitespace() {
+        if !is_valid_oauth_scope_token(tok) {
+            return Err(());
+        }
+        header_scopes.push(tok.to_owned());
+    }
     Ok(CallerAuth::Delegated {
         auth_ref,
         header_scopes,
     })
+}
+
+fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+    let mut saw_any = false;
+    for val in headers.get_all(header::CONTENT_ENCODING) {
+        saw_any = true;
+        let Ok(raw) = val.to_str() else {
+            return true;
+        };
+        let mut saw_token = false;
+        for tok in raw.split(',') {
+            let trimmed = tok.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            saw_token = true;
+            if !trimmed.eq_ignore_ascii_case("identity") {
+                return true;
+            }
+        }
+        if !saw_token {
+            return true;
+        }
+    }
+    let _ = saw_any;
+    false
+}
+
+fn header_mentions_method(headers: &HeaderMap, target: &str) -> bool {
+    headers
+        .get_all("mcp-method")
+        .iter()
+        .any(|v| v.to_str().ok().is_some_and(|s| s.trim() == target))
+}
+
+fn header_targets_intercepted_method(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("mcp-method")
+        .iter()
+        .any(|v| v.to_str().map_or(true, |s| is_intercepted_method(s.trim())))
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
@@ -1595,23 +1931,98 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         .is_some_and(|main| main.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn accepts_json_and_sse(headers: &HeaderMap) -> bool {
-    let mut has_json = false;
-    let mut has_sse = false;
+fn parse_qvalue_milli(raw: &str) -> Option<u16> {
+    if let Some(frac) = raw.strip_prefix("0.") {
+        if frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut val = 0u16;
+        let mut scale = 100u16;
+        for b in frac.bytes() {
+            val += u16::from(b - b'0') * scale;
+            scale /= 10;
+        }
+        Some(val)
+    } else if raw == "0" {
+        Some(0)
+    } else if raw == "1" {
+        Some(1000)
+    } else if let Some(zeros) = raw.strip_prefix("1.") {
+        (zeros.len() <= 3 && zeros.bytes().all(|b| b == b'0')).then_some(1000)
+    } else {
+        None
+    }
+}
+
+fn accepts_media_type(headers: &HeaderMap, target_type: &str, target_sub: &str) -> bool {
+    let mut best: Option<(u8, u16)> = None;
     for val in headers.get_all(header::ACCEPT) {
         let Ok(text) = val.to_str() else {
-            continue;
+            return false;
         };
         for item in text.split(',') {
-            let main = item.split(';').next().unwrap_or("").trim();
-            if main.eq_ignore_ascii_case("application/json") {
-                has_json = true;
-            } else if main.eq_ignore_ascii_case("text/event-stream") {
-                has_sse = true;
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
             }
+            let mut parts = item.split(';');
+            let media = parts.next().unwrap_or("").trim();
+            let Some((ty, sub)) = media.split_once('/') else {
+                return false;
+            };
+            let ty = ty.trim();
+            let sub = sub.trim();
+            if ty.is_empty() || sub.is_empty() {
+                return false;
+            }
+
+            let mut q_milli = 1000u16;
+            for param in parts {
+                let param = param.trim();
+                if param.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = param.split_once('=')
+                    && k.trim().eq_ignore_ascii_case("q")
+                {
+                    let Some(parsed_q) = parse_qvalue_milli(v.trim()) else {
+                        return false;
+                    };
+                    q_milli = parsed_q;
+                }
+            }
+
+            let specificity =
+                if ty.eq_ignore_ascii_case(target_type) && sub.eq_ignore_ascii_case(target_sub) {
+                    3u8
+                } else if ty.eq_ignore_ascii_case(target_type) && sub == "*" {
+                    2u8
+                } else if ty == "*" && sub == "*" {
+                    1u8
+                } else {
+                    continue;
+                };
+
+            best = Some(match best {
+                None => (specificity, q_milli),
+                Some((cur_spec, cur_q)) => {
+                    if specificity > cur_spec {
+                        (specificity, q_milli)
+                    } else if specificity == cur_spec {
+                        (cur_spec, cur_q.min(q_milli))
+                    } else {
+                        (cur_spec, cur_q)
+                    }
+                }
+            });
         }
     }
-    has_json && has_sse
+    best.is_some_and(|(_, q)| q > 0)
+}
+
+fn accepts_json_and_sse(headers: &HeaderMap) -> bool {
+    accepts_media_type(headers, "application", "json")
+        && accepts_media_type(headers, "text", "event-stream")
 }
 
 fn is_valid_jsonrpc_id(val: &Value) -> bool {
@@ -1622,11 +2033,757 @@ fn is_valid_jsonrpc_id(val: &Value) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum EscapeState {
+    None,
+    Backslash,
+    Unicode {
+        digits: u8,
+        value: u16,
+        high_surrogate: Option<u16>,
+    },
+    SurrogateBackslash(u16),
+    SurrogateU(u16),
+}
+
+struct StringCollector {
+    buf: Vec<u8>,
+    cap: usize,
+    overflowed: bool,
+    escape: EscapeState,
+}
+
+impl StringCollector {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+            overflowed: false,
+            escape: EscapeState::None,
+        }
+    }
+
+    fn push_byte(&mut self, b: u8) {
+        if self.overflowed {
+            return;
+        }
+        if self.buf.len() < self.cap {
+            self.buf.push(b);
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        if self.overflowed {
+            return;
+        }
+        let mut tmp = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut tmp).as_bytes();
+        if self.buf.len() + encoded.len() <= self.cap {
+            self.buf.extend_from_slice(encoded);
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn feed_byte(&mut self, b: u8) -> Result<bool, ()> {
+        match self.escape {
+            EscapeState::None => match b {
+                b'"' => Ok(true),
+                b'\\' => {
+                    self.escape = EscapeState::Backslash;
+                    Ok(false)
+                }
+                0x00..=0x1f => Err(()),
+                _ => {
+                    self.push_byte(b);
+                    Ok(false)
+                }
+            },
+            EscapeState::Backslash => {
+                let decoded = match b {
+                    b'"' => b'"',
+                    b'\\' => b'\\',
+                    b'/' => b'/',
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'u' => {
+                        self.escape = EscapeState::Unicode {
+                            digits: 0,
+                            value: 0,
+                            high_surrogate: None,
+                        };
+                        return Ok(false);
+                    }
+                    _ => return Err(()),
+                };
+                self.push_byte(decoded);
+                self.escape = EscapeState::None;
+                Ok(false)
+            }
+            EscapeState::Unicode {
+                digits,
+                value,
+                high_surrogate,
+            } => {
+                let nibble = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ => return Err(()),
+                };
+                let next_val = (value << 4) | u16::from(nibble);
+                if digits + 1 < 4 {
+                    self.escape = EscapeState::Unicode {
+                        digits: digits + 1,
+                        value: next_val,
+                        high_surrogate,
+                    };
+                    return Ok(false);
+                }
+                if let Some(hi) = high_surrogate {
+                    if !(0xdc00..=0xdfff).contains(&next_val) {
+                        return Err(());
+                    }
+                    let cp =
+                        0x10000 + ((u32::from(hi - 0xd800)) << 10) + u32::from(next_val - 0xdc00);
+                    let ch = char::from_u32(cp).ok_or(())?;
+                    self.push_char(ch);
+                    self.escape = EscapeState::None;
+                    Ok(false)
+                } else if (0xd800..=0xdbff).contains(&next_val) {
+                    self.escape = EscapeState::SurrogateBackslash(next_val);
+                    Ok(false)
+                } else if (0xdc00..=0xdfff).contains(&next_val) {
+                    Err(())
+                } else {
+                    let ch = char::from_u32(u32::from(next_val)).ok_or(())?;
+                    self.push_char(ch);
+                    self.escape = EscapeState::None;
+                    Ok(false)
+                }
+            }
+            EscapeState::SurrogateBackslash(hi) => {
+                if b == b'\\' {
+                    self.escape = EscapeState::SurrogateU(hi);
+                    Ok(false)
+                } else {
+                    Err(())
+                }
+            }
+            EscapeState::SurrogateU(hi) => {
+                if b == b'u' {
+                    self.escape = EscapeState::Unicode {
+                        digits: 0,
+                        value: 0,
+                        high_surrogate: Some(hi),
+                    };
+                    Ok(false)
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
+    fn take_string(&mut self) -> Result<Option<String>, ()> {
+        if self.overflowed {
+            self.buf.clear();
+            return Ok(None);
+        }
+        let bytes = std::mem::take(&mut self.buf);
+        let text = String::from_utf8(bytes).map_err(|_| ())?;
+        Ok(Some(text))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Depth1Key {
+    Method,
+    Id,
+    Other,
+}
+
+enum LexState {
+    Start,
+    ObjExpectKeyOrEnd,
+    ObjExpectKey,
+    ReadingKey(StringCollector),
+    ObjExpectColon(Depth1Key),
+    ObjExpectValue(Depth1Key),
+    ReadingMethod(StringCollector),
+    ReadingStringId(StringCollector),
+    ReadingNumberId(Vec<u8>),
+    SkippingString(StringCollector),
+    SkippingPrimitive,
+    SkippingNested {
+        stack: Vec<u8>,
+        in_string: Option<StringCollector>,
+    },
+    ObjExpectCommaOrEnd,
+    AfterRootObject,
+    PassthroughRoot,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanDecision {
+    NeedMore,
+    Passthrough,
+    Intercepted,
+    DuplicateMethod,
+    Malformed,
+}
+
+/// Zero-AST depth-1 JSON lexical scanner for streaming MCP POST classification.
+struct TopLevelJsonScanner {
+    state: LexState,
+    saw_method_key: bool,
+    intercepted_method: bool,
+    non_string_method: bool,
+    duplicate_method: bool,
+    passthrough_ready: bool,
+    captured_id: Option<Value>,
+}
+
+impl TopLevelJsonScanner {
+    fn new() -> Self {
+        Self {
+            state: LexState::Start,
+            saw_method_key: false,
+            intercepted_method: false,
+            non_string_method: false,
+            duplicate_method: false,
+            passthrough_ready: false,
+            captured_id: None,
+        }
+    }
+
+    fn captured_id(&self) -> Option<Value> {
+        self.captured_id.clone()
+    }
+
+    fn feed_chunk(&mut self, chunk: &[u8]) -> ScanDecision {
+        let mut idx = 0usize;
+        while idx < chunk.len() {
+            let b = chunk[idx];
+            idx += 1;
+            self.step_byte(b);
+            if matches!(self.state, LexState::Malformed) {
+                return ScanDecision::Malformed;
+            }
+            if self.duplicate_method {
+                return ScanDecision::DuplicateMethod;
+            }
+            if matches!(self.state, LexState::PassthroughRoot) {
+                return ScanDecision::Passthrough;
+            }
+        }
+        if self.passthrough_ready {
+            ScanDecision::Passthrough
+        } else if self.intercepted_method {
+            ScanDecision::Intercepted
+        } else {
+            ScanDecision::NeedMore
+        }
+    }
+
+    fn finish_eof(&mut self) -> ScanDecision {
+        if let LexState::ReadingNumberId(buf) = &mut self.state {
+            let bytes = std::mem::take(buf);
+            self.finish_number_id(&bytes);
+            self.state = LexState::Malformed;
+            return ScanDecision::Malformed;
+        }
+        if self.duplicate_method {
+            return ScanDecision::DuplicateMethod;
+        }
+        match self.state {
+            LexState::PassthroughRoot => ScanDecision::Passthrough,
+            LexState::AfterRootObject => {
+                if self.passthrough_ready || !self.saw_method_key {
+                    ScanDecision::Passthrough
+                } else {
+                    ScanDecision::Intercepted
+                }
+            }
+            _ => ScanDecision::Malformed,
+        }
+    }
+
+    fn finish_number_id(&mut self, bytes: &[u8]) {
+        if self.captured_id.is_none()
+            && bytes.len() <= 32
+            && let Ok(s) = std::str::from_utf8(bytes)
+            && let Ok(val) = serde_json::from_str::<Value>(s)
+            && is_valid_jsonrpc_id(&val)
+        {
+            self.captured_id = Some(val);
+        }
+    }
+
+    fn step_byte(&mut self, b: u8) {
+        loop {
+            match &mut self.state {
+                LexState::Start => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b'[' => {
+                            self.passthrough_ready = true;
+                            self.state = LexState::PassthroughRoot;
+                        }
+                        b'{' => {
+                            self.state = LexState::ObjExpectKeyOrEnd;
+                        }
+                        _ => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::ObjExpectKeyOrEnd => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b'}' => {
+                            if !self.saw_method_key {
+                                self.passthrough_ready = true;
+                            }
+                            self.state = LexState::AfterRootObject;
+                        }
+                        b'"' => {
+                            self.state = LexState::ReadingKey(StringCollector::new(32));
+                        }
+                        _ => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::ObjExpectKey => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    if b == b'"' {
+                        self.state = LexState::ReadingKey(StringCollector::new(32));
+                    } else {
+                        self.state = LexState::Malformed;
+                    }
+                    return;
+                }
+                LexState::ReadingKey(collector) => {
+                    match collector.feed_byte(b) {
+                        Ok(false) => {}
+                        Ok(true) => match collector.take_string() {
+                            Ok(Some(k)) if k == "method" => {
+                                if self.saw_method_key {
+                                    self.duplicate_method = true;
+                                }
+                                self.saw_method_key = true;
+                                self.state = LexState::ObjExpectColon(Depth1Key::Method);
+                            }
+                            Ok(Some(k)) if k == "id" => {
+                                self.state = LexState::ObjExpectColon(Depth1Key::Id);
+                            }
+                            Ok(_) => {
+                                self.state = LexState::ObjExpectColon(Depth1Key::Other);
+                            }
+                            Err(()) => {
+                                self.state = LexState::Malformed;
+                            }
+                        },
+                        Err(()) => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::ObjExpectColon(key) => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    let key = *key;
+                    if b == b':' {
+                        self.state = LexState::ObjExpectValue(key);
+                    } else {
+                        self.state = LexState::Malformed;
+                    }
+                    return;
+                }
+                LexState::ObjExpectValue(key) => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    let key = *key;
+                    match (key, b) {
+                        (Depth1Key::Method, b'"') => {
+                            self.state = LexState::ReadingMethod(StringCollector::new(64));
+                        }
+                        (Depth1Key::Method, _) => {
+                            self.non_string_method = true;
+                            self.enter_skip_value(b);
+                        }
+                        (Depth1Key::Id, b'"') if self.captured_id.is_none() => {
+                            self.state = LexState::ReadingStringId(StringCollector::new(256));
+                        }
+                        (Depth1Key::Id, b'-' | b'0'..=b'9') if self.captured_id.is_none() => {
+                            let mut num = Vec::with_capacity(16);
+                            num.push(b);
+                            self.state = LexState::ReadingNumberId(num);
+                        }
+                        (_, first) => {
+                            self.enter_skip_value(first);
+                        }
+                    }
+                    return;
+                }
+                LexState::ReadingMethod(collector) => {
+                    match collector.feed_byte(b) {
+                        Ok(false) => {}
+                        Ok(true) => match collector.take_string() {
+                            Ok(Some(m)) if is_intercepted_method(&m) => {
+                                self.intercepted_method = true;
+                                self.state = LexState::ObjExpectCommaOrEnd;
+                            }
+                            Ok(_) => {
+                                self.passthrough_ready = true;
+                                self.state = LexState::ObjExpectCommaOrEnd;
+                            }
+                            Err(()) => {
+                                self.state = LexState::Malformed;
+                            }
+                        },
+                        Err(()) => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::ReadingStringId(collector) => {
+                    match collector.feed_byte(b) {
+                        Ok(false) => {}
+                        Ok(true) => match collector.take_string() {
+                            Ok(Some(id_str)) => {
+                                self.captured_id = Some(Value::String(id_str));
+                                self.state = LexState::ObjExpectCommaOrEnd;
+                            }
+                            Ok(None) => {
+                                self.state = LexState::ObjExpectCommaOrEnd;
+                            }
+                            Err(()) => {
+                                self.state = LexState::Malformed;
+                            }
+                        },
+                        Err(()) => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::ReadingNumberId(buf) => {
+                    if matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E') {
+                        if buf.len() <= 32 {
+                            buf.push(b);
+                        }
+                        return;
+                    }
+                    if is_json_ws(b) || b == b',' || b == b'}' {
+                        let bytes = std::mem::take(buf);
+                        self.finish_number_id(&bytes);
+                        self.state = LexState::ObjExpectCommaOrEnd;
+                        continue;
+                    }
+                    self.state = LexState::Malformed;
+                    return;
+                }
+                LexState::SkippingString(collector) => {
+                    match collector.feed_byte(b) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            self.state = LexState::ObjExpectCommaOrEnd;
+                        }
+                        Err(()) => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::SkippingPrimitive => {
+                    if matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'+' | b'-' | b'.') {
+                        return;
+                    }
+                    if is_json_ws(b) || b == b',' || b == b'}' {
+                        self.state = LexState::ObjExpectCommaOrEnd;
+                        continue;
+                    }
+                    self.state = LexState::Malformed;
+                    return;
+                }
+                LexState::SkippingNested { stack, in_string } => {
+                    if let Some(sc) = in_string {
+                        match sc.feed_byte(b) {
+                            Ok(false) => {}
+                            Ok(true) => *in_string = None,
+                            Err(()) => self.state = LexState::Malformed,
+                        }
+                        return;
+                    }
+                    match b {
+                        b'"' => {
+                            *in_string = Some(StringCollector::new(0));
+                        }
+                        b'{' => {
+                            if stack.len() >= MAX_JSON_SCAN_NESTING {
+                                self.state = LexState::Malformed;
+                            } else {
+                                stack.push(b'}');
+                            }
+                        }
+                        b'[' => {
+                            if stack.len() >= MAX_JSON_SCAN_NESTING {
+                                self.state = LexState::Malformed;
+                            } else {
+                                stack.push(b']');
+                            }
+                        }
+                        b'}' | b']' => {
+                            if stack.pop() != Some(b) {
+                                self.state = LexState::Malformed;
+                            } else if stack.is_empty() {
+                                self.state = LexState::ObjExpectCommaOrEnd;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                LexState::ObjExpectCommaOrEnd => {
+                    if is_json_ws(b) {
+                        return;
+                    }
+                    match b {
+                        b',' => {
+                            if self.passthrough_ready && self.captured_id.is_some() {
+                                self.state = LexState::PassthroughRoot;
+                            } else {
+                                self.state = LexState::ObjExpectKey;
+                            }
+                        }
+                        b'}' => {
+                            if !self.saw_method_key {
+                                self.passthrough_ready = true;
+                            }
+                            self.state = LexState::AfterRootObject;
+                        }
+                        _ => {
+                            self.state = LexState::Malformed;
+                        }
+                    }
+                    return;
+                }
+                LexState::AfterRootObject => {
+                    if !is_json_ws(b) {
+                        self.state = LexState::Malformed;
+                    }
+                    return;
+                }
+                LexState::PassthroughRoot | LexState::Malformed => return,
+            }
+        }
+    }
+
+    fn enter_skip_value(&mut self, first: u8) {
+        match first {
+            b'"' => {
+                self.state = LexState::SkippingString(StringCollector::new(0));
+            }
+            b'{' => {
+                self.state = LexState::SkippingNested {
+                    stack: vec![b'}'],
+                    in_string: None,
+                };
+            }
+            b'[' => {
+                self.state = LexState::SkippingNested {
+                    stack: vec![b']'],
+                    in_string: None,
+                };
+            }
+            b't' | b'f' | b'n' | b'-' | b'0'..=b'9' => {
+                self.state = LexState::SkippingPrimitive;
+            }
+            _ => {
+                self.state = LexState::Malformed;
+            }
+        }
+    }
+}
+
+fn is_json_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+enum ScannedPostBody<B> {
+    PassthroughStream {
+        prefix: Bytes,
+        rest: B,
+        eof: bool,
+        captured_id: Option<Value>,
+    },
+    Buffered(Bytes),
+    DuplicateMethod {
+        captured_id: Option<Value>,
+    },
+    Malformed {
+        captured_id: Option<Value>,
+    },
+}
+
+#[derive(Debug)]
 enum BodyReadError {
     TooLarge,
     Timeout,
     BudgetExhausted,
     Io(String),
+}
+
+fn append_leased_chunk(
+    out: &mut LeasedBuffer,
+    chunk: &[u8],
+    limit: usize,
+    pools: &MemoryPools,
+    prefer_control: bool,
+    allow_control_fallback: bool,
+    using_control: &mut bool,
+) -> Result<(), BodyReadError> {
+    let next_len = out.len() + chunk.len();
+    if next_len > limit {
+        return Err(BodyReadError::TooLarge);
+    }
+    if *using_control && !prefer_control && next_len > CONTROL_FALLBACK_MAX_BYTES {
+        return Err(BodyReadError::BudgetExhausted);
+    }
+    if !out
+        .try_extend(chunk)
+        .map_err(|err| BodyReadError::Io(err.to_string()))?
+    {
+        if allow_control_fallback
+            && !*using_control
+            && next_len <= CONTROL_FALLBACK_MAX_BYTES
+            && let Some(ctrl_lease) = pools.control.try_acquire(next_len.max(out.capacity()))
+        {
+            out.replace_lease(ctrl_lease);
+            *using_control = true;
+            if !out
+                .try_extend(chunk)
+                .map_err(|err| BodyReadError::Io(err.to_string()))?
+            {
+                return Err(BodyReadError::BudgetExhausted);
+            }
+        } else {
+            return Err(BodyReadError::BudgetExhausted);
+        }
+    }
+    Ok(())
+}
+
+async fn scan_or_buffer_json_body<B>(
+    mut body: B,
+    limit: usize,
+    pools: &MemoryPools,
+    prefer_control: bool,
+) -> Result<ScannedPostBody<B>, BodyReadError>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let lease = if prefer_control {
+        pools
+            .control
+            .try_acquire(0)
+            .ok_or(BodyReadError::BudgetExhausted)?
+    } else {
+        pools
+            .proxy
+            .try_acquire(0)
+            .ok_or(BodyReadError::BudgetExhausted)?
+    };
+    let mut using_control = prefer_control;
+
+    let scan_fut = async {
+        let mut out = LeasedBuffer::new(lease);
+        let mut scanner = TopLevelJsonScanner::new();
+
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
+            if let Ok(chunk) = frame.into_data() {
+                if chunk.is_empty() {
+                    continue;
+                }
+                append_leased_chunk(
+                    &mut out,
+                    &chunk,
+                    limit,
+                    pools,
+                    prefer_control,
+                    true,
+                    &mut using_control,
+                )?;
+
+                match scanner.feed_chunk(&chunk) {
+                    ScanDecision::Passthrough => {
+                        let eof = body.is_end_stream();
+                        return Ok(ScannedPostBody::PassthroughStream {
+                            prefix: out.into_bytes(),
+                            rest: body,
+                            eof,
+                            captured_id: scanner.captured_id(),
+                        });
+                    }
+                    ScanDecision::DuplicateMethod => {
+                        return Ok(ScannedPostBody::DuplicateMethod {
+                            captured_id: scanner.captured_id(),
+                        });
+                    }
+                    ScanDecision::Malformed => {
+                        return Ok(ScannedPostBody::Malformed {
+                            captured_id: scanner.captured_id(),
+                        });
+                    }
+                    ScanDecision::NeedMore | ScanDecision::Intercepted => {}
+                }
+            }
+        }
+
+        match scanner.finish_eof() {
+            ScanDecision::Passthrough => Ok(ScannedPostBody::PassthroughStream {
+                prefix: out.into_bytes(),
+                rest: body,
+                eof: true,
+                captured_id: scanner.captured_id(),
+            }),
+            ScanDecision::DuplicateMethod => Ok(ScannedPostBody::DuplicateMethod {
+                captured_id: scanner.captured_id(),
+            }),
+            ScanDecision::Malformed => Ok(ScannedPostBody::Malformed {
+                captured_id: scanner.captured_id(),
+            }),
+            ScanDecision::Intercepted | ScanDecision::NeedMore => {
+                Ok(ScannedPostBody::Buffered(out.into_bytes()))
+            }
+        }
+    };
+
+    tokio::time::timeout(BODY_READ_TIMEOUT, scan_fut)
+        .await
+        .map_err(|_| BodyReadError::Timeout)?
 }
 
 async fn read_request_body_leased<B>(
@@ -1658,35 +2815,15 @@ where
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
             if let Ok(chunk) = frame.into_data() {
-                let next_len = out.len() + chunk.len();
-                if next_len > limit {
-                    return Err(BodyReadError::TooLarge);
-                }
-                if using_control && !prefer_control && next_len > CONTROL_FALLBACK_MAX_BYTES {
-                    return Err(BodyReadError::BudgetExhausted);
-                }
-                if !out
-                    .try_extend(&chunk)
-                    .map_err(|err| BodyReadError::Io(err.to_string()))?
-                {
-                    if allow_control_fallback
-                        && !using_control
-                        && next_len <= CONTROL_FALLBACK_MAX_BYTES
-                        && let Some(ctrl_lease) =
-                            pools.control.try_acquire(next_len.max(out.capacity()))
-                    {
-                        out.replace_lease(ctrl_lease);
-                        using_control = true;
-                        if !out
-                            .try_extend(&chunk)
-                            .map_err(|err| BodyReadError::Io(err.to_string()))?
-                        {
-                            return Err(BodyReadError::BudgetExhausted);
-                        }
-                    } else {
-                        return Err(BodyReadError::BudgetExhausted);
-                    }
-                }
+                append_leased_chunk(
+                    &mut out,
+                    &chunk,
+                    limit,
+                    pools,
+                    prefer_control,
+                    allow_control_fallback,
+                    &mut using_control,
+                )?;
             }
         }
         Ok(out.into_bytes())
@@ -1719,7 +2856,87 @@ fn attach_result_type(val: &mut Value, modern: bool) {
     }
 }
 
+fn auth_error_response(
+    profile: Profile,
+    req_id: Option<Value>,
+    err: EngineError,
+) -> Response<RespBody> {
+    match err {
+        EngineError::InvalidToken(msg) => {
+            let www = HeaderValue::from_static(r#"Bearer error="invalid_token""#);
+            match req_id {
+                Some(id) => {
+                    let mut resp = jsonrpc_error(
+                        StatusCode::UNAUTHORIZED,
+                        id,
+                        profile.forbidden_code(),
+                        &msg,
+                        None,
+                    );
+                    resp.headers_mut().insert(header::WWW_AUTHENTICATE, www);
+                    resp
+                }
+                None => {
+                    let mut resp = empty_response(StatusCode::UNAUTHORIZED);
+                    resp.headers_mut().insert(header::WWW_AUTHENTICATE, www);
+                    resp
+                }
+            }
+        }
+        EngineError::InsufficientScope {
+            required_scopes,
+            message,
+        } => {
+            let www_text = if required_scopes.is_empty() {
+                r#"Bearer error="insufficient_scope""#.to_owned()
+            } else {
+                format!(
+                    r#"Bearer error="insufficient_scope", scope="{}""#,
+                    required_scopes.join(" ")
+                )
+            };
+            let www = HeaderValue::from_str(&www_text).unwrap_or_else(|_| {
+                HeaderValue::from_static(r#"Bearer error="insufficient_scope""#)
+            });
+            match req_id {
+                Some(id) => {
+                    let mut resp = jsonrpc_error(
+                        StatusCode::FORBIDDEN,
+                        id,
+                        profile.forbidden_code(),
+                        &message,
+                        None,
+                    );
+                    resp.headers_mut().insert(header::WWW_AUTHENTICATE, www);
+                    resp
+                }
+                None => {
+                    let mut resp = empty_response(StatusCode::FORBIDDEN);
+                    resp.headers_mut().insert(header::WWW_AUTHENTICATE, www);
+                    resp
+                }
+            }
+        }
+        EngineError::AuthUnavailable(msg) => match req_id {
+            Some(id) => jsonrpc_error(StatusCode::SERVICE_UNAVAILABLE, id, -32603, &msg, None),
+            None => empty_response(StatusCode::SERVICE_UNAVAILABLE),
+        },
+        other => match req_id {
+            Some(id) => engine_error_response(id, profile, other),
+            None => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        },
+    }
+}
+
 fn engine_error_response(id: Value, profile: Profile, err: EngineError) -> Response<RespBody> {
+    if matches!(
+        err,
+        EngineError::InvalidToken(_)
+            | EngineError::InsufficientScope { .. }
+            | EngineError::AuthUnavailable(_)
+    ) {
+        return auth_error_response(profile, Some(id), err);
+    }
     let code = err.to_jsonrpc_code(profile);
     let data = err.error_data();
     let msg = err.to_string();
@@ -1829,6 +3046,10 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
             Poll::Ready(self.0.pop_front().map(|chunk| Ok(Frame::data(chunk))))
         }
+
+        fn is_end_stream(&self) -> bool {
+            self.0.is_empty()
+        }
     }
 
     #[tokio::test]
@@ -1863,5 +3084,106 @@ mod tests {
         assert_eq!(pools.control.used(), retained.len());
         drop(retained);
         assert_eq!(pools.control.used(), 0);
+    }
+
+    #[test]
+    fn accept_header_handles_wildcards_and_q_zero_exclusions() {
+        let check = |raw: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, raw.parse().unwrap());
+            accepts_json_and_sse(&h)
+        };
+        assert!(check("application/json, text/event-stream"));
+        assert!(check("*/*"));
+        assert!(check("application/*, text/*"));
+        assert!(check("application/json;q=0.5, text/event-stream;q=1.0"));
+        assert!(check("*/*;q=0.1, application/json;q=0.8"));
+
+        assert!(!check("application/json"));
+        assert!(!check("text/event-stream"));
+        assert!(!check("*/*, text/event-stream;q=0"));
+        assert!(!check("*/*, application/*;q=0"));
+        assert!(!check(
+            "application/*, application/json;q=0.000, text/event-stream"
+        ));
+        assert!(!check(
+            "application/json, application/json;q=0, text/event-stream"
+        ));
+        assert!(!check("*/*;q=0"));
+    }
+
+    #[test]
+    fn depth1_scanner_classifies_across_arbitrary_byte_splits_and_unicode_escapes() {
+        let escaped_intercept =
+            br#"{"params":{"nested":{"method":"tools/call"},"pad":"xyz"},"\u006dethod":"events\u002fpoll","id":99}"#;
+        for step in [1usize, 2, 3, 7, 19] {
+            let mut s = TopLevelJsonScanner::new();
+            let mut dec = ScanDecision::NeedMore;
+            for chunk in escaped_intercept.chunks(step) {
+                dec = s.feed_chunk(chunk);
+            }
+            if dec == ScanDecision::NeedMore {
+                dec = s.finish_eof();
+            }
+            assert_eq!(dec, ScanDecision::Intercepted, "step {step}");
+            assert_eq!(s.captured_id(), Some(json!(99)));
+        }
+
+        // JSON-RPC client response (no method) streams after root object closes.
+        let client_resp = br#"{"jsonrpc":"2.0","id":"srv_1","result":{"sampling":"ok"}}"#;
+        for step in [1usize, 5, 13] {
+            let mut s = TopLevelJsonScanner::new();
+            let mut dec = ScanDecision::NeedMore;
+            for chunk in client_resp.chunks(step) {
+                dec = s.feed_chunk(chunk);
+                if dec == ScanDecision::Passthrough {
+                    break;
+                }
+            }
+            if dec == ScanDecision::NeedMore {
+                dec = s.finish_eof();
+            }
+            assert_eq!(dec, ScanDecision::Passthrough, "step {step}");
+            assert_eq!(s.captured_id(), Some(json!("srv_1")));
+        }
+
+        // Batch array stops on the opening '['.
+        let mut batch = TopLevelJsonScanner::new();
+        assert_eq!(batch.feed_chunk(b" [ {}"), ScanDecision::Passthrough);
+
+        // Duplicate depth-1 method key is rejected.
+        let dup = br#"{"jsonrpc":"2.0","id":1,"method":"events/list","method":"tools/call"}"#;
+        let mut dup_s = TopLevelJsonScanner::new();
+        assert_eq!(dup_s.feed_chunk(dup), ScanDecision::DuplicateMethod);
+    }
+
+    #[tokio::test]
+    async fn streaming_scanner_stops_buffering_immediately_on_non_local_method() {
+        let pools = MemoryPools::from_quotas(&QuotaConfig::default());
+        let chunk1 = Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"blob":""#,
+        );
+        let chunk2 = Bytes::from(vec![b'x'; 256 * 1024]);
+        let chunk3 = Bytes::from_static(br#""}}"#);
+        let incoming = Chunks([chunk1.clone(), chunk2, chunk3].into());
+
+        let res = scan_or_buffer_json_body(incoming, MAX_REQUEST_BODY_BYTES, &pools, false)
+            .await
+            .unwrap();
+        match res {
+            ScannedPostBody::PassthroughStream {
+                prefix,
+                mut rest,
+                eof,
+                captured_id,
+            } => {
+                assert!(!eof);
+                assert_eq!(prefix, chunk1);
+                assert_eq!(captured_id, Some(json!(7)));
+                let rem1 = rest.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(rem1.len(), 256 * 1024);
+            }
+            _ => panic!("expected early PassthroughStream"),
+        }
     }
 }

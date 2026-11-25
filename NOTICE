@@ -1,0 +1,259 @@
+mcp-hookd
+Copyright 2026 The mcp-hookd Contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+Binary distributions statically link Rust crates from crates.io across Linux
+(musl), macOS, Windows, and FreeBSD targets. This file reproduces the copyright
+and license notices required by those third-party components.
+
+================================================================================
+1. Apache-2.0 and Dual/Multi-Licensed Crates Elected Under Apache-2.0
+================================================================================
+
+For crates distributed under dual or multi-license terms that offer the Apache
+License, Version 2.0 ("Apache-2.0 OR MIT", "MIT OR Apache-2.0", "Apache-2.0 OR
+ISC OR MIT", "Apache-2.0 OR BSL-1.0", "BSD-2-Clause OR Apache-2.0 OR MIT", and
+"(MIT OR Apache-2.0) AND Unicode-3.0"), mcp-hookd elects the Apache License,
+Version 2.0 (full text in LICENSE).
+
+Included crates in this category include:
+  ahash, allocator-api2, anstream, anstyle, anstyle-parse, anstyle-query,
+  anstyle-wincon, atomic-waker, base64, bit-set, bit-vec, bitflags,
+  block-buffer, bytecount, cfg-if, clap, clap_builder, clap_lex, colorchoice,
+  const-oid, core-foundation, core-foundation-sys, cpufeatures, crypto-common,
+  digest, email_address, equivalent, errno, form_urlencoded, fraction,
+  futures-channel, futures-core, futures-sink, futures-task, futures-util,
+  getrandom, hashbrown, heck, http, httparse, httpdate, hybrid-array,
+  hyper-rustls, idna, idna_adapter, is_terminal_polyfill, itoa, libc, lock_api,
+  num, num-bigint, num-cmp, num-complex, num-integer, num-iter, num-rational,
+  num-traits, once_cell, once_cell_polyfill, openssl-probe, parking_lot,
+  parking_lot_core, percent-encoding, pin-project-lite, ref-cast, regex,
+  regex-automata, regex-syntax, rustls, rustls-native-certs, rustls-pki-types,
+  ryu-js, scopeguard, security-framework, security-framework-sys, serde,
+  serde_core, serde_json, sha2, signal-hook-registry, smallvec, socket2,
+  stable_deref_trait, tokio-rustls, typenum, unicode-general-category,
+  unicode-ident, url, utf8_iter, utf8parse, utf_types, windows-link,
+  windows-sys, windows-targets, windows_aarch64_msvc, windows_x86_64_msvc,
+  zerocopy, and zeroize.
+
+Additional third-party notice from atomic-waker:
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+  Licensed under the Apache License, Version 2.0 or the MIT License.
+
+================================================================================
+2. ring (Apache-2.0 AND ISC, with BoringSSL / OpenSSL / Fiat-Crypto Notices)
+================================================================================
+
+Crate: ring 0.17.x (https://github.com/briansmith/ring)
+
+ring combines original code under an ISC-style license, code derived from
+BoringSSL and the OpenSSL project under the Apache License, Version 2.0 and ISC
+terms, code from fiat-crypto under the Apache License, Version 2.0, and polyfill
+code from once_cell under Apache-2.0 OR MIT:
+
+  Copyright 2015-2025 Brian Smith.
+  Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
+  Written by Andy Polyakov <appro@openssl.org> for the OpenSSL project.
+  Adapted for Linux kernel by Ard Biesheuvel of Linaro.
+  Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2015, Intel Inc.
+  Copyright 2015-2020 the fiat-crypto authors.
+  Copyright (c) Google Inc. (BoringSSL Authors).
+
+ISC license notice for ring (LICENSE-other-bits):
+
+  Copyright 2015-2025 Brian Smith.
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+  SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+  OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+  CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+BoringSSL portions are licensed under the Apache License, Version 2.0 (see
+LICENSE). BoringSSL also notes that test-only support code and build scripts in
+its repository carry Go Authors and Chromium Authors 3-clause BSD notices, which
+are not linked into compiled binaries.
+
+================================================================================
+3. ISC-Licensed Crates (rustls-webpki, untrusted)
+================================================================================
+
+Crate: rustls-webpki 0.103.x (https://github.com/rustls/webpki)
+  Copyright 2015 Brian Smith.
+
+Crate: untrusted 0.9.x (https://github.com/briansmith/untrusted)
+  Copyright 2015-2016 Brian Smith.
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+4. BSD-3-Clause Crate (subtle)
+================================================================================
+
+Crate: subtle 2.6.x (https://github.com/dalek-cryptography/subtle)
+
+  Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+  Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are
+  met:
+
+  1. Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
+
+  3. Neither the name of the copyright holder nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+  IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+  TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+  PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+  HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+  TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+  PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+5. Unicode-3.0 Crates (ICU4X and unicode-ident)
+================================================================================
+
+Crates:
+  icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data,
+  icu_properties, icu_properties_data, icu_provider, litemap, potential_utf,
+  tinystr, unicode-ident, writeable, yoke, zerofrom, zerotrie, zerovec
+
+  UNICODE LICENSE V3
+
+  COPYRIGHT AND PERMISSION NOTICE
+
+  Copyright (c) 1991-2024 Unicode, Inc.
+  Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
+  ICU 1.8.1 to ICU 57.1 (c) 1995-2016 International Business Machines
+  Corporation and others.
+
+  NOTICE TO USER: Carefully read the following legal agreement. BY
+  DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+  SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+  TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+  DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+  Permission is hereby granted, free of charge, to any person obtaining a
+  copy of data files and any associated documentation (the "Data Files") or
+  software and any associated documentation (the "Software") to deal in the
+  Data Files or Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, and/or sell
+  copies of the Data Files or Software, and to permit persons to whom the
+  Data Files or Software are furnished to do so, provided that either (a)
+  this copyright and permission notice appear with all copies of the Data
+  Files or Software, or (b) this copyright and permission notice appear in
+  associated Documentation.
+
+  THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+  KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+  THIRD PARTY RIGHTS.
+
+  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+  BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+  OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+  WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+  ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+  FILES OR SOFTWARE.
+
+  Except as contained in this notice, the name of a copyright holder shall
+  not be used in advertising or otherwise to promote the sale, use or other
+  dealings in these Data Files or Software without prior written
+  authorization of the copyright holder.
+
+================================================================================
+6. MIT, MIT-0, Unlicense/MIT, and Zlib Crates
+================================================================================
+
+MIT-licensed crates (including Unlicense OR MIT crates elected under MIT):
+  - aho-corasick, memchr: Copyright (c) Andrew Gallant
+  - bytes, slab: Copyright (c) 2018-2019 Carl Lerche
+  - data-encoding: Copyright (c) 2015-2020 Julien Cretin; Copyright (c) 2017-2020 Google Inc.
+  - fancy-regex: Copyright 2015 The Fancy Regex Authors
+  - fluent-uri: Copyright (c) 2024 Scallop Ye
+  - http-body, http-body-util: Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+  - hyper, hyper-util, try-lock, want: Copyright (c) 2014-2026 Sean McArthur; Copyright (c) 2016 Alex Crichton
+  - jsonschema, jsonschema-regex, jsonschema-value, referencing: Copyright (c) 2020-2026 Dmitry Dygalo
+  - micromap: Copyright (c) 2023-2026 Yegor Bugayenko
+  - mio: Copyright (c) 2014 Carl Lerche and other MIO contributors
+  - outref, uuid-simd, vsimd: Copyright (c) 2022 Nugine
+  - schannel: Copyright (c) 2015 steffengy
+  - serde_json_canonicalizer: Copyright (c) 2023 Attila Mravik
+  - strsim: Copyright (c) 2015 Danny Guo; Copyright (c) 2016 Titus Wormer; Copyright (c) 2018 Akash Kurdekar
+  - strum: Copyright (c) 2019 Peter Glotfelty
+  - synstructure: Copyright 2016 Nika Layzell
+  - tokio, tokio-util, tracing, tracing-core: Copyright (c) Tokio Contributors; spin portion Copyright (c) 2014 Mathijs van de Nes
+  - tower-service: Copyright (c) 2019-2021 Tower Contributors
+  - zmij: Copyright (c) David Tolnay and zmij contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+MIT-0 crate (borrow-or-share 0.2.x):
+  Copyright 2024 Scallop Ye
+  Licensed under the MIT No Attribution License (MIT-0).
+
+Zlib crate (foldhash 0.2.x):
+  Copyright (c) 2024 Orson Peters
+
+  This software is provided 'as-is', without any express or implied warranty.
+  In no event will the authors be held liable for any damages arising from the
+  use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not claim
+     that you wrote the original software. If you use this software in a
+     product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.

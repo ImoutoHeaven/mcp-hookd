@@ -19,6 +19,7 @@ pub const DEFAULT_REVERIFY_SECS: u64 = 15;
 pub const MIN_REVERIFY_SECS: u64 = 5;
 pub const MAX_REVERIFY_SECS: u64 = 300;
 pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 300;
+pub const MIN_TOKEN_LEN: usize = 16;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -364,7 +365,7 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
     let mut inbound_tokens = Vec::with_capacity(raw.inbound_tokens.len());
     for (i, tok) in raw.inbound_tokens.iter().enumerate() {
         let field = format!("inbound_tokens[{i}]");
-        validate_visible_ascii_token(&field, tok, 1)?;
+        validate_visible_ascii_token(&field, tok, MIN_TOKEN_LEN)?;
         inbound_tokens.push(SecretString::new(tok.clone()));
     }
 
@@ -386,6 +387,12 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
 
     let auth_context = match raw.auth_context {
         Some(ac) => {
+            if !listen.ip().is_loopback() {
+                return Err(
+                    "auth_context requires listen address to be loopback (127.0.0.0/8 or [::1])"
+                        .into(),
+                );
+            }
             if !(MIN_REVERIFY_SECS..=MAX_REVERIFY_SECS).contains(&ac.reverify_secs) {
                 return Err(format!(
                     "auth_context.reverify_secs: must be in {MIN_REVERIFY_SECS}..={MAX_REVERIFY_SECS}"
@@ -397,7 +404,11 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
             validate_check_url(&check_url)?;
 
             let check_token_str = ac.check_token;
-            validate_visible_ascii_token("auth_context.check_token", &check_token_str, 16)?;
+            validate_visible_ascii_token(
+                "auth_context.check_token",
+                &check_token_str,
+                MIN_TOKEN_LEN,
+            )?;
 
             let expected_resource = ac.expected_resource;
             if expected_resource.is_empty() {
@@ -429,7 +440,7 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
             }
             let bearer_token = match up.bearer_token {
                 Some(tok) => {
-                    validate_visible_ascii_token("upstream.bearer_token", &tok, 1)?;
+                    validate_visible_ascii_token("upstream.bearer_token", &tok, MIN_TOKEN_LEN)?;
                     Some(SecretString::new(tok))
                 }
                 None => None,
@@ -489,7 +500,7 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
             let mut tokens = Vec::with_capacity(ing.tokens.len());
             for (i, tok) in ing.tokens.iter().enumerate() {
                 let field = format!("ingest.tokens[{i}]");
-                validate_visible_ascii_token(&field, tok, 1)?;
+                validate_visible_ascii_token(&field, tok, MIN_TOKEN_LEN)?;
                 tokens.push(SecretString::new(tok.clone()));
             }
             if ing.events.is_empty() {
@@ -519,6 +530,8 @@ fn validate_raw_config(raw: RawConfig) -> Result<Config, String> {
                 validate_schema(&ev.payload_schema)
                     .map_err(|e| format!("ingest.events[{i}] ('{}'): {e}", ev.name))?;
                 let input_schema = build_filter_input_schema(&ev.payload_schema, &ev.filter_fields)
+                    .map_err(|e| format!("ingest.events[{i}] ('{}'): {e}", ev.name))?;
+                validate_schema(&input_schema)
                     .map_err(|e| format!("ingest.events[{i}] ('{}'): {e}", ev.name))?;
                 events.push(IngestEventConfig {
                     name: ev.name,
@@ -668,7 +681,7 @@ mod tests {
                     "UPSTREAM" => "http://127.0.0.1:8765/mcp",
                     "UPSTREAM_EVENT" => "upstream.build",
                     "DISALLOWED" => "private_repo",
-                    "PROD" => "producer",
+                    "PROD" => "producer_secret_token_01",
                     "EVENT" => "local.build",
                     "DESCRIPTION" => "Build result",
                     "FIELD" => "repo",
@@ -718,19 +731,25 @@ mod tests {
             r#""profile": "chatgpt","#,
             r#""profile": "chatgpt", "profile": "sep3415","#,
         );
-        assert!(Config::parse_json_with_env(&source, |_| Some("token".into())).is_err());
+        assert!(
+            Config::parse_json_with_env(&source, |_| Some("inbound_secret_token_01".into()))
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_partial_env_interpolation_and_plaintext_non_loopback_check_url() {
         let partial = sample_ingest_config().replace("${INBOUND}", "prefix-${INBOUND}");
-        assert!(Config::parse_json_with_env(&partial, |_| Some("x".into())).is_err());
+        assert!(
+            Config::parse_json_with_env(&partial, |_| Some("inbound_secret_token_01".into()))
+                .is_err()
+        );
 
         let bad_check = r#"{
             "listen": "127.0.0.1:8081",
             "state_path": "/tmp/s.json",
             "profile": "sep3415",
-            "inbound_tokens": ["tok1"],
+            "inbound_tokens": ["inbound_secret_token_01"],
             "auth_context": {
                 "check_url": "http://localhost:8083/authorization/check",
                 "check_token": "0123456789abcdef",
@@ -744,6 +763,52 @@ mod tests {
 
         let good_check = bad_check.replace("http://localhost:8083", "http://127.0.0.1:8083");
         assert!(Config::parse_json_with_env(&good_check, |_| None).is_ok());
+
+        let non_loopback_listen = good_check.replace("127.0.0.1:8081", "0.0.0.0:8081");
+        let err = Config::parse_json_with_env(&non_loopback_listen, |_| None).unwrap_err();
+        assert!(err.contains("loopback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_short_static_tokens() {
+        for (inbound, upstream_tok, producer) in [
+            (
+                "short_tok_15chr",
+                "upstream_secret_token_01",
+                "producer_secret_token_01",
+            ),
+            (
+                "inbound_secret_token_01",
+                "short_up_15char",
+                "producer_secret_token_01",
+            ),
+            (
+                "inbound_secret_token_01",
+                "upstream_secret_token_01",
+                "short_pr_15char",
+            ),
+        ] {
+            let cfg = serde_json::json!({
+                "listen": "127.0.0.1:8081",
+                "state_path": "/tmp/s.json",
+                "profile": "sep3415",
+                "inbound_tokens": [inbound],
+                "upstream": {
+                    "url": "http://127.0.0.1:8765/mcp",
+                    "bearer_token": upstream_tok
+                },
+                "ingest": {
+                    "tokens": [producer],
+                    "events": [{
+                        "name": "ci.ev",
+                        "description": "desc",
+                        "payload_schema": {"type": "object"}
+                    }]
+                }
+            });
+            let err = Config::parse_json_with_env(&cfg.to_string(), |_| None).unwrap_err();
+            assert!(err.contains("16 visible ASCII"), "unexpected error: {err}");
+        }
     }
 
     #[test]
@@ -752,13 +817,13 @@ mod tests {
             "listen": "127.0.0.1:8081",
             "state_path": "/tmp/s.json",
             "profile": "sep3415",
-            "inbound_tokens": ["tok1"],
+            "inbound_tokens": ["inbound_secret_token_01"],
             "upstream": {
                 "url": "http://127.0.0.1:8765/mcp",
                 "expose_events": [{"name": "dup.ev"}]
             },
             "ingest": {
-                "tokens": ["ptok"],
+                "tokens": ["producer_secret_token_01"],
                 "events": [{
                     "name": "dup.ev",
                     "description": "dup",

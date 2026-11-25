@@ -63,27 +63,32 @@ pub fn build_upstream_headers(
 ) -> Result<HeaderMap, String> {
     let nominated = collect_connection_nominated(inbound);
     let mut out = HeaderMap::with_capacity(inbound.len() + 3);
-    let mut has_forwarded_proto = false;
 
     for (name, value) in inbound {
         let lower = name.as_str();
         if is_hop_by_hop(lower, &nominated)
-            || matches!(lower, "authorization" | "cookie" | "origin" | "host")
+            || matches!(
+                lower,
+                "authorization"
+                    | "cookie"
+                    | "origin"
+                    | "host"
+                    | "forwarded"
+                    | "x-real-ip"
+                    | "cf-connecting-ip"
+                    | "true-client-ip"
+            )
             || lower.starts_with("x-authorization-")
+            || lower.starts_with("x-forwarded-")
         {
             continue;
-        }
-        if lower == "x-forwarded-proto" {
-            has_forwarded_proto = true;
         }
         out.append(name.clone(), value.clone());
     }
 
-    if !has_forwarded_proto {
-        let proto = HeaderValue::from_str(upstream_url.scheme())
-            .map_err(|e| format!("invalid upstream scheme for X-Forwarded-Proto: {e}"))?;
-        out.insert(HeaderName::from_static("x-forwarded-proto"), proto);
-    }
+    let proto = HeaderValue::from_str(upstream_url.scheme())
+        .map_err(|e| format!("invalid upstream scheme for X-Forwarded-Proto: {e}"))?;
+    out.insert(HeaderName::from_static("x-forwarded-proto"), proto);
 
     let authority = url_authority(upstream_url)?;
     let host_val =
@@ -743,11 +748,30 @@ mod tests {
         let out_no_auth = build_upstream_headers(&inbound, &upstream, Some(&token), false).unwrap();
         assert!(out_no_auth.get(header::AUTHORIZATION).is_none());
 
-        // Existing X-Forwarded-Proto is preserved.
-        let mut with_proto = HeaderMap::new();
-        with_proto.insert("x-forwarded-proto", "https".parse().unwrap());
-        let out_proto = build_upstream_headers(&with_proto, &upstream, None, true).unwrap();
-        assert_eq!(out_proto.get("x-forwarded-proto").unwrap(), "https");
+        // Spoofed client IP and forwarding headers are stripped; X-Forwarded-Proto uses upstream_url.scheme().
+        let mut with_forwarded = HeaderMap::new();
+        with_forwarded.insert("forwarded", "for=1.2.3.4;proto=https".parse().unwrap());
+        with_forwarded.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        with_forwarded.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        with_forwarded.insert("x-forwarded-proto", "https".parse().unwrap());
+        with_forwarded.insert("x-real-ip", "1.2.3.4".parse().unwrap());
+        with_forwarded.insert("cf-connecting-ip", "1.2.3.4".parse().unwrap());
+        with_forwarded.insert("true-client-ip", "1.2.3.4".parse().unwrap());
+        let out_proto = build_upstream_headers(&with_forwarded, &upstream, None, true).unwrap();
+        assert_eq!(out_proto.get("x-forwarded-proto").unwrap(), "http");
+        for stripped_proxy in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-real-ip",
+            "cf-connecting-ip",
+            "true-client-ip",
+        ] {
+            assert!(
+                out_proto.get(stripped_proxy).is_none(),
+                "{stripped_proxy} should be stripped"
+            );
+        }
     }
 
     #[test]

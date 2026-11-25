@@ -2,6 +2,17 @@
 
 use serde_json::{Map, Number, Value, json};
 
+struct OfflineRejectRetriever;
+
+impl jsonschema::Retrieve for OfflineRejectRetriever {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(format!("external JSON Schema reference is disallowed: {uri}").into())
+    }
+}
+
 fn as_exact_integer(value: &Value) -> Option<i128> {
     let number = value.as_number()?;
     if let Some(value) = number.as_i64() {
@@ -87,56 +98,34 @@ pub fn build_filter_input_schema(
     }))
 }
 
-/// Check a configured schema against its bundled draft meta-schema without external retrieval.
-pub fn validate_schema(schema: &Value) -> Result<(), String> {
-    let result = match schema.get("$schema").and_then(Value::as_str) {
-        None => jsonschema::draft202012::meta::validate(schema),
-        Some(uri) => match uri.trim_end_matches('#') {
-            "http://json-schema.org/draft-04/schema"
-            | "https://json-schema.org/draft-04/schema" => {
-                jsonschema::draft4::meta::validate(schema)
-            }
-            "http://json-schema.org/draft-06/schema"
-            | "https://json-schema.org/draft-06/schema" => {
-                jsonschema::draft6::meta::validate(schema)
-            }
-            "http://json-schema.org/draft-07/schema"
-            | "https://json-schema.org/draft-07/schema" => {
-                jsonschema::draft7::meta::validate(schema)
-            }
-            "https://json-schema.org/draft/2019-09/schema"
-            | "http://json-schema.org/draft/2019-09/schema" => {
-                jsonschema::draft201909::meta::validate(schema)
-            }
-            "https://json-schema.org/draft/2020-12/schema"
-            | "http://json-schema.org/draft/2020-12/schema" => {
-                jsonschema::draft202012::meta::validate(schema)
-            }
-            // Custom dialects are resolved asynchronously when the schema is compiled.
-            _ => return Ok(()),
-        },
-    };
-    result.map_err(|error| format!("invalid JSON Schema: {error}"))
+/// Compile a JSON Schema validator offline, rejecting any external URI `$ref`.
+pub fn compile_validator(schema: &Value) -> Result<jsonschema::Validator, String> {
+    jsonschema::options()
+        .with_retriever(OfflineRejectRetriever)
+        .build(schema)
+        .map_err(|error| format!("invalid JSON Schema: {error}"))
 }
 
-/// Validate with the declared draft, resolving external references asynchronously.
-pub async fn validate_against_schema(schema: &Value, value: &Value) -> Result<(), String> {
-    let validator = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        jsonschema::async_validator_for(schema),
-    )
-    .await
-    .map_err(|_| "JSON Schema resolution timed out after 30 seconds".to_owned())?
-    .map_err(|error| format!("invalid JSON Schema: {error}"))?;
+/// Check a schema against its bundled draft meta-schema and verify it compiles offline.
+pub fn validate_schema(schema: &Value) -> Result<(), String> {
+    compile_validator(schema).map(|_| ())
+}
+
+/// Validate `value` against `schema` offline.
+pub fn validate_against_schema(schema: &Value, value: &Value) -> Result<(), String> {
+    let validator = compile_validator(schema)?;
     validator.validate(value).map_err(|error| error.to_string())
 }
 
-/// Normalize whole integer arguments without narrowing their supported range.
-pub async fn normalize_filter_arguments(
+/// Validate and normalize whole integer arguments using a precompiled `Validator`.
+pub fn normalize_filter_arguments_with_validator(
+    validator: &jsonschema::Validator,
     input_schema: &Value,
     args: &Map<String, Value>,
 ) -> Result<Map<String, Value>, String> {
-    validate_against_schema(input_schema, &Value::Object(args.clone())).await?;
+    validator
+        .validate(&Value::Object(args.clone()))
+        .map_err(|error| error.to_string())?;
     let props = input_schema.get("properties").and_then(Value::as_object);
     let mut normalized = Map::with_capacity(args.len());
     for (k, v) in args {
@@ -158,6 +147,15 @@ pub async fn normalize_filter_arguments(
         }
     }
     Ok(normalized)
+}
+
+/// Normalize whole integer arguments without narrowing their supported range.
+pub fn normalize_filter_arguments(
+    input_schema: &Value,
+    args: &Map<String, Value>,
+) -> Result<Map<String, Value>, String> {
+    let validator = compile_validator(input_schema)?;
+    normalize_filter_arguments_with_validator(&validator, input_schema, args)
 }
 
 #[cfg(test)]
@@ -187,26 +185,23 @@ mod tests {
         assert!(build_filter_input_schema(&payload, &["missing".into()]).is_err());
     }
 
-    #[tokio::test]
-    async fn integer_normalization_accepts_whole_float_and_rejects_fractional() {
+    #[test]
+    fn integer_normalization_accepts_whole_float_and_rejects_fractional() {
         let schema = json!({
             "type": "object",
             "properties": {"pr": {"type": "integer"}},
             "additionalProperties": false
         });
         let ok_args = json!({"pr": 42.0}).as_object().unwrap().clone();
-        let norm = normalize_filter_arguments(&schema, &ok_args).await.unwrap();
+        let norm = normalize_filter_arguments(&schema, &ok_args).unwrap();
         assert_eq!(norm["pr"], json!(42));
 
         let bad_args = json!({"pr": 42.5}).as_object().unwrap().clone();
-        assert!(
-            normalize_filter_arguments(&schema, &bad_args)
-                .await
-                .is_err()
-        );
+        assert!(normalize_filter_arguments(&schema, &bad_args).is_err());
     }
-    #[tokio::test]
-    async fn validates_standard_keywords_and_declared_drafts() {
+
+    #[test]
+    fn validates_standard_keywords_and_declared_drafts() {
         for (schema, valid, invalid) in [
             (
                 json!({"type": "object", "properties": {"repo": {"$ref": "#/$defs/repo"}},
@@ -247,36 +242,28 @@ mod tests {
             ),
         ] {
             assert!(validate_schema(&schema).is_ok(), "{schema}");
+            assert!(validate_against_schema(&schema, &valid).is_ok(), "{schema}");
             assert!(
-                validate_against_schema(&schema, &valid).await.is_ok(),
-                "{schema}"
-            );
-            assert!(
-                validate_against_schema(&schema, &invalid).await.is_err(),
+                validate_against_schema(&schema, &invalid).is_err(),
                 "{schema}"
             );
         }
         assert!(validate_schema(&json!({"type": "unknown"})).is_err());
         assert!(validate_schema(&json!({"minimum": "3"})).is_err());
-        assert!(validate_schema(&json!({"$ref": "https://example.com/schema.json"})).is_ok());
     }
 
-    #[tokio::test]
-    async fn integer_validation_and_equality_preserve_u64_precision() {
+    #[test]
+    fn integer_validation_and_equality_preserve_u64_precision() {
         let schema = json!({
             "type": "object",
             "properties": {"n": {"type": "integer", "minimum": 9_007_199_254_740_993u64}}
         });
         let args = json!({"n": u64::MAX}).as_object().unwrap().clone();
         assert_eq!(
-            normalize_filter_arguments(&schema, &args).await.unwrap()["n"],
+            normalize_filter_arguments(&schema, &args).unwrap()["n"],
             json!(u64::MAX)
         );
-        assert!(
-            validate_against_schema(&schema, &json!({"n": 9_007_199_254_740_992u64}))
-                .await
-                .is_err()
-        );
+        assert!(validate_against_schema(&schema, &json!({"n": 9_007_199_254_740_992u64})).is_err());
         assert!(scalar_eq(
             &json!(9_223_372_036_854_775_808u64),
             &json!(9_223_372_036_854_775_808.0)
@@ -288,35 +275,32 @@ mod tests {
         assert!(!scalar_eq(&json!(u64::MAX), &json!(u64::MAX as f64)));
     }
 
-    #[tokio::test]
-    async fn resolves_external_references_without_blocking_the_runtime() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0u8; 4096];
-                assert!(socket.read(&mut request).await.unwrap() > 0);
-                let body = r#"{"type":"string","pattern":"^[A-Z]+$"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let schema = json!({"$ref": format!("http://{address}/schema.json")});
-        assert!(
-            validate_against_schema(&schema, &json!("ABC"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            validate_against_schema(&schema, &json!("abc"))
-                .await
-                .is_err()
-        );
-        server.await.unwrap();
+    #[test]
+    fn rejects_external_http_and_file_references_offline() {
+        for external in [
+            json!({"$ref": "http://127.0.0.1:8080/schema.json"}),
+            json!({"$ref": "https://example.com/schema.json"}),
+            json!({"$ref": "file:///etc/passwd"}),
+            json!({
+                "type": "object",
+                "properties": {
+                    "secret": {"$ref": "file:///etc/passwd"}
+                }
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ssrf": {"$ref": "http://127.0.0.1:9/internal.json#/$defs/x"}
+                }
+            }),
+            json!({"$schema": "http://127.0.0.1:9/custom-meta-schema.json", "type": "string"}),
+        ] {
+            let err = compile_validator(&external).unwrap_err();
+            assert!(
+                err.contains("disallowed") || err.contains("invalid JSON Schema"),
+                "unexpected error for {external}: {err}"
+            );
+            assert!(validate_schema(&external).is_err(), "{external}");
+        }
     }
 }

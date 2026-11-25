@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix="hookd-release-") as work:
     root = Path(work)
     package = root / name
     package.mkdir()
-    for source in (binary, "LICENSE", "README.md"):
+    for source in (binary, "LICENSE", "NOTICE", "README.md"):
         shutil.copy2(source, package)
 
     archive = shutil.make_archive(

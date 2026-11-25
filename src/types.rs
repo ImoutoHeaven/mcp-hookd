@@ -50,6 +50,7 @@ pub const LEGACY_PROTOCOL_VERSIONS: &[&str] =
 pub const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 
 static MONOTONIC_UNIX_FLOOR: AtomicU64 = AtomicU64::new(0);
+static MONOTONIC_UNIX_MS_FLOOR: AtomicU64 = AtomicU64::new(0);
 
 pub fn unix_now() -> u64 {
     let raw = SystemTime::now()
@@ -57,6 +58,18 @@ pub fn unix_now() -> u64 {
         .unwrap_or_default()
         .as_secs();
     MONOTONIC_UNIX_FLOOR
+        .fetch_max(raw, Ordering::Relaxed)
+        .max(raw)
+}
+
+pub fn unix_now_ms() -> u64 {
+    let raw = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    MONOTONIC_UNIX_MS_FLOOR
         .fetch_max(raw, Ordering::Relaxed)
         .max(raw)
 }

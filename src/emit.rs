@@ -509,6 +509,15 @@ fn build_outgoing_event(raw: &str, name_override: Option<&str>) -> Result<Outgoi
         return Err("event input must be a JSON object".into());
     };
 
+    for key in map.keys() {
+        if !matches!(
+            key.as_str(),
+            "eventId" | "name" | "timestamp" | "data" | "cursor" | "_meta"
+        ) {
+            return Err(format!("unknown top-level field '{key}'"));
+        }
+    }
+
     let name = match name_override {
         Some(n) => n.to_owned(),
         None => map
@@ -536,7 +545,7 @@ fn build_outgoing_event(raw: &str, name_override: Option<&str>) -> Result<Outgoi
         return Err("missing required 'data' field".into());
     };
 
-    // Extra top-level fields (cursor, truncated, _meta, etc.) are intentionally dropped here.
+    // Ignore optional transport metadata such as cursor and _meta on SEP-3415 EventOccurrence inputs.
     Ok(OutgoingEvent {
         event_id,
         name,
@@ -813,7 +822,6 @@ mod tests {
             "name": "ci.build_failed",
             "data": {"repo": "mcp-hookd", "pr": 7},
             "cursor": "cur_123",
-            "truncated": true,
             "_meta": {"source": "mcpcli"}
         })
         .to_string();
@@ -844,7 +852,6 @@ mod tests {
             &json!({"repo": "mcp-hookd", "pr": 7})
         );
         assert!(!obj.contains_key("cursor"));
-        assert!(!obj.contains_key("truncated"));
         assert!(!obj.contains_key("_meta"));
 
         let event_id = obj.get("eventId").unwrap().as_str().unwrap();
@@ -1008,7 +1015,7 @@ mod tests {
         let input = concat!(
             "\n",
             "   \r\n",
-            r#"{"name":"ev","eventId":"id_1","data":{"n":1},"cursor":"c1","truncated":false,"_meta":{}}"#,
+            r#"{"name":"ev","eventId":"id_1","data":{"n":1},"cursor":"c1","_meta":{}}"#,
             "\r\n",
             "\t\n",
             r#"{"name":"ev","eventId":"id_2","data":{"n":2}}"#,
@@ -1373,6 +1380,64 @@ mod tests {
         let line: Value = serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
         assert_eq!(line, json!({"ok": true, "dropped": true}));
 
+        assert!(server.recorded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_upstream_event_id_and_unknown_top_level_fields() {
+        let server = spawn_mock_server(vec![]).await;
+        for bad_payload in [
+            r#"{"name":"ev","data":{"k":1},"truncated":false}"#,
+            r#"{"name":"ev","data":{"k":1},"upstreamEventId":"up_1"}"#,
+            r#"{"name":"ev","data":{"k":1},"unexpected":123}"#,
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code_fail = run_emit_with_io(
+                base_options(server.url.clone(), false, OnInvalid::Fail),
+                Cursor::new(bad_payload.as_bytes()),
+                &mut stdout,
+                &mut stderr,
+            )
+            .await;
+            assert_eq!(code_fail, ExitCode::FAILURE);
+            assert!(
+                String::from_utf8(stderr.clone())
+                    .unwrap()
+                    .contains("unknown top-level field")
+            );
+
+            stderr.clear();
+            let code_drop = run_emit_with_io(
+                base_options(server.url.clone(), false, OnInvalid::Drop),
+                Cursor::new(bad_payload.as_bytes()),
+                &mut stdout,
+                &mut stderr,
+            )
+            .await;
+            assert_eq!(code_drop, ExitCode::SUCCESS);
+
+            let stream_input = format!("{bad_payload}\n");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code_stream = run_emit_with_io(
+                base_options(server.url.clone(), true, OnInvalid::Fail),
+                Cursor::new(stream_input.as_bytes()),
+                &mut stdout,
+                &mut stderr,
+            )
+            .await;
+            assert_eq!(code_stream, ExitCode::SUCCESS);
+            let line: Value =
+                serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+            assert_eq!(line["ok"], false);
+            assert!(
+                line["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown top-level field")
+            );
+        }
         assert!(server.recorded.lock().unwrap().is_empty());
     }
 }

@@ -287,7 +287,7 @@ fn base_config(
         resource_path: "/mcp".to_string(),
         state_path,
         profile,
-        inbound_tokens: vec![SecretString::new("inbound-tok-1")],
+        inbound_tokens: vec![SecretString::new("inbound-secret-tok-1")],
         allowed_origins: vec!["https://allowed.example.com".to_string()],
         max_ttl_secs: 3600,
         auth_context,
@@ -348,7 +348,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
                 };
             }
 
-            assert_eq!(auth.as_deref(), Some("Bearer upstream-secret"));
+            assert_eq!(auth.as_deref(), Some("Bearer upstream-secret-tok-1"));
             let body = req.into_body().collect().await.unwrap().to_bytes();
             let msg: Value = serde_json::from_slice(&body).unwrap();
             let rpc_method = msg["method"].as_str().unwrap_or("");
@@ -451,7 +451,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
         Profile::Chatgpt,
         Some(UpstreamConfig {
             url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
-            bearer_token: Some(SecretString::new("upstream-secret")),
+            bearer_token: Some(SecretString::new("upstream-secret-tok-1")),
             passthrough_prefixes: vec!["/t/".to_string()],
             request_timeout_secs: 10,
             expose_events: vec![ExposeEventConfig {
@@ -460,7 +460,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
             }],
         }),
         Some(IngestConfig {
-            tokens: vec![SecretString::new("producer-tok-1")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         None,
@@ -515,7 +515,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("origin", "https://evil.example"),
         ],
         Bytes::new(),
@@ -584,7 +584,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("origin", "https://allowed.example.com"),
             ("host", "public-proxy.example.com"),
             ("content-type", "application/json; charset=utf-8"),
@@ -610,7 +610,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
         .unwrap(),
     );
     let legacy_headers = [
-        ("authorization", "Bearer inbound-tok-1"),
+        ("authorization", "Bearer inbound-secret-tok-1"),
         ("content-type", "application/json"),
         ("accept", "application/json, text/event-stream"),
         ("mcp-session-id", "up-sess-1"),
@@ -652,7 +652,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
             ("accept", "application/json, text/event-stream"),
             ("mcp-protocol-version", PROTOCOL_VERSION_MODERN),
@@ -670,7 +670,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
     let (st, _, bad_name) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/poll",
         3,
         json!({"name": "task.exited"}),
@@ -683,7 +683,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
     let (st, _, disallowed) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/poll",
         4,
         json!({"name": "task.exited", "arguments": {"scope": "all"}}),
@@ -696,7 +696,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
     let (st, _, allowed_poll) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/poll",
         5,
         json!({"name": "task.exited", "arguments": {"taskId": "t1", "nested": {"count": 7}}}),
@@ -706,12 +706,28 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(allowed_poll["result"]["cursor"], "c1");
 
+    // Local ingest event called via events/poll or events/stream returns chatgpt unsupported_code (-32602)
+    for method in ["events/poll", "events/stream"] {
+        let (st, _, ingest_unsupported) = mcp_post_modern(
+            &client,
+            &base_url,
+            "inbound-secret-tok-1",
+            method,
+            50,
+            json!({"name": "ci.build_failed", "arguments": {"repo": "org/app"}}),
+            &[],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(ingest_unsupported["error"]["code"], -32602);
+    }
+
     // 7. POST /v1/events rejects inbound_tokens, accepts producer token + emit --stream delivers webhook
     let (st, _, _) = send_http(
         &client,
         Method::POST,
         &format!("{base_url}/v1/events"),
-        &[("authorization", "Bearer inbound-tok-1")],
+        &[("authorization", "Bearer inbound-secret-tok-1")],
         Bytes::from_static(b"{}"),
     )
     .await;
@@ -721,7 +737,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
     let (st, _, sub_resp) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         6,
         json!({
@@ -748,7 +764,7 @@ async fn acceptance_1_protocol_facade_passthrough_origin_and_emit_stream() {
             name: None,
             stream: true,
             on_invalid: OnInvalid::Fail,
-            token: Some(SecretString::new("producer-tok-1")),
+            token: Some(SecretString::new("producer-secret-tok-1")),
         },
         Cursor::new(ndjson.as_bytes()),
         &mut stdout,
@@ -798,6 +814,12 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
             let body = req.into_body().collect().await.unwrap().to_bytes();
             let val: Value = serde_json::from_slice(&body).unwrap();
             let aref = val["ref"].as_str().unwrap_or("");
+            if aref == "aref_transient_500" {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from_static(b"check unavailable")))
+                    .unwrap();
+            }
             let resp = match grants.lock().unwrap().get(aref) {
                 Some((true, scopes, expires_at)) => json!({
                     "active": true,
@@ -821,6 +843,12 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
         // Forged X-Authorization-* must be stripped before reaching upstream.
         assert!(req.headers().get("x-authorization-ref").is_none());
         assert!(req.headers().get("x-authorization-scope").is_none());
+        if *req.method() == Method::GET || *req.method() == Method::DELETE {
+            return Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
         let body = req.into_body().collect().await.unwrap().to_bytes();
         let msg: Value = serde_json::from_slice(&body).unwrap();
         let resp = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": true}});
@@ -848,7 +876,7 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
                 expose_events: vec![],
             }),
             Some(IngestConfig {
-                tokens: vec![SecretString::new("prod-tok")],
+                tokens: vec![SecretString::new("producer-secret-tok-1")],
                 events: vec![ci_ingest_event()],
             }),
             Some(AuthContextConfig {
@@ -870,24 +898,84 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
     let base_url = format!("http://{}", server.local_addr());
     let client = http_client();
 
-    // 1. Missing X-Authorization-Ref returns HTTP 500
-    let (st, _, _) = mcp_post_modern(
+    // 1. Hop inbound token mismatch returns 401 with bare WWW-Authenticate: Bearer; missing/blank/dup X-Authorization-* returns empty 400
+    let (st_hop, hdrs_hop, body_hop) = send_http(
+        &client,
+        Method::GET,
+        &format!("{base_url}/mcp"),
+        &[("authorization", "Bearer wrong-inbound-secret-token")],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_hop, StatusCode::UNAUTHORIZED);
+    assert_eq!(hdrs_hop.get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+    assert!(body_hop.is_empty());
+
+    let (st, _, err_missing) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/list",
         1,
         json!({}),
         &[],
     )
     .await;
-    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(err_missing, Value::Null);
+
+    let (st_blank, _, body_blank) = send_http(
+        &client,
+        Method::GET,
+        &format!("{base_url}/mcp"),
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("x-authorization-ref", "   "),
+            ("x-authorization-scope", "events:read"),
+        ],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_blank, StatusCode::BAD_REQUEST);
+    assert!(body_blank.is_empty());
+
+    // Transient 5xx from check endpoint returns 503 Service Unavailable
+    let (st_503_get, _, body_503_get) = send_http(
+        &client,
+        Method::GET,
+        &format!("{base_url}/mcp"),
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("x-authorization-ref", "aref_transient_500"),
+            ("x-authorization-scope", "events:read"),
+        ],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_503_get, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_503_get.is_empty());
+
+    let (st_503_post, _, res_503_post) = mcp_post_modern(
+        &client,
+        &base_url,
+        "inbound-secret-tok-1",
+        "tools/call",
+        100,
+        json!({"name": "echo"}),
+        &[
+            ("x-authorization-ref", "aref_transient_500"),
+            ("x-authorization-scope", "events:read"),
+        ],
+    )
+    .await;
+    assert_eq!(st_503_post, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res_503_post["error"]["code"], -32603);
 
     // 2. Upstream tools/call strips X-Authorization-* headers
     let (st, _, _) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "tools/call",
         2,
         json!({"name": "echo"}),
@@ -908,7 +996,7 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
     let (st_a, _, res_a) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         3,
         sub_params.clone(),
@@ -921,7 +1009,7 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
     let (st_b, _, res_b) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         4,
         sub_params.clone(),
@@ -936,11 +1024,11 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
     assert_ne!(res_a["result"]["id"], res_b["result"]["id"]);
     assert_eq!(server.engine().active_subscription_count(), 2);
 
-    // 4. Refreshing Alice with narrowed scope returns HTTP 200 + JSON-RPC Forbidden (-32024)
-    let (st_narrow, _, res_narrow) = mcp_post_modern(
+    // 4. Refreshing Alice with narrowed scope returns HTTP 403 + insufficient_scope with sorted required scope + JSON-RPC -32024
+    let (st_narrow, hdrs_narrow, res_narrow) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         5,
         sub_params,
@@ -950,15 +1038,81 @@ async fn acceptance_2_delegated_auth_isolation_narrow_scope_revocation_and_start
         ],
     )
     .await;
-    assert_eq!(st_narrow, StatusCode::OK);
+    assert_eq!(st_narrow, StatusCode::FORBIDDEN);
+    assert_eq!(
+        hdrs_narrow.get(header::WWW_AUTHENTICATE).unwrap(),
+        r#"Bearer error="insufficient_scope", scope="events:read events:write""#
+    );
     assert_eq!(res_narrow["error"]["code"], -32024);
 
-    // 5. Revoking Bob destroys Bob's subscription within reverify_secs and sends terminated
+    // Disjoint header scope (empty effective_scopes) returns HTTP 403 + insufficient_scope on GET and tools/call
+    let (st_empty_get, hdrs_empty_get, body_empty_get) = send_http(
+        &client,
+        Method::GET,
+        &format!("{base_url}/mcp"),
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("x-authorization-ref", "aref_alice"),
+            ("x-authorization-scope", "unrelated:scope"),
+        ],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_empty_get, StatusCode::FORBIDDEN);
+    assert_eq!(
+        hdrs_empty_get.get(header::WWW_AUTHENTICATE).unwrap(),
+        r#"Bearer error="insufficient_scope""#
+    );
+    assert!(body_empty_get.is_empty());
+
+    // 5. Revoking Bob destroys Bob's subscription within reverify_secs, sends terminated, and blocks GET/DELETE/tools/call with 401 invalid_token
     grants.lock().unwrap().get_mut("aref_bob").unwrap().0 = false;
     wait_until(Duration::from_secs(7), || async {
         server.engine().active_subscription_count() == 1
     })
     .await;
+
+    for method in [Method::GET, Method::DELETE] {
+        let (st_rev, hdrs_rev, body_rev) = send_http(
+            &client,
+            method,
+            &format!("{base_url}/mcp"),
+            &[
+                ("authorization", "Bearer inbound-secret-tok-1"),
+                ("x-authorization-ref", "aref_bob"),
+                ("x-authorization-scope", "events:read"),
+            ],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(st_rev, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            hdrs_rev.get(header::WWW_AUTHENTICATE).unwrap(),
+            r#"Bearer error="invalid_token""#
+        );
+        assert!(body_rev.is_empty());
+    }
+
+    let (st_rev_tool, hdrs_rev_tool, res_rev_tool) = mcp_post_modern(
+        &client,
+        &base_url,
+        "inbound-secret-tok-1",
+        "tools/call",
+        6,
+        json!({"name": "echo"}),
+        &[
+            ("x-authorization-ref", "aref_bob"),
+            ("x-authorization-scope", "events:read"),
+        ],
+    )
+    .await;
+    assert_eq!(st_rev_tool, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        hdrs_rev_tool.get(header::WWW_AUTHENTICATE).unwrap(),
+        r#"Bearer error="invalid_token""#
+    );
+    assert_eq!(res_rev_tool["id"], 6);
+    assert_eq!(res_rev_tool["error"]["code"], -32024);
     wait_until(Duration::from_secs(2), || async {
         cb.requests.lock().await.iter().any(|r| {
             serde_json::from_slice::<Value>(&r.body)
@@ -1022,7 +1176,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
         Profile::Sep3415,
         None,
         Some(IngestConfig {
-            tokens: vec![SecretString::new("prod-tok")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         None,
@@ -1041,7 +1195,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
     let (_, _, bad_url) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         1,
         json!({
@@ -1056,7 +1210,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
     let (_, _, bad_secret) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         2,
         json!({
@@ -1068,6 +1222,22 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
     .await;
     assert_eq!(bad_secret["error"]["code"], -32602);
 
+    // Local ingest event called via events/poll or events/stream returns sep3415 unsupported_code (-32026)
+    for method in ["events/poll", "events/stream"] {
+        let (st, _, ingest_unsupported) = mcp_post_modern(
+            &client,
+            &base_url,
+            "inbound-secret-tok-1",
+            method,
+            20,
+            json!({"name": "ci.build_failed", "arguments": {"repo": "org/app"}}),
+            &[],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(ingest_unsupported["error"]["code"], -32026);
+    }
+
     // 2. 302 redirect callback fails verification with CallbackEndpointError (-32027)
     let dir2 = TempDir::new().unwrap();
     let cfg2 = base_config(
@@ -1075,7 +1245,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
         Profile::Sep3415,
         None,
         Some(IngestConfig {
-            tokens: vec![SecretString::new("prod-tok")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         None,
@@ -1090,7 +1260,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
     let (_, _, redir_err) = mcp_post_modern(
         &client,
         &format!("http://{}", redir_srv.local_addr()),
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         3,
         json!({
@@ -1109,7 +1279,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
     let (_, _, sub1) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         4,
         json!({
@@ -1124,7 +1294,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
     let (_, _, sub2) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         5,
         json!({
@@ -1162,7 +1332,7 @@ async fn acceptance_3_secure_callbacks_verification_redirect_dual_secret_and_410
             Method::POST,
             &format!("{base_url}/v1/events"),
             &[
-                ("authorization", "Bearer prod-tok"),
+                ("authorization", "Bearer producer-secret-tok-1"),
                 ("content-type", "application/json"),
             ],
             Bytes::from(
@@ -1359,7 +1529,7 @@ async fn acceptance_4_poll_fallback_slow_consumer_drop_and_budget_isolation() {
             }],
         }),
         Some(IngestConfig {
-            tokens: vec![SecretString::new("prod-tok")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         None,
@@ -1382,7 +1552,7 @@ async fn acceptance_4_poll_fallback_slow_consumer_drop_and_budget_isolation() {
         let (st, _, _) = mcp_post_modern(
             &client,
             &base_url,
-            "inbound-tok-1",
+            "inbound-secret-tok-1",
             "events/subscribe",
             1,
             json!({
@@ -1405,7 +1575,7 @@ async fn acceptance_4_poll_fallback_slow_consumer_drop_and_budget_isolation() {
     let (st, _, _) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         2,
         json!({
@@ -1432,7 +1602,7 @@ async fn acceptance_4_poll_fallback_slow_consumer_drop_and_budget_isolation() {
         Method::POST,
         &format!("{base_url}/v1/events"),
         &[
-            ("authorization", "Bearer prod-tok"),
+            ("authorization", "Bearer producer-secret-tok-1"),
             ("content-type", "application/json"),
         ],
         Bytes::from(
@@ -1452,7 +1622,7 @@ async fn acceptance_4_poll_fallback_slow_consumer_drop_and_budget_isolation() {
     let (st_tool, _, tool_val) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "tools/call",
         3,
         json!({ "name": "ping_tool" }),
@@ -1465,7 +1635,7 @@ async fn acceptance_4_poll_fallback_slow_consumer_drop_and_budget_isolation() {
     let (st_unsub, _, unsub_val) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/unsubscribe",
         4,
         json!({
@@ -1537,7 +1707,7 @@ async fn acceptance_5_burst_dropped_slow_without_suspending_or_blocking_healthy_
         Profile::Sep3415,
         None,
         Some(IngestConfig {
-            tokens: vec![SecretString::new("prod-tok")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         None,
@@ -1559,7 +1729,7 @@ async fn acceptance_5_burst_dropped_slow_without_suspending_or_blocking_healthy_
         let (st, _, _) = mcp_post_modern(
             &client,
             &base_url,
-            "inbound-tok-1",
+            "inbound-secret-tok-1",
             "events/subscribe",
             id,
             json!({
@@ -1581,7 +1751,7 @@ async fn acceptance_5_burst_dropped_slow_without_suspending_or_blocking_healthy_
             Method::POST,
             &format!("{base_url}/v1/events"),
             &[
-                ("authorization", "Bearer prod-tok"),
+                ("authorization", "Bearer producer-secret-tok-1"),
                 ("content-type", "application/json"),
             ],
             Bytes::from(
@@ -1628,7 +1798,7 @@ async fn acceptance_5_burst_dropped_slow_without_suspending_or_blocking_healthy_
     let (st, _, refresh) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         3,
         json!({
@@ -1652,7 +1822,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
         Profile::Chatgpt,
         None,
         Some(IngestConfig {
-            tokens: vec![SecretString::new("prod-tok")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         None,
@@ -1667,7 +1837,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
     let (st, _, disc) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "server/discover",
         1,
         json!({}),
@@ -1703,7 +1873,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
             ("accept", "application/json, text/event-stream"),
         ],
@@ -1723,7 +1893,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
             ("accept", "application/json, text/event-stream"),
             ("mcp-session-id", &sid),
@@ -1743,7 +1913,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
             ("accept", "application/json, text/event-stream"),
             ("mcp-session-id", &sid),
@@ -1764,7 +1934,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
         Method::POST,
         &format!("{base_url}/mcp"),
         &[
-            ("authorization", "Bearer inbound-tok-1"),
+            ("authorization", "Bearer inbound-secret-tok-1"),
             ("content-type", "application/json"),
             ("content-type", "application/json"),
             ("accept", "application/json, text/event-stream"),
@@ -1786,18 +1956,33 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
 
     server.shutdown().await.unwrap();
 
-    // 4. With auth_context enabled, no-upstream `server/discover` reports `cacheScope: "private"`.
+    // 4. With auth_context enabled, no-upstream `server/discover` verifies delegated auth and reports `cacheScope: "private"`.
+    let (priv_auth_addr, _priv_auth_task) = spawn_http_mock(|_req| async move {
+        let resp = json!({
+            "active": true,
+            "principal": "aref_1",
+            "resource": "https://mcp.example.com/mcp",
+            "scopes": ["events:read"],
+            "expiresAt": unix_now() + 3600
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
+            .unwrap()
+    })
+    .await;
     let dir2 = TempDir::new().unwrap();
     let cfg_priv = base_config(
         dir2.path().join("subscriptions.json"),
         Profile::Sep3415,
         None,
         Some(IngestConfig {
-            tokens: vec![SecretString::new("prod-tok")],
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
             events: vec![ci_ingest_event()],
         }),
         Some(AuthContextConfig {
-            check_url: Url::parse("http://127.0.0.1:1/authorization/check").unwrap(),
+            check_url: Url::parse(&format!("http://{priv_auth_addr}/authorization/check")).unwrap(),
             check_token: SecretString::new("0123456789abcdef"),
             expected_resource: "https://mcp.example.com/mcp".to_string(),
             reverify_secs: 15,
@@ -1809,7 +1994,7 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
     let (st_priv, _, disc_priv) = mcp_post_modern(
         &client,
         &format!("http://{}", srv_priv.local_addr()),
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "server/discover",
         5,
         json!({}),
@@ -1937,7 +2122,7 @@ async fn unsubscribe_retry_persists_removal_after_transient_io_failure() {
             profile,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("producer")],
+                tokens: vec![SecretString::new("producer-secret-tok-1")],
                 events: vec![ci_ingest_event()],
             }),
             None,
@@ -1958,7 +2143,7 @@ async fn unsubscribe_retry_persists_removal_after_transient_io_failure() {
         let (status, _, subscribed) = mcp_post_modern(
             &client,
             &base_url,
-            "inbound-tok-1",
+            "inbound-secret-tok-1",
             "events/subscribe",
             1,
             json!({
@@ -1983,7 +2168,7 @@ async fn unsubscribe_retry_persists_removal_after_transient_io_failure() {
         let (status, _, failed) = mcp_post_modern(
             &client,
             &base_url,
-            "inbound-tok-1",
+            "inbound-secret-tok-1",
             "events/unsubscribe",
             2,
             params.clone(),
@@ -1999,7 +2184,7 @@ async fn unsubscribe_retry_persists_removal_after_transient_io_failure() {
         let (status, _, retried) = mcp_post_modern(
             &client,
             &base_url,
-            "inbound-tok-1",
+            "inbound-secret-tok-1",
             "events/unsubscribe",
             3,
             params,
@@ -2111,7 +2296,7 @@ async fn polling_respects_bootstrap_and_rejected_batch_delays() {
     let (status, _, subscribed) = mcp_post_modern(
         &client,
         &base_url,
-        "inbound-tok-1",
+        "inbound-secret-tok-1",
         "events/subscribe",
         1,
         json!({
@@ -2141,5 +2326,428 @@ async fn polling_respects_bootstrap_and_rejected_batch_delays() {
     }
     assert_eq!(server.engine().pools().outbox.used(), 0);
     assert_eq!(callback.requests.lock().await.len(), 1);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn acceptance_7_streaming_passthrough_stateless_responses_and_multiframe_handshake() {
+    let catalog_calls = Arc::new(AtomicUsize::new(0));
+    let catalog_calls_bg = Arc::clone(&catalog_calls);
+
+    let (up_addr, _up_task) = spawn_http_mock(move |req| {
+        let catalog_calls = Arc::clone(&catalog_calls_bg);
+        async move {
+            let method = req.method().clone();
+            let headers = req.headers().clone();
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+
+            if method == Method::GET {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Full::new(Bytes::from_static(b": upstream-get-stream\n\n")))
+                    .unwrap();
+            }
+            if method == Method::DELETE {
+                return Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .header(header::ALLOW, "POST, GET")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+            }
+
+            if headers.get(header::CONTENT_ENCODING).is_some_and(|v| v == "gzip") {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Full::new(body))
+                    .unwrap();
+            }
+
+            let ct = headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !ct.starts_with("application/json") {
+                return Response::builder()
+                    .status(StatusCode::CREATED)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Full::new(body))
+                    .unwrap();
+            }
+
+            let msg: Value = serde_json::from_slice(&body).unwrap();
+            if msg.is_array() {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(
+                        serde_json::to_vec(&json!([{"jsonrpc":"2.0","id":1,"result":"batch-ok"}]))
+                            .unwrap(),
+                    )))
+                    .unwrap();
+            }
+
+            // Client Sampling/Elicitation JSON-RPC Response or Error (no "method" field)
+            if msg.get("method").is_none() {
+                return Response::builder()
+                    .status(StatusCode::ACCEPTED)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+            }
+
+            match msg["method"].as_str().unwrap_or("") {
+                "initialize" => {
+                    let sse = concat!(
+                        ": priming\n\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}}}}\n\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv_req_1\",\"method\":\"roots/list\"}\n\n"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CONTENT_LENGTH, sse.len())
+                        .body(Full::new(Bytes::from(sse)))
+                        .unwrap()
+                }
+                "events/list" => {
+                    catalog_calls.fetch_add(1, Ordering::SeqCst);
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "result": {
+                            "events": [{
+                                "name": "task.exited",
+                                "delivery": ["poll"],
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": { "scope": { "type": "string" } }
+                                },
+                                "payloadSchema": { "type": "object" }
+                            }]
+                        }
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
+                        .unwrap()
+                }
+                "events/poll" => {
+                    let ev_name = msg["params"]["name"].as_str().unwrap_or("");
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "result": {
+                            "events": [],
+                            "cursor": format!("dyn_{ev_name}"),
+                            "truncated": false,
+                            "hasMore": false,
+                            "nextPollMs": 1000
+                        }
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
+                        .unwrap()
+                }
+                "tools/call" => {
+                    let accept = headers
+                        .get(header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "result": { "seenAccept": accept }
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from(serde_json::to_vec(&resp).unwrap())))
+                        .unwrap()
+                }
+                _ => Response::builder()
+                    .status(StatusCode::ACCEPTED)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            }
+        }
+    })
+    .await;
+
+    let dir = TempDir::new().unwrap();
+    let cfg = base_config(
+        dir.path().join("subscriptions.json"),
+        Profile::Chatgpt,
+        Some(UpstreamConfig {
+            url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+            bearer_token: Some(SecretString::new("upstream-secret-tok-1")),
+            passthrough_prefixes: vec![],
+            request_timeout_secs: 10,
+            expose_events: vec![ExposeEventConfig {
+                name: "task.exited".into(),
+                disallow_arguments: vec!["scope".into()],
+            }],
+        }),
+        Some(IngestConfig {
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
+            events: vec![ci_ingest_event()],
+        }),
+        None,
+    );
+    let server = start_server(cfg, QuotaConfig::default(), None)
+        .await
+        .unwrap();
+    let mcp_url = format!("http://{}/mcp", server.local_addr());
+    let client = http_client();
+
+    // 1. GET /mcp and stateless DELETE /mcp (without Mcp-Session-Id) pass directly to upstream
+    let (st_get, _, body_get) = send_http(
+        &client,
+        Method::GET,
+        &mcp_url,
+        &[("authorization", "Bearer inbound-secret-tok-1")],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_get, StatusCode::OK);
+    assert_eq!(&body_get[..], b": upstream-get-stream\n\n");
+
+    let (st_del, hdrs_del, _) = send_http(
+        &client,
+        Method::DELETE,
+        &mcp_url,
+        &[("authorization", "Bearer inbound-secret-tok-1")],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(st_del, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(hdrs_del.get(header::ALLOW).unwrap(), "POST, GET");
+
+    // 2. Stateless 2025-11-25 tools/call with Accept: application/json (no session, no _meta) passes through
+    let (st_stateless, _, body_stateless) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("accept", "application/json"),
+            ("mcp-protocol-version", "2025-11-25"),
+        ],
+        Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ls"}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_stateless, StatusCode::OK);
+    let stateless_val: Value = serde_json::from_slice(&body_stateless).unwrap();
+    assert_eq!(stateless_val["result"]["seenAccept"], "application/json");
+
+    // 3. Client JSON-RPC Response (Sampling/Elicitation) and Batch and future version notifications pass through
+    for raw in [
+        &br#"{"jsonrpc":"2.0","id":"srv_req_1","result":{"roots":[]}}"#[..],
+        &br#"{"jsonrpc":"2.0","id":9,"error":{"code":-1,"message":"denied"}}"#[..],
+    ] {
+        let (st_resp, _, _) = send_http(
+            &client,
+            Method::POST,
+            &mcp_url,
+            &[
+                ("authorization", "Bearer inbound-secret-tok-1"),
+                ("content-type", "application/json"),
+            ],
+            Bytes::copy_from_slice(raw),
+        )
+        .await;
+        assert_eq!(st_resp, StatusCode::ACCEPTED);
+    }
+
+    let (st_batch, _, body_batch) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+        ],
+        Bytes::from_static(br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#),
+    )
+    .await;
+    assert_eq!(st_batch, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_batch).unwrap()[0]["result"],
+        "batch-ok"
+    );
+
+    let (st_future_notif, _, _) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("mcp-protocol-version", "2027-06-01"),
+        ],
+        Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#),
+    )
+    .await;
+    assert_eq!(st_future_notif, StatusCode::ACCEPTED);
+
+    // 4. Compressed Content-Encoding: gzip passes through on tools/call, returns 415 on intercepted Mcp-Method
+    let (st_gzip_ok, _, body_gzip_ok) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("content-encoding", "gzip"),
+            ("mcp-method", "tools/call"),
+        ],
+        Bytes::from_static(b"compressed-bytes"),
+    )
+    .await;
+    assert_eq!(st_gzip_ok, StatusCode::OK);
+    assert_eq!(&body_gzip_ok[..], b"compressed-bytes");
+
+    let (st_gzip_415, _, _) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("content-encoding", "gzip"),
+            ("mcp-method", "events/poll"),
+        ],
+        Bytes::from_static(b"compressed-bytes"),
+    )
+    .await;
+    assert_eq!(st_gzip_415, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // Non-JSON Content-Type passes through to upstream when upstream is present
+    let (st_bin, _, body_bin) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "text/plain"),
+        ],
+        Bytes::from_static(b"raw-text"),
+    )
+    .await;
+    assert_eq!(st_bin, StatusCode::CREATED);
+    assert_eq!(&body_bin[..], b"raw-text");
+
+    // 5. Multi-frame SSE initialize handshake injects capability AND preserves trailing SSE notifications/requests
+    let (st_hs, hdrs_hs, body_hs) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("accept", "application/json, text/event-stream"),
+        ],
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#),
+    )
+    .await;
+    assert_eq!(st_hs, StatusCode::OK);
+    assert!(hdrs_hs.get(header::CONTENT_LENGTH).is_none());
+    let hs_text = std::str::from_utf8(&body_hs).unwrap();
+    assert!(hs_text.contains(r#""events":{}"#));
+    assert!(hs_text.contains("notifications/tools/list_changed"));
+    assert!(hs_text.contains("roots/list"));
+
+    // 6. Adversarial >128KiB params BEFORE trailing "method":"events/poll" cannot bypass disallow_arguments
+    let big_pad = "p".repeat(140 * 1024);
+    let sneaky = format!(
+        r#"{{"params":{{"pad":"{big_pad}","name":"task.exited","arguments":{{"scope":"all"}}}},"jsonrpc":"2.0","id":77,"\u006dethod":"events\u002fpoll"}}"#
+    );
+    let (st_sneaky, _, body_sneaky) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+        ],
+        Bytes::from(sneaky),
+    )
+    .await;
+    assert_eq!(st_sneaky, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_sneaky).unwrap()["error"]["code"],
+        -32602
+    );
+
+    // 7. Dynamic upstream event not in catalog refreshes once and passes through to upstream
+    let before_calls = catalog_calls.load(Ordering::SeqCst);
+    let (st_dyn, _, body_dyn) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+        ],
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":88,"method":"events/poll","params":{"name":"dynamic.unlisted"}}"#),
+    )
+    .await;
+    assert_eq!(st_dyn, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body_dyn).unwrap()["result"]["cursor"],
+        "dyn_dynamic.unlisted"
+    );
+    assert_eq!(catalog_calls.load(Ordering::SeqCst), before_calls + 1);
+
+    // 8. Local events/list honors Accept: */* and rejects ;q=0 exclusion with 406
+    let meta = modern_meta();
+    let list_payload = Bytes::from(
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 90,
+            "method": "events/list",
+            "params": { "_meta": meta }
+        }))
+        .unwrap(),
+    );
+    let (st_wild, _, _) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("accept", "*/*"),
+            ("mcp-protocol-version", PROTOCOL_VERSION_MODERN),
+            ("mcp-method", "events/list"),
+        ],
+        list_payload.clone(),
+    )
+    .await;
+    assert_eq!(st_wild, StatusCode::OK);
+
+    let (st_q0, _, _) = send_http(
+        &client,
+        Method::POST,
+        &mcp_url,
+        &[
+            ("authorization", "Bearer inbound-secret-tok-1"),
+            ("content-type", "application/json"),
+            ("accept", "*/*, text/event-stream;q=0"),
+            ("mcp-protocol-version", PROTOCOL_VERSION_MODERN),
+            ("mcp-method", "events/list"),
+        ],
+        list_payload,
+    )
+    .await;
+    assert_eq!(st_q0, StatusCode::NOT_ACCEPTABLE);
+
     server.shutdown().await.unwrap();
 }

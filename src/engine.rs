@@ -5,15 +5,16 @@ use crate::auth::{
     AuthCheckOutcome, AuthContextClient, compute_refresh_before, intersect_scopes, scopes_subset,
 };
 use crate::config::{Config, IngestEventConfig};
-use crate::outbound::{DeliveryOutcome, OutboundClient, validate_callback_url};
-use crate::schema::{normalize_filter_arguments, scalar_eq, validate_against_schema};
+use crate::outbound::{DeliveryOutcome, OutboundClient, VerifyError, validate_callback_url};
+use crate::schema::{compile_validator, normalize_filter_arguments_with_validator, scalar_eq};
 use crate::store::{
     PersistedState, PersistedSubscription, STATE_VERSION, StateStore, StoreHandle, VerifiedEndpoint,
 };
 use crate::types::{
     ByteLease, CallbackErrorReason, MAX_INGEST_BODY_BYTES, MAX_WEBHOOK_PAYLOAD_BYTES, MemoryPools,
     Profile, QuotaConfig, SecretString, SubscriptionKey, decode_whsec, is_valid_event_id,
-    random_base64url, random_bytes, sha256_bytes, sha256_hex, unix_now, utc_rfc3339_now,
+    random_base64url, random_bytes, sha256_bytes, sha256_hex, unix_now, unix_now_ms,
+    utc_rfc3339_now,
 };
 use crate::upstream::{
     UpstreamClient, UpstreamError, UpstreamEventDescriptor, UpstreamEventStream,
@@ -35,13 +36,24 @@ const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 const MAX_TRANSIENT_RETRIES: u32 = 6;
 const VERIFY_RATE_WINDOW: Duration = Duration::from_secs(60);
 const VERIFY_RATE_LIMIT: usize = 20;
+const VERIFY_PRINCIPAL_RATE_LIMIT: usize = 60;
+const MAX_VERIFY_RATE_ENTRIES: usize = 4096;
 const KEY_LOCK_PRUNE_THRESHOLD: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineError {
     InvalidParams(String),
-    NotFound { kind: &'static str, message: String },
+    NotFound {
+        kind: &'static str,
+        message: String,
+    },
+    InvalidToken(String),
+    InsufficientScope {
+        required_scopes: Vec<String>,
+        message: String,
+    },
     Forbidden(String),
+    AuthUnavailable(String),
     ResourceExhausted(String),
     Unsupported(String),
     CallbackEndpoint(CallbackErrorReason),
@@ -53,11 +65,13 @@ impl EngineError {
         match self {
             Self::InvalidParams(_) => -32602,
             Self::NotFound { .. } => profile.not_found_code(),
-            Self::Forbidden(_) => profile.forbidden_code(),
+            Self::InvalidToken(_) | Self::InsufficientScope { .. } | Self::Forbidden(_) => {
+                profile.forbidden_code()
+            }
             Self::ResourceExhausted(_) => profile.resource_exhausted_code(),
             Self::Unsupported(_) => profile.unsupported_code(),
             Self::CallbackEndpoint(_) => profile.callback_error_code(),
-            Self::Internal(_) => -32603,
+            Self::AuthUnavailable(_) | Self::Internal(_) => -32603,
         }
     }
 
@@ -74,10 +88,13 @@ impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidParams(m)
+            | Self::InvalidToken(m)
             | Self::Forbidden(m)
+            | Self::AuthUnavailable(m)
             | Self::ResourceExhausted(m)
             | Self::Unsupported(m)
             | Self::Internal(m) => f.write_str(m),
+            Self::InsufficientScope { message, .. } => f.write_str(message),
             Self::NotFound { message, .. } => f.write_str(message),
             Self::CallbackEndpoint(reason) => {
                 write!(
@@ -222,19 +239,33 @@ struct ResolvedCaller {
     expires_at: Option<u64>,
 }
 
+struct CompiledIngestEvent {
+    payload_validator: Arc<jsonschema::Validator>,
+    input_validator: Arc<jsonschema::Validator>,
+}
+
+#[derive(Clone)]
+struct CachedUpstreamEvent {
+    descriptor: UpstreamEventDescriptor,
+    catalog: CatalogEvent,
+    input_validator: Result<Arc<jsonschema::Validator>, String>,
+}
+
 #[derive(Default)]
 struct CatalogCache {
     fetched_at: Option<Instant>,
-    upstream_events: Vec<UpstreamEventDescriptor>,
+    upstream_events: Vec<CachedUpstreamEvent>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum EventKind {
     Ingest {
         input_schema: Value,
+        input_validator: Arc<jsonschema::Validator>,
     },
     Upstream {
         input_schema: Value,
+        input_validator: Arc<jsonschema::Validator>,
         disallow_arguments: Vec<String>,
         supports_webhook: bool,
         supports_push: bool,
@@ -277,6 +308,7 @@ enum OutboxItem {
         _lease: ByteLease,
     },
     Gap {
+        webhook_id: String,
         cursor: String,
         _lease: ByteLease,
     },
@@ -304,6 +336,7 @@ struct SubState {
     prev_secret_until: Option<u64>,
     refresh_before: u64,
     safe_cursor: Option<String>,
+    bootstrap_since_ms: Option<u64>,
     ingest_cursor: Option<String>,
     poll_not_before: Option<(Instant, Duration)>,
     pending_truncated_for_refresh: bool,
@@ -349,6 +382,7 @@ impl SubRuntime {
             prev_secret_until: refresh.map_or(st.prev_secret_until, |r| r.prev_secret_until),
             refresh_before: refresh.map_or(st.refresh_before, |r| r.refresh_before),
             safe_cursor: st.safe_cursor.clone(),
+            bootstrap_since_ms: st.bootstrap_since_ms,
             pending_truncated_for_refresh: st.pending_truncated_for_refresh,
             suspended: st.suspended && !refresh.is_some_and(|r| r.resume_suspended),
             last_error: st.last_error,
@@ -550,7 +584,7 @@ struct DedupEntry {
 struct RuntimeState {
     subscriptions: HashMap<SubscriptionKey, Arc<SubRuntime>>,
     verified_endpoints: HashMap<(String, String, String), u64>,
-    dedup: HashMap<(usize, String), DedupEntry>,
+    dedup: HashMap<(usize, String, String), DedupEntry>,
 }
 
 impl RuntimeState {
@@ -591,7 +625,64 @@ struct VerifyBucket {
     count: usize,
 }
 
+#[derive(Default)]
+struct VerifyRateState {
+    by_principal: HashMap<String, VerifyBucket>,
+    by_host: HashMap<(String, String), VerifyBucket>,
+}
+
+impl VerifyRateState {
+    fn prune_expired(&mut self, now: Instant) {
+        self.by_principal
+            .retain(|_, b| now.saturating_duration_since(b.window_start) < VERIFY_RATE_WINDOW);
+        self.by_host
+            .retain(|_, b| now.saturating_duration_since(b.window_start) < VERIFY_RATE_WINDOW);
+    }
+
+    fn check_and_record(
+        &mut self,
+        principal: &str,
+        target_host: &str,
+        now: Instant,
+    ) -> Result<(), EngineError> {
+        self.prune_expired(now);
+        let host_key = (principal.to_owned(), target_host.to_owned());
+        if (!self.by_principal.contains_key(principal)
+            && self.by_principal.len() >= MAX_VERIFY_RATE_ENTRIES)
+            || (!self.by_host.contains_key(&host_key)
+                && self.by_host.len() >= MAX_VERIFY_RATE_ENTRIES)
+        {
+            return Err(EngineError::ResourceExhausted(
+                "callback verification rate table is full".into(),
+            ));
+        }
+        let p_count = self.by_principal.get(principal).map_or(0, |b| b.count);
+        let h_count = self.by_host.get(&host_key).map_or(0, |b| b.count);
+        if p_count >= VERIFY_PRINCIPAL_RATE_LIMIT || h_count >= VERIFY_RATE_LIMIT {
+            return Err(EngineError::ResourceExhausted(
+                "callback verification rate limit exceeded".into(),
+            ));
+        }
+        self.by_principal
+            .entry(principal.to_owned())
+            .or_insert(VerifyBucket {
+                window_start: now,
+                count: 0,
+            })
+            .count += 1;
+        self.by_host
+            .entry(host_key)
+            .or_insert(VerifyBucket {
+                window_start: now,
+                count: 0,
+            })
+            .count += 1;
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawIngestEvent {
     #[serde(rename = "eventId")]
     event_id: String,
@@ -599,6 +690,10 @@ struct RawIngestEvent {
     #[serde(default)]
     timestamp: Option<String>,
     data: Value,
+    #[serde(default)]
+    cursor: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<serde::de::IgnoredAny>,
 }
 
 pub struct HookdEngine {
@@ -608,12 +703,13 @@ pub struct HookdEngine {
     outbound: OutboundClient,
     upstream: Option<UpstreamClient>,
     auth_client: Option<AuthContextClient>,
+    ingest_validators: HashMap<String, CompiledIngestEvent>,
     store: StoreHandle,
     upstream_stream_sem: Arc<Semaphore>,
     global_delivery_sem: Arc<Semaphore>,
     catalog_cache: tokio::sync::Mutex<CatalogCache>,
     key_locks: Mutex<HashMap<SubscriptionKey, Weak<tokio::sync::Mutex<()>>>>,
-    verify_rate: Mutex<HashMap<(String, String), VerifyBucket>>,
+    verify_rate: Mutex<VerifyRateState>,
     runtime: Mutex<RuntimeState>,
     shutdown_tx: watch::Sender<bool>,
     tasks: TaskTracker,
@@ -646,6 +742,27 @@ impl HookdEngine {
             .as_ref()
             .map(AuthContextClient::new)
             .transpose()?;
+
+        let mut ingest_validators = HashMap::new();
+        if let Some(ref ing) = config.ingest {
+            for ev in &ing.events {
+                let payload_validator = Arc::new(
+                    compile_validator(&ev.payload_schema)
+                        .map_err(|e| format!("ingest event '{}': {e}", ev.name))?,
+                );
+                let input_validator = Arc::new(
+                    compile_validator(&ev.input_schema)
+                        .map_err(|e| format!("ingest event '{}' input_schema: {e}", ev.name))?,
+                );
+                ingest_validators.insert(
+                    ev.name.clone(),
+                    CompiledIngestEvent {
+                        payload_validator,
+                        input_validator,
+                    },
+                );
+            }
+        }
 
         let now = unix_now();
         let mut mutated = false;
@@ -752,12 +869,13 @@ impl HookdEngine {
             outbound,
             upstream,
             auth_client,
+            ingest_validators,
             store: StoreHandle::spawn(state_store),
             upstream_stream_sem,
             global_delivery_sem,
             catalog_cache: tokio::sync::Mutex::new(CatalogCache::default()),
             key_locks: Mutex::new(HashMap::new()),
-            verify_rate: Mutex::new(HashMap::new()),
+            verify_rate: Mutex::new(VerifyRateState::default()),
             runtime: Mutex::new(RuntimeState {
                 subscriptions,
                 verified_endpoints,
@@ -837,6 +955,10 @@ impl HookdEngine {
             .len()
     }
 
+    pub async fn verify_caller(&self, caller: &CallerAuth, live: bool) -> Result<(), EngineError> {
+        self.resolve_caller(caller, live).await.map(|_| ())
+    }
+
     pub async fn list_events(
         &self,
         caller: &CallerAuth,
@@ -848,8 +970,8 @@ impl HookdEngine {
         let upstream_events = self.get_upstream_catalog().await?;
 
         let mut merged = Vec::new();
-        for ev in &upstream_events {
-            let cat = self.transform_upstream_event(ev);
+        for cached in &upstream_events {
+            let cat = cached.catalog.clone();
             let include = if legacy_session || self.config.profile == Profile::Chatgpt {
                 cat.delivery.iter().any(|m| m == "webhook")
             } else {
@@ -906,11 +1028,9 @@ impl HookdEngine {
             return Ok(Some(event.input_schema.clone()));
         }
         Ok(self
-            .get_upstream_catalog()
+            .lookup_upstream_event_refresh_once(name)
             .await?
-            .into_iter()
-            .find(|event| event.name == name)
-            .map(|event| event.input_schema))
+            .map(|cached| cached.descriptor.input_schema))
     }
 
     pub async fn resolve_event_for_passthrough(
@@ -921,11 +1041,10 @@ impl HookdEngine {
         if self.find_ingest_event(name).is_some() {
             return Ok(PassthroughResolution::IngestUnsupported);
         }
-        let upstream_events = self.get_upstream_catalog().await?;
-        let exists = upstream_events.iter().any(|ev| ev.name == name);
-        if !exists {
+        if self.upstream.is_none() {
             return Ok(PassthroughResolution::NotFound);
         }
+        let _ = self.lookup_upstream_event_refresh_once(name).await?;
         if let Some(args) = arguments
             && let Some(expose) = self.find_expose_event(name)
         {
@@ -958,10 +1077,19 @@ impl HookdEngine {
         let resolved = self.resolve_caller(caller, true).await?;
 
         let event_kind = self.resolve_event_for_subscribe(&req.event_name).await?;
-        let (input_schema, disallow_args, is_ingest) = match &event_kind {
-            EventKind::Ingest { input_schema } => (input_schema.clone(), Vec::new(), true),
+        let (input_schema, input_validator, disallow_args, is_ingest) = match &event_kind {
+            EventKind::Ingest {
+                input_schema,
+                input_validator,
+            } => (
+                input_schema.clone(),
+                Arc::clone(input_validator),
+                Vec::new(),
+                true,
+            ),
             EventKind::Upstream {
                 input_schema,
+                input_validator,
                 disallow_arguments,
                 supports_webhook,
                 ..
@@ -972,7 +1100,12 @@ impl HookdEngine {
                         req.event_name
                     )));
                 }
-                (input_schema.clone(), disallow_arguments.clone(), false)
+                (
+                    input_schema.clone(),
+                    Arc::clone(input_validator),
+                    disallow_arguments.clone(),
+                    false,
+                )
             }
         };
 
@@ -984,9 +1117,12 @@ impl HookdEngine {
                 )));
             }
         }
-        let normalized_args = normalize_filter_arguments(&input_schema, &req.arguments)
-            .await
-            .map_err(EngineError::InvalidParams)?;
+        let normalized_args = normalize_filter_arguments_with_validator(
+            &input_validator,
+            &input_schema,
+            &req.arguments,
+        )
+        .map_err(EngineError::InvalidParams)?;
 
         let key = SubscriptionKey::new(
             &resolved.principal,
@@ -1042,9 +1178,13 @@ impl HookdEngine {
             if self.auth_client.is_some()
                 && !scopes_subset(&granted_scopes, &resolved.effective_scopes)
             {
-                return Err(EngineError::Forbidden(
-                    "caller scopes no longer cover subscription granted scopes".into(),
-                ));
+                let mut required_scopes = granted_scopes.clone();
+                required_scopes.sort();
+                required_scopes.dedup();
+                return Err(EngineError::InsufficientScope {
+                    required_scopes,
+                    message: "caller scopes no longer cover subscription granted scopes".into(),
+                });
             }
 
             let secret_changed = current_secret.expose() != req.delivery_secret.expose();
@@ -1175,6 +1315,7 @@ impl HookdEngine {
                 ..
             }
         );
+        let mut bootstrap_since_ms = None;
         let (safe_cursor, response_cursor, truncated, replay_events, replay_cursor) = if is_ingest {
             (None, None, false, Vec::new(), None)
         } else if push_only {
@@ -1191,6 +1332,7 @@ impl HookdEngine {
             started_stream = Some(started);
             (safe, response, truncated, Vec::new(), None)
         } else {
+            let bootstrap_started_ms = unix_now_ms();
             let upstream = self
                 .upstream
                 .as_ref()
@@ -1214,6 +1356,12 @@ impl HookdEngine {
                 let head = poll.cursor.or(req.cursor.clone());
                 (head.clone(), head, poll.truncated, Vec::new(), None)
             } else {
+                if req.cursor.is_none()
+                    && let Some(max_age_ms) = req.max_age_ms
+                    && poll.cursor.is_some()
+                {
+                    bootstrap_since_ms = Some(bootstrap_started_ms.saturating_sub(max_age_ms));
+                }
                 (
                     req.cursor.clone(),
                     req.cursor.clone(),
@@ -1252,6 +1400,7 @@ impl HookdEngine {
             prev_secret_until: None,
             refresh_before,
             safe_cursor,
+            bootstrap_since_ms,
             pending_truncated_for_refresh: false,
             suspended: false,
             last_error: None,
@@ -1342,12 +1491,20 @@ impl HookdEngine {
 
         // Normalize arguments if we know the event schema so key matches subscribe().
         let normalized_args = match self.resolve_event_for_subscribe(&req.event_name).await {
-            Ok(EventKind::Ingest { input_schema })
-            | Ok(EventKind::Upstream { input_schema, .. }) => {
-                normalize_filter_arguments(&input_schema, &req.arguments)
-                    .await
-                    .unwrap_or(req.arguments)
-            }
+            Ok(EventKind::Ingest {
+                input_schema,
+                input_validator,
+            })
+            | Ok(EventKind::Upstream {
+                input_schema,
+                input_validator,
+                ..
+            }) => normalize_filter_arguments_with_validator(
+                &input_validator,
+                &input_schema,
+                &req.arguments,
+            )
+            .unwrap_or(req.arguments),
             Err(_) => req.arguments,
         };
 
@@ -1404,6 +1561,7 @@ impl HookdEngine {
         }
         let parsed: RawIngestEvent = serde_json::from_slice(raw_body)
             .map_err(|e| IngestError::BadRequest(format!("invalid JSON body: {e}")))?;
+        let _ = (parsed.cursor, parsed.meta);
 
         if !is_valid_event_id(&parsed.event_id) {
             return Err(IngestError::Unprocessable(
@@ -1418,8 +1576,12 @@ impl HookdEngine {
             )));
         };
 
-        validate_against_schema(&ev_cfg.payload_schema, &parsed.data)
-            .await
+        let compiled = self.ingest_validators.get(&ev_cfg.name).ok_or_else(|| {
+            IngestError::ServiceUnavailable("missing compiled validator for ingest event".into())
+        })?;
+        compiled
+            .payload_validator
+            .validate(&parsed.data)
             .map_err(|e| IngestError::Unprocessable(format!("payload schema violation: {e}")))?;
 
         let data_json = serde_json::to_string(&parsed.data)
@@ -1435,7 +1597,7 @@ impl HookdEngine {
                 "daemon is shutting down".into(),
             ));
         }
-        let dedup_key = (token_slot, parsed.event_id.clone());
+        let dedup_key = (token_slot, parsed.name.clone(), parsed.event_id.clone());
 
         if let Some(existing) = rt.dedup.get(&dedup_key) {
             if existing
@@ -1683,11 +1845,19 @@ impl HookdEngine {
                 };
                 match outcome {
                     AuthCheckOutcome::Active(checked) => {
+                        if checked.resource != client.expected_resource()
+                            || checked.expires_at <= unix_now()
+                        {
+                            return Err(EngineError::InvalidToken(
+                                "delegated authorization is inactive".into(),
+                            ));
+                        }
                         let effective = intersect_scopes(header_scopes, &checked.scopes);
                         if effective.is_empty() {
-                            return Err(EngineError::Forbidden(
-                                "no effective scopes after intersection".into(),
-                            ));
+                            return Err(EngineError::InsufficientScope {
+                                required_scopes: Vec::new(),
+                                message: "no effective scopes after intersection".into(),
+                            });
                         }
                         Ok(ResolvedCaller {
                             principal: checked.principal,
@@ -1696,10 +1866,10 @@ impl HookdEngine {
                             expires_at: Some(checked.expires_at),
                         })
                     }
-                    AuthCheckOutcome::Inactive => {
-                        Err(EngineError::Forbidden("authorization is not active".into()))
-                    }
-                    AuthCheckOutcome::TransientError(err) => Err(EngineError::Internal(err)),
+                    AuthCheckOutcome::Inactive => Err(EngineError::InvalidToken(
+                        "delegated authorization is inactive".into(),
+                    )),
+                    AuthCheckOutcome::TransientError(err) => Err(EngineError::AuthUnavailable(err)),
                 }
             }
             (Some(_), CallerAuth::StaticSlot(_)) => Err(EngineError::Internal(
@@ -1711,22 +1881,14 @@ impl HookdEngine {
         }
     }
 
-    async fn get_upstream_catalog(&self) -> Result<Vec<UpstreamEventDescriptor>, EngineError> {
+    async fn refresh_upstream_catalog_locked(
+        &self,
+        cache: &mut CatalogCache,
+        allow_not_found: bool,
+    ) -> Result<(), EngineError> {
         let Some(ref upstream) = self.upstream else {
-            return Ok(Vec::new());
+            return Ok(());
         };
-        let mut cache = self.catalog_cache.lock().await;
-        if let Some(ts) = cache.fetched_at
-            && ts.elapsed() < CATALOG_CACHE_TTL
-        {
-            return Ok(cache.upstream_events.clone());
-        }
-
-        let allow_not_found = self
-            .config
-            .upstream
-            .as_ref()
-            .is_some_and(|u| u.expose_events.is_empty());
         let events = upstream
             .list_events_all_pages(allow_not_found)
             .await
@@ -1745,34 +1907,100 @@ impl HookdEngine {
             }
         }
 
-        cache.upstream_events = events.clone();
+        let mut compiled = Vec::with_capacity(events.len());
+        for descriptor in events {
+            let catalog = self.transform_upstream_event(&descriptor);
+            let input_validator = compile_validator(&catalog.input_schema).map(Arc::new);
+            compiled.push(CachedUpstreamEvent {
+                descriptor,
+                catalog,
+                input_validator,
+            });
+        }
+        cache.upstream_events = compiled;
         cache.fetched_at = Some(Instant::now());
-        Ok(events)
+        Ok(())
+    }
+
+    async fn get_upstream_catalog(&self) -> Result<Vec<CachedUpstreamEvent>, EngineError> {
+        if self.upstream.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut cache = self.catalog_cache.lock().await;
+        if let Some(ts) = cache.fetched_at
+            && ts.elapsed() < CATALOG_CACHE_TTL
+        {
+            return Ok(cache.upstream_events.clone());
+        }
+        let allow_not_found = self
+            .config
+            .upstream
+            .as_ref()
+            .is_some_and(|u| u.expose_events.is_empty());
+        self.refresh_upstream_catalog_locked(&mut cache, allow_not_found)
+            .await?;
+        Ok(cache.upstream_events.clone())
+    }
+
+    async fn lookup_upstream_event_refresh_once(
+        &self,
+        name: &str,
+    ) -> Result<Option<CachedUpstreamEvent>, EngineError> {
+        if self.upstream.is_none() {
+            return Ok(None);
+        }
+        let mut cache = self.catalog_cache.lock().await;
+        if cache
+            .fetched_at
+            .is_some_and(|ts| ts.elapsed() < CATALOG_CACHE_TTL)
+            && let Some(found) = cache
+                .upstream_events
+                .iter()
+                .find(|e| e.descriptor.name == name)
+        {
+            return Ok(Some(found.clone()));
+        }
+        self.refresh_upstream_catalog_locked(&mut cache, true)
+            .await?;
+        Ok(cache
+            .upstream_events
+            .iter()
+            .find(|e| e.descriptor.name == name)
+            .cloned())
     }
 
     async fn resolve_event_for_subscribe(&self, name: &str) -> Result<EventKind, EngineError> {
         if let Some(ev) = self.find_ingest_event(name) {
+            let compiled = self.ingest_validators.get(name).ok_or_else(|| {
+                EngineError::Internal("missing compiled validator for ingest event".into())
+            })?;
             return Ok(EventKind::Ingest {
                 input_schema: ev.input_schema.clone(),
+                input_validator: Arc::clone(&compiled.input_validator),
             });
         }
         let upstream_events = self.get_upstream_catalog().await?;
-        let Some(ev) = upstream_events.iter().find(|e| e.name == name) else {
+        let Some(cached) = upstream_events.iter().find(|e| e.descriptor.name == name) else {
             return Err(EngineError::NotFound {
                 kind: "event",
                 message: format!("event '{name}' not found"),
             });
         };
-        let transformed = self.transform_upstream_event(ev);
+        let input_validator = cached
+            .input_validator
+            .clone()
+            .map_err(EngineError::InvalidParams)?;
         let disallow_arguments = self
             .find_expose_event(name)
             .map(|e| e.disallow_arguments.clone())
             .unwrap_or_default();
-        let supports_webhook = transformed.delivery.iter().any(|m| m == "webhook");
-        let supports_push = transformed.delivery.iter().any(|m| m == "push");
-        let supports_poll = ev.delivery.is_empty() || ev.delivery.iter().any(|m| m == "poll");
+        let supports_webhook = cached.catalog.delivery.iter().any(|m| m == "webhook");
+        let supports_push = cached.catalog.delivery.iter().any(|m| m == "push");
+        let supports_poll = cached.descriptor.delivery.is_empty()
+            || cached.descriptor.delivery.iter().any(|m| m == "poll");
         Ok(EventKind::Upstream {
-            input_schema: transformed.input_schema,
+            input_schema: cached.catalog.input_schema.clone(),
+            input_validator,
             disallow_arguments,
             supports_webhook,
             supports_push,
@@ -1855,31 +2083,9 @@ impl HookdEngine {
             return Ok(());
         }
 
-        // Per-(principal, target_host) rate limit on verification challenges.
         {
             let mut rl = self.verify_rate.lock().unwrap_or_else(|p| p.into_inner());
-            let now_inst = Instant::now();
-            if rl.len() >= 256 {
-                rl.retain(|_, b| {
-                    now_inst.saturating_duration_since(b.window_start) < VERIFY_RATE_WINDOW
-                });
-            }
-            let entry = rl
-                .entry((principal.to_owned(), target_host.to_owned()))
-                .or_insert(VerifyBucket {
-                    window_start: now_inst,
-                    count: 0,
-                });
-            if now_inst.saturating_duration_since(entry.window_start) >= VERIFY_RATE_WINDOW {
-                entry.window_start = now_inst;
-                entry.count = 0;
-            }
-            if entry.count >= VERIFY_RATE_LIMIT {
-                return Err(EngineError::ResourceExhausted(
-                    "callback verification rate limit exceeded".into(),
-                ));
-            }
-            entry.count += 1;
+            rl.check_and_record(principal, target_host, Instant::now())?;
         }
 
         let mut shutdown = self.shutdown_tx.subscribe();
@@ -1901,7 +2107,13 @@ impl HookdEngine {
             result = self.outbound.verify_callback(url, sub_id, secret) => result,
         };
         drop(permit);
-        verified.map_err(EngineError::CallbackEndpoint)?;
+        match verified {
+            Ok(()) => {}
+            Err(VerifyError::Callback(reason)) => {
+                return Err(EngineError::CallbackEndpoint(reason));
+            }
+            Err(VerifyError::RateLimited(msg)) => return Err(EngineError::ResourceExhausted(msg)),
+        }
 
         {
             let mut rt = self.runtime.lock().unwrap_or_else(|p| p.into_inner());
@@ -2091,6 +2303,7 @@ impl HookdEngine {
                         let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
                         state.outbox.pop_front();
                         state.safe_cursor = Some(cursor);
+                        state.bootstrap_since_ms = None;
                         state.outbox.len() < self.quotas.max_outbox_per_sub / 2
                     };
                     self.mark_state_dirty();
@@ -2098,66 +2311,42 @@ impl HookdEngine {
                         sub.space_notify.notify_one();
                     }
                 }
-                HeadAction::Gap { cursor } => {
+                HeadAction::Gap { webhook_id, cursor }
+                    if self.config.profile == Profile::Chatgpt =>
+                {
                     if !self
                         .verify_auth_before_delivery(&sub, &mut cancel_rx, &mut shutdown_rx)
                         .await
                     {
                         break;
                     }
-                    if self.config.profile == Profile::Sep3415 {
-                        let body = json!({ "type": "gap", "cursor": cursor }).to_string();
-                        let wid = format!(
-                            "msg_{}",
-                            random_base64url(18).unwrap_or_else(|_| "gap".into())
-                        );
-                        let _permit = tokio::select! {
-                            res = self.global_delivery_sem.acquire() => match res {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            },
-                            _ = cancel_rx.changed() => return,
-                            _ = shutdown_rx.changed() => return,
-                            () = self.subscription_expired(&sub) => return,
-                        };
-                        match self
-                            .delivery_authorization(&sub, &mut cancel_rx, &mut shutdown_rx)
-                            .await
-                        {
-                            DeliveryAuthorization::Ready => {}
-                            DeliveryAuthorization::Retry => continue,
-                            DeliveryAuthorization::Revoked => return,
-                        }
-                        if self.expire_subscription_if_due(&sub) {
-                            return;
-                        }
-                        let (secret, prev_secret) = active_secrets(&sub);
-                        tokio::select! {
-                            biased;
-                            () = self.subscription_expired(&sub) => return,
-                            _ = cancel_rx.changed() => return,
-                            _ = self.outbound.post_webhook(
-                                &sub.key.url,
-                                &sub.id,
-                                &wid,
-                                body.as_bytes(),
-                                &secret,
-                                prev_secret.as_ref(),
-                            ) => {}
-                        }
-                    }
+                    let _ = webhook_id;
                     let should_notify_space = {
                         let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
                         st.outbox.pop_front();
                         st.safe_cursor = Some(cursor);
-                        if self.config.profile == Profile::Chatgpt {
-                            st.pending_truncated_for_refresh = true;
-                        }
+                        st.bootstrap_since_ms = None;
+                        st.pending_truncated_for_refresh = true;
                         st.outbox.len() < self.quotas.max_outbox_per_sub / 2
                     };
                     self.mark_state_dirty();
                     if should_notify_space {
                         sub.space_notify.notify_one();
+                    }
+                }
+                HeadAction::Gap { webhook_id, cursor } => {
+                    if !self
+                        .deliver_with_retry(
+                            &sub,
+                            &webhook_id,
+                            Some(cursor.clone()),
+                            &mut cancel_rx,
+                            &mut shutdown_rx,
+                            |_| json!({ "type": "gap", "cursor": &cursor }).to_string(),
+                        )
+                        .await
+                    {
+                        return;
                     }
                 }
                 HeadAction::Event {
@@ -2169,188 +2358,213 @@ impl HookdEngine {
                     advance_cursor,
                     is_ingest,
                 } => {
-                    let mut attempt: u32 = 0;
-                    loop {
-                        if *cancel_rx.borrow() {
-                            return;
-                        }
-                        if !self
-                            .verify_auth_before_delivery(&sub, &mut cancel_rx, &mut shutdown_rx)
-                            .await
-                        {
-                            return;
-                        }
-
-                        let _permit = tokio::select! {
-                            res = self.global_delivery_sem.acquire() => match res {
-                                Ok(p) => p,
-                                Err(_) => return,
+                    if !self
+                        .deliver_with_retry(
+                            &sub,
+                            &webhook_id,
+                            advance_cursor.clone(),
+                            &mut cancel_rx,
+                            &mut shutdown_rx,
+                            |safe_cursor| {
+                                let payload_cursor = if is_ingest {
+                                    None
+                                } else {
+                                    advance_cursor.as_deref().or(safe_cursor)
+                                };
+                                serialize_event_envelope(
+                                    &event_id,
+                                    &name,
+                                    &timestamp,
+                                    &data_json,
+                                    payload_cursor,
+                                )
                             },
-                            _ = cancel_rx.changed() => return,
-                            _ = shutdown_rx.changed() => return,
-                            () = self.subscription_expired(&sub) => return,
-                        };
-                        match self
-                            .delivery_authorization(&sub, &mut cancel_rx, &mut shutdown_rx)
-                            .await
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deliver the current outbox head with backoff retry, permanent drop, and suspension.
+    /// Returns `false` when the worker loop must exit immediately.
+    async fn deliver_with_retry<F>(
+        self: &Arc<Self>,
+        sub: &Arc<SubRuntime>,
+        webhook_id: &str,
+        advance_cursor: Option<String>,
+        cancel_rx: &mut watch::Receiver<bool>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        build_body: F,
+    ) -> bool
+    where
+        F: Fn(Option<&str>) -> String,
+    {
+        let mut attempt: u32 = 0;
+        loop {
+            if *cancel_rx.borrow() {
+                return false;
+            }
+            if !self
+                .verify_auth_before_delivery(sub, cancel_rx, shutdown_rx)
+                .await
+            {
+                return false;
+            }
+
+            let permit = tokio::select! {
+                res = self.global_delivery_sem.acquire() => match res {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                },
+                _ = cancel_rx.changed() => return false,
+                _ = shutdown_rx.changed() => return false,
+                () = self.subscription_expired(sub) => return false,
+            };
+            match self
+                .delivery_authorization(sub, cancel_rx, shutdown_rx)
+                .await
+            {
+                DeliveryAuthorization::Ready => {}
+                DeliveryAuthorization::Retry => continue,
+                DeliveryAuthorization::Revoked => return false,
+            }
+            if self.expire_subscription_if_due(sub) {
+                return false;
+            }
+            let (secret, prev_secret, safe_cursor, is_suspended) = {
+                let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                let now = unix_now();
+                let prev = match (&st.prev_secret, st.prev_secret_until) {
+                    (Some(s), Some(until)) if now <= until => Some(s.clone()),
+                    _ => None,
+                };
+                (
+                    st.secret.clone(),
+                    prev,
+                    st.safe_cursor.clone(),
+                    st.suspended,
+                )
+            };
+            if is_suspended {
+                return true;
+            }
+
+            let body = build_body(safe_cursor.as_deref());
+            let outcome = tokio::select! {
+                biased;
+                () = self.subscription_expired(sub) => return false,
+                _ = cancel_rx.changed() => return false,
+                outcome = self.outbound.post_webhook(
+                    &sub.key.url,
+                    &sub.id,
+                    webhook_id,
+                    body.as_bytes(),
+                    &secret,
+                    prev_secret.as_ref(),
+                ) => outcome,
+            };
+            drop(permit);
+
+            match outcome {
+                DeliveryOutcome::Success => {
+                    let (dirty, notify_space) = {
+                        let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                        st.consecutive_failures = 0;
+                        st.first_failure_at = None;
+                        st.last_error = None;
+                        st.outbox.pop_front();
+                        let mut dirty = false;
+                        if let Some(ref c) = advance_cursor {
+                            st.safe_cursor = Some(c.clone());
+                            st.bootstrap_since_ms = None;
+                            dirty = true;
+                        }
+                        (dirty, st.outbox.len() < self.quotas.max_outbox_per_sub / 2)
+                    };
+                    if dirty {
+                        self.mark_state_dirty();
+                    }
+                    if notify_space {
+                        sub.space_notify.notify_one();
+                    }
+                    return true;
+                }
+                DeliveryOutcome::PermanentDrop(reason) => {
+                    let notify_space = {
+                        let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                        st.last_error = Some(reason);
+                        st.outbox.pop_front();
+                        if let Some(ref c) = advance_cursor {
+                            st.safe_cursor = Some(c.clone());
+                            st.bootstrap_since_ms = None;
+                        }
+                        st.outbox.len() < self.quotas.max_outbox_per_sub / 2
+                    };
+                    self.mark_state_dirty();
+                    if notify_space {
+                        sub.space_notify.notify_one();
+                    }
+                    return true;
+                }
+                DeliveryOutcome::Transient(reason) => {
+                    let mut became_suspended = false;
+                    let mut exhausted_drop = false;
+                    let mut notify_space = false;
+
+                    {
+                        let mut st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                        st.consecutive_failures = st.consecutive_failures.saturating_add(1);
+                        let first = *st.first_failure_at.get_or_insert_with(Instant::now);
+                        st.last_error = Some(reason);
+
+                        if st.consecutive_failures >= self.quotas.suspend_failure_count
+                            && first.elapsed()
+                                >= Duration::from_secs(self.quotas.suspend_min_duration_secs)
                         {
-                            DeliveryAuthorization::Ready => {}
-                            DeliveryAuthorization::Retry => continue,
-                            DeliveryAuthorization::Revoked => return,
-                        }
-                        if self.expire_subscription_if_due(&sub) {
-                            return;
-                        }
-                        let (secret, prev_secret, safe_cursor, is_suspended) = {
-                            let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                            let now = unix_now();
-                            let prev = match (&st.prev_secret, st.prev_secret_until) {
-                                (Some(s), Some(until)) if now <= until => Some(s.clone()),
-                                _ => None,
-                            };
-                            (
-                                st.secret.clone(),
-                                prev,
-                                st.safe_cursor.clone(),
-                                st.suspended,
-                            )
-                        };
-                        if is_suspended {
-                            break;
-                        }
-
-                        let payload_cursor = if is_ingest {
-                            None
-                        } else {
-                            advance_cursor.as_deref().or(safe_cursor.as_deref())
-                        };
-                        let body = serialize_event_envelope(
-                            &event_id,
-                            &name,
-                            &timestamp,
-                            &data_json,
-                            payload_cursor,
-                        );
-
-                        let outcome = tokio::select! {
-                            biased;
-                            () = self.subscription_expired(&sub) => return,
-                            _ = cancel_rx.changed() => return,
-                            outcome = self.outbound.post_webhook(
-                                &sub.key.url,
-                                &sub.id,
-                                &webhook_id,
-                                body.as_bytes(),
-                                &secret,
-                                prev_secret.as_ref(),
-                            ) => outcome,
-                        };
-                        drop(_permit);
-
-                        match outcome {
-                            DeliveryOutcome::Success => {
-                                let (dirty, notify_space) = {
-                                    let mut st =
-                                        sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                                    st.consecutive_failures = 0;
-                                    st.first_failure_at = None;
-                                    st.last_error = None;
-                                    st.outbox.pop_front();
-                                    let mut dirty = false;
-                                    if let Some(ref c) = advance_cursor {
-                                        st.safe_cursor = Some(c.clone());
-                                        dirty = true;
-                                    }
-                                    (dirty, st.outbox.len() < self.quotas.max_outbox_per_sub / 2)
-                                };
-                                if dirty {
-                                    self.mark_state_dirty();
-                                }
-                                if notify_space {
-                                    sub.space_notify.notify_one();
-                                }
-                                break;
+                            st.suspended = true;
+                            became_suspended = true;
+                            st.outbox.clear();
+                            if matches!(sub.source, SubSource::Upstream { .. }) {
+                                sub.stop_consumer_locked(&mut st);
+                                st.ingest_cursor = st.safe_cursor.clone();
                             }
-                            DeliveryOutcome::PermanentDrop(reason) => {
-                                let notify_space = {
-                                    let mut st =
-                                        sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                                    st.last_error = Some(reason);
-                                    st.outbox.pop_front();
-                                    if let Some(ref c) = advance_cursor {
-                                        st.safe_cursor = Some(c.clone());
-                                    }
-                                    st.outbox.len() < self.quotas.max_outbox_per_sub / 2
-                                };
-                                self.mark_state_dirty();
-                                if notify_space {
-                                    sub.space_notify.notify_one();
-                                }
-                                break;
+                        } else if attempt >= MAX_TRANSIENT_RETRIES {
+                            st.outbox.pop_front();
+                            if let Some(ref c) = advance_cursor {
+                                st.safe_cursor = Some(c.clone());
+                                st.bootstrap_since_ms = None;
                             }
-                            DeliveryOutcome::Transient(reason) => {
-                                let mut became_suspended = false;
-                                let mut exhausted_drop = false;
-                                let mut notify_space = false;
-
-                                {
-                                    let mut st =
-                                        sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                                    st.consecutive_failures =
-                                        st.consecutive_failures.saturating_add(1);
-                                    let first =
-                                        *st.first_failure_at.get_or_insert_with(Instant::now);
-                                    st.last_error = Some(reason);
-
-                                    if st.consecutive_failures >= self.quotas.suspend_failure_count
-                                        && first.elapsed()
-                                            >= Duration::from_secs(
-                                                self.quotas.suspend_min_duration_secs,
-                                            )
-                                    {
-                                        st.suspended = true;
-                                        became_suspended = true;
-                                        if matches!(sub.source, SubSource::Upstream { .. }) {
-                                            sub.stop_consumer_locked(&mut st);
-                                            st.outbox.clear();
-                                            st.ingest_cursor = st.safe_cursor.clone();
-                                        }
-                                    } else if attempt >= MAX_TRANSIENT_RETRIES {
-                                        st.outbox.pop_front();
-                                        if let Some(ref c) = advance_cursor {
-                                            st.safe_cursor = Some(c.clone());
-                                        }
-                                        exhausted_drop = true;
-                                        notify_space =
-                                            st.outbox.len() < self.quotas.max_outbox_per_sub / 2;
-                                    }
-                                }
-
-                                if became_suspended {
-                                    self.mark_state_dirty();
-                                    break;
-                                }
-                                if exhausted_drop {
-                                    self.mark_state_dirty();
-                                    if notify_space {
-                                        sub.space_notify.notify_one();
-                                    }
-                                    break;
-                                }
-                                if *shutdown_rx.borrow() {
-                                    return;
-                                }
-
-                                let delay = backoff_with_jitter(self.quotas.retry_base_ms, attempt);
-                                attempt += 1;
-                                tokio::select! {
-                                        () = tokio::time::sleep(delay) => {}
-                                        _ = cancel_rx.changed() => return,
-                                        _ = shutdown_rx.changed() => return,
-                                () = self.subscription_expired(&sub) => return,
-                                    }
-                            }
+                            exhausted_drop = true;
+                            notify_space = st.outbox.len() < self.quotas.max_outbox_per_sub / 2;
                         }
+                    }
+
+                    if became_suspended {
+                        self.mark_state_dirty();
+                        return true;
+                    }
+                    if exhausted_drop {
+                        self.mark_state_dirty();
+                        if notify_space {
+                            sub.space_notify.notify_one();
+                        }
+                        return true;
+                    }
+                    if *shutdown_rx.borrow() {
+                        return false;
+                    }
+
+                    let delay = backoff_with_jitter(self.quotas.retry_base_ms, attempt);
+                    attempt += 1;
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        _ = cancel_rx.changed() => return false,
+                        _ = shutdown_rx.changed() => return false,
+                        () = self.subscription_expired(sub) => return false,
                     }
                 }
             }
@@ -2536,18 +2750,29 @@ impl HookdEngine {
             }
             let mut use_poll = supports_poll;
             let mut ready_stream = started_stream.take();
-            if ready_stream.is_none() && supports_push {
+            let need_bootstrap_poll = {
+                let state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
+                supports_poll && state.ingest_cursor.is_none() && state.bootstrap_since_ms.is_some()
+            };
+            if ready_stream.is_none() && supports_push && !need_bootstrap_poll {
                 if let Ok(permit) = Arc::clone(&self.upstream_stream_sem).try_acquire_owned() {
-                    let cursor = {
+                    let (cursor, max_age_ms) = {
                         let state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                        state.ingest_cursor.clone()
+                        let age = if state.ingest_cursor.is_none() {
+                            state
+                                .bootstrap_since_ms
+                                .map(|since| unix_now_ms().saturating_sub(since).max(1))
+                        } else {
+                            None
+                        };
+                        (state.ingest_cursor.clone(), age)
                     };
                     let opening_stream = upstream.open_event_stream(
                         event_name,
                         Some(arguments),
                         &input_schema,
                         cursor.as_deref(),
-                        None,
+                        max_age_ms,
                         None,
                     );
                     let opened_stream = tokio::select! {
@@ -2713,23 +2938,27 @@ impl HookdEngine {
                 {
                     return;
                 }
-                let cursor = {
+                let (cursor, poll_max_age_ms, max_events) = {
                     let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                    st.ingest_cursor.clone()
-                };
-                let max_events = {
-                    let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-                    self.quotas
+                    let max_age = if st.ingest_cursor.is_none() {
+                        st.bootstrap_since_ms
+                            .map(|since| unix_now_ms().saturating_sub(since).max(1))
+                    } else {
+                        None
+                    };
+                    let cap = self
+                        .quotas
                         .max_outbox_per_sub
                         .saturating_sub(st.outbox.len())
-                        .max(1)
+                        .max(1);
+                    (st.ingest_cursor.clone(), max_age, cap)
                 };
                 let poll_fut = upstream.poll_events(
                     event_name,
                     Some(arguments),
                     &input_schema,
                     cursor.as_deref(),
-                    None,
+                    poll_max_age_ms,
                     Some(max_events),
                 );
                 let poll_res = tokio::select! {
@@ -2741,6 +2970,7 @@ impl HookdEngine {
                 };
                 match poll_res {
                     Ok(resp) => {
+                        let mut cleared_bootstrap = false;
                         {
                             let mut state = sub.state.lock().unwrap_or_else(|p| p.into_inner());
                             if !self.sub_accepts_events(&state, Some(&consumer_cancel)) {
@@ -2749,6 +2979,15 @@ impl HookdEngine {
                             state.poll_not_before = (!resp.has_more).then(|| {
                                 (Instant::now(), Duration::from_millis(resp.next_poll_ms))
                             });
+                            if resp.cursor.is_none()
+                                && (resp.truncated || resp.events.is_empty())
+                                && state.bootstrap_since_ms.take().is_some()
+                            {
+                                cleared_bootstrap = true;
+                            }
+                        }
+                        if cleared_bootstrap {
+                            self.mark_state_dirty();
                         }
                         if resp.truncated {
                             if let Some(c) = resp.cursor
@@ -2875,6 +3114,7 @@ impl HookdEngine {
         let dirty = state.outbox.is_empty();
         if dirty {
             state.safe_cursor = Some(cursor.clone());
+            state.bootstrap_since_ms = None;
         } else {
             if state.outbox.len() >= self.quotas.max_outbox_per_sub {
                 return false;
@@ -2918,8 +3158,13 @@ impl HookdEngine {
         let Some(lease) = self.pools.outbox.try_acquire(body_len) else {
             return false;
         };
+        let webhook_id = format!(
+            "msg_{}",
+            random_base64url(18).unwrap_or_else(|_| "gap".into())
+        );
         state.ingest_cursor = Some(cursor.clone());
         state.outbox.push_back(OutboxItem::Gap {
+            webhook_id,
             cursor,
             _lease: lease,
         });
@@ -3257,11 +3502,8 @@ impl HookdEngine {
             }
 
             {
-                let now_inst = Instant::now();
                 let mut rl = self.verify_rate.lock().unwrap_or_else(|p| p.into_inner());
-                rl.retain(|_, b| {
-                    now_inst.saturating_duration_since(b.window_start) < VERIFY_RATE_WINDOW
-                });
+                rl.prune_expired(Instant::now());
             }
 
             for sub in expired_subs {
@@ -3326,6 +3568,7 @@ enum HeadAction {
         is_ingest: bool,
     },
     Gap {
+        webhook_id: String,
         cursor: String,
     },
     Checkpoint {
@@ -3353,23 +3596,16 @@ fn clone_outbox_head(item: &OutboxItem) -> HeadAction {
             advance_cursor: advance_cursor.clone(),
             is_ingest: *is_ingest,
         },
-        OutboxItem::Gap { cursor, .. } => HeadAction::Gap {
+        OutboxItem::Gap {
+            webhook_id, cursor, ..
+        } => HeadAction::Gap {
+            webhook_id: webhook_id.clone(),
             cursor: cursor.clone(),
         },
         OutboxItem::Checkpoint { cursor, .. } => HeadAction::Checkpoint {
             cursor: cursor.clone(),
         },
     }
-}
-
-fn active_secrets(sub: &SubRuntime) -> (SecretString, Option<SecretString>) {
-    let st = sub.state.lock().unwrap_or_else(|p| p.into_inner());
-    let now = unix_now();
-    let prev = match (&st.prev_secret, st.prev_secret_until) {
-        (Some(s), Some(until)) if now <= until => Some(s.clone()),
-        _ => None,
-    };
-    (st.secret.clone(), prev)
 }
 
 fn outbox_cursor(item: &OutboxItem) -> Option<&str> {
@@ -3417,6 +3653,7 @@ fn new_sub_runtime(sub: PersistedSubscription, source: SubSource, auth_paused: b
             refresh_before: sub.refresh_before,
             ingest_cursor: sub.safe_cursor.clone(),
             safe_cursor: sub.safe_cursor,
+            bootstrap_since_ms: sub.bootstrap_since_ms,
             poll_not_before: None,
             pending_truncated_for_refresh: sub.pending_truncated_for_refresh,
             suspended: sub.suspended,
@@ -3722,7 +3959,7 @@ mod tests {
             resource_path: "/mcp".into(),
             state_path,
             profile,
-            inbound_tokens: vec![SecretString::new("inbound_tok_0")],
+            inbound_tokens: vec![SecretString::new("inbound_secret_token_0")],
             allowed_origins: Vec::new(),
             max_ttl_secs: 3600,
             auth_context,
@@ -3780,6 +4017,7 @@ mod tests {
                 prev_secret_until: None,
                 refresh_before: unix_now() + 1800,
                 safe_cursor: None,
+                bootstrap_since_ms: None,
                 pending_truncated_for_refresh: false,
                 suspended: false,
                 last_error: None,
@@ -3840,7 +4078,7 @@ mod tests {
                 Profile::Sep3415,
                 None,
                 Some(IngestConfig {
-                    tokens: vec![SecretString::new("prod")],
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
                     events: vec![sample_ingest_event_cfg()],
                 }),
                 None,
@@ -3906,7 +4144,7 @@ mod tests {
                 Profile::Sep3415,
                 None,
                 Some(IngestConfig {
-                    tokens: vec![SecretString::new("producer")],
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
                     events: vec![sample_ingest_event_cfg()],
                 }),
                 None,
@@ -3985,7 +4223,7 @@ mod tests {
                     Profile::Sep3415,
                     None,
                     Some(IngestConfig {
-                        tokens: vec![SecretString::new("producer")],
+                        tokens: vec![SecretString::new("producer_secret_token_0")],
                         events: vec![sample_ingest_event_cfg()],
                     }),
                     None,
@@ -4123,7 +4361,7 @@ mod tests {
                 Profile::Sep3415,
                 None,
                 Some(IngestConfig {
-                    tokens: vec![SecretString::new("producer")],
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
                     events: vec![sample_ingest_event_cfg()],
                 }),
                 None,
@@ -4228,7 +4466,7 @@ mod tests {
                 Profile::Sep3415,
                 None,
                 Some(IngestConfig {
-                    tokens: vec![SecretString::new("producer")],
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
                     events: vec![sample_ingest_event_cfg()],
                 }),
                 None,
@@ -4340,7 +4578,7 @@ mod tests {
                     Profile::Sep3415,
                     None,
                     Some(IngestConfig {
-                        tokens: vec![SecretString::new("producer")],
+                        tokens: vec![SecretString::new("producer_secret_token_0")],
                         events: vec![sample_ingest_event_cfg()],
                     }),
                     None,
@@ -4476,7 +4714,7 @@ mod tests {
                 Profile::Sep3415,
                 None,
                 Some(IngestConfig {
-                    tokens: vec![SecretString::new("producer")],
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
                     events: vec![sample_ingest_event_cfg()],
                 }),
                 None,
@@ -4559,7 +4797,7 @@ mod tests {
                 Profile::Sep3415,
                 None,
                 Some(IngestConfig {
-                    tokens: vec![SecretString::new("producer")],
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
                     events: vec![sample_ingest_event_cfg()],
                 }),
                 None,
@@ -4790,7 +5028,7 @@ mod tests {
             Profile::Sep3415,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("prod_tok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -4948,7 +5186,7 @@ mod tests {
             Profile::Chatgpt,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("prod_tok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -5002,7 +5240,7 @@ mod tests {
             Profile::Chatgpt,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("prod_tok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -5147,7 +5385,7 @@ mod tests {
                 }],
             }),
             Some(IngestConfig {
-                tokens: vec![SecretString::new("ptok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -5202,7 +5440,7 @@ mod tests {
                 .resolve_event_for_passthrough("does.not.exist", None)
                 .await
                 .unwrap(),
-            PassthroughResolution::NotFound
+            PassthroughResolution::UpstreamAllowed
         );
         let mut bad_args = Map::new();
         bad_args.insert("scope".into(), json!("all"));
@@ -5499,7 +5737,7 @@ mod tests {
             Profile::Sep3415,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("prod_tok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -5664,6 +5902,7 @@ mod tests {
                     prev_secret_until: None,
                     refresh_before: unix_now() + 1800,
                     safe_cursor: None,
+                    bootstrap_since_ms: None,
                     pending_truncated_for_refresh: false,
                     suspended: false,
                     last_error: None,
@@ -5679,6 +5918,7 @@ mod tests {
                     prev_secret_until: None,
                     refresh_before: unix_now() + 1800,
                     safe_cursor: None,
+                    bootstrap_since_ms: None,
                     pending_truncated_for_refresh: false,
                     suspended: false,
                     last_error: None,
@@ -5693,7 +5933,7 @@ mod tests {
             Profile::Sep3415,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("ptok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             Some(AuthContextConfig {
@@ -5732,7 +5972,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, EngineError::Forbidden(_)));
+        assert!(matches!(err, EngineError::InsufficientScope { .. }));
 
         engine.shutdown().await.unwrap();
         check_handle.abort();
@@ -6201,6 +6441,7 @@ mod tests {
                 prev_secret_until: None,
                 refresh_before: unix_now() + 1800,
                 safe_cursor: Some("c0".into()),
+                bootstrap_since_ms: None,
                 pending_truncated_for_refresh: false,
                 suspended: false,
                 last_error: None,
@@ -6230,7 +6471,7 @@ mod tests {
             Profile::Chatgpt,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("ptok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -6305,7 +6546,7 @@ mod tests {
             Profile::Chatgpt,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("ptok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -6386,7 +6627,7 @@ mod tests {
             Profile::Chatgpt,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("ptok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -6454,7 +6695,7 @@ mod tests {
             Profile::Sep3415,
             None,
             Some(IngestConfig {
-                tokens: vec![SecretString::new("ptok")],
+                tokens: vec![SecretString::new("producer_secret_token_0")],
                 events: vec![sample_ingest_event_cfg()],
             }),
             None,
@@ -6486,6 +6727,7 @@ mod tests {
                 prev_secret_until: None,
                 refresh_before: unix_now() + 1800,
                 safe_cursor: Some("c0".into()),
+                bootstrap_since_ms: None,
                 pending_truncated_for_refresh: false,
                 suspended: false,
                 last_error: None,
@@ -6789,5 +7031,598 @@ mod tests {
         delivery_permits.add_permits(100);
         engine.shutdown().await.unwrap();
         up_handle.abort();
+    }
+    #[test]
+    fn verify_rate_enforces_per_principal_cap_and_fails_closed_at_table_limit() {
+        let mut rl = VerifyRateState::default();
+        let now = Instant::now();
+
+        for i in 0..VERIFY_PRINCIPAL_RATE_LIMIT {
+            rl.check_and_record("principal_a", &format!("h{i}.example.com"), now)
+                .unwrap();
+        }
+        assert!(matches!(
+            rl.check_and_record("principal_a", "overflow.example.com", now),
+            Err(EngineError::ResourceExhausted(_))
+        ));
+
+        let mut full = VerifyRateState::default();
+        for i in 0..MAX_VERIFY_RATE_ENTRIES {
+            full.check_and_record(&format!("p_{i}"), &format!("h_{i}.example.com"), now)
+                .unwrap();
+        }
+        assert_eq!(full.by_host.len(), MAX_VERIFY_RATE_ENTRIES);
+        assert!(matches!(
+            full.check_and_record("p_new", "h_new.example.com", now),
+            Err(EngineError::ResourceExhausted(_))
+        ));
+        assert_eq!(full.by_host.len(), MAX_VERIFY_RATE_ENTRIES);
+
+        let after_window = now + VERIFY_RATE_WINDOW + Duration::from_secs(1);
+        full.check_and_record("p_new", "h_new.example.com", after_window)
+            .unwrap();
+        assert_eq!(full.by_host.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gap_delivery_retries_transient_failures_before_advancing_safe_cursor() {
+        let gap_attempts = Arc::new(AtomicUsize::new(0));
+        let ga = Arc::clone(&gap_attempts);
+        let cb = spawn_tls_callback(move |_headers, body| {
+            let ga = Arc::clone(&ga);
+            async move {
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                if v["type"] == "verification" {
+                    let resp = json!({ "challenge": v["challenge"] });
+                    return (StatusCode::OK, resp.to_string().into_bytes());
+                }
+                if v["type"] == "gap" {
+                    let n = ga.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, b"{}".to_vec());
+                    }
+                }
+                (StatusCode::OK, b"{}".to_vec())
+            }
+        })
+        .await;
+
+        let poll_step = Arc::new(AtomicUsize::new(0));
+        let ps = Arc::clone(&poll_step);
+        let (up_url, up_handle) = spawn_http_mock(move |req| {
+            let ps = Arc::clone(&ps);
+            async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                let id = v["id"].clone();
+                let resp = match v["method"].as_str().unwrap_or("") {
+                    "events/list" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "events": [{
+                                "name": "task.exited",
+                                "delivery": ["poll"],
+                                "inputSchema": { "type": "object" },
+                                "payloadSchema": { "type": "object" }
+                            }]
+                        }
+                    }),
+                    "events/poll" => {
+                        let step = ps.fetch_add(1, Ordering::SeqCst);
+                        if step == 0 {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "events": [],
+                                    "cursor": "c0",
+                                    "truncated": false,
+                                    "hasMore": false,
+                                    "nextPollMs": 20
+                                }
+                            })
+                        } else if step == 1 {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "events": [],
+                                    "cursor": "c_gap",
+                                    "truncated": true,
+                                    "hasMore": false,
+                                    "nextPollMs": 500
+                                }
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "events": [],
+                                    "cursor": "c_gap",
+                                    "truncated": false,
+                                    "hasMore": false,
+                                    "nextPollMs": 500
+                                }
+                            })
+                        }
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(resp.to_string())))
+                    .unwrap()
+            }
+        })
+        .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut quotas = test_quotas();
+        quotas.retry_base_ms = 20;
+        let engine = HookdEngine::new(
+            base_config(
+                dir.path().join("subs.json"),
+                Profile::Sep3415,
+                Some(UpstreamConfig {
+                    url: up_url,
+                    bearer_token: None,
+                    passthrough_prefixes: Vec::new(),
+                    request_timeout_secs: 5,
+                    expose_events: vec![ExposeEventConfig {
+                        name: "task.exited".into(),
+                        disallow_arguments: Vec::new(),
+                    }],
+                }),
+                None,
+                None,
+            ),
+            quotas.clone(),
+            MemoryPools::from_quotas(&quotas),
+            Some(loopback_outbound(cb.roots.clone())),
+        )
+        .await
+        .unwrap();
+
+        engine
+            .subscribe(
+                &CallerAuth::StaticSlot(0),
+                SubscribeRequest {
+                    event_name: "task.exited".into(),
+                    arguments: Map::new(),
+                    delivery_mode: "webhook".into(),
+                    delivery_url: cb.url.clone(),
+                    delivery_secret: test_secret(31),
+                    ttl_ms: None,
+                    cursor: None,
+                    max_age_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..100 {
+            if gap_attempts.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(gap_attempts.load(Ordering::SeqCst), 3);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            engine.snapshot_state().subscriptions[0]
+                .safe_cursor
+                .as_deref(),
+            Some("c_gap")
+        );
+
+        engine.shutdown().await.unwrap();
+        up_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ingest_suspension_clears_outbox_and_releases_byte_budget() {
+        let cb = spawn_tls_callback(|_headers, body| async move {
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            if v["type"] == "verification" {
+                let resp = json!({ "challenge": v["challenge"] });
+                (StatusCode::OK, resp.to_string().into_bytes())
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, b"{}".to_vec())
+            }
+        })
+        .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut quotas = test_quotas();
+        quotas.retry_base_ms = 5;
+        quotas.suspend_failure_count = 2;
+        quotas.suspend_min_duration_secs = 0;
+        let pools = MemoryPools::from_quotas(&quotas);
+        let engine = HookdEngine::new(
+            base_config(
+                dir.path().join("subs.json"),
+                Profile::Sep3415,
+                None,
+                Some(IngestConfig {
+                    tokens: vec![SecretString::new("producer_secret_token_0")],
+                    events: vec![sample_ingest_event_cfg()],
+                }),
+                None,
+            ),
+            quotas,
+            pools.clone(),
+            Some(loopback_outbound(cb.roots.clone())),
+        )
+        .await
+        .unwrap();
+
+        engine
+            .subscribe(
+                &CallerAuth::StaticSlot(0),
+                SubscribeRequest {
+                    event_name: "ci.build_failed".into(),
+                    arguments: Map::new(),
+                    delivery_mode: "webhook".into(),
+                    delivery_url: cb.url.clone(),
+                    delivery_secret: test_secret(32),
+                    ttl_ms: None,
+                    cursor: None,
+                    max_age_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        for i in 0..3 {
+            let raw = serde_json::to_vec(&json!({
+                "eventId": format!("ing_ev_{i}"),
+                "name": "ci.build_failed",
+                "timestamp": "2026-11-25T00:00:00Z",
+                "data": { "repo": "org/app", "pr": i }
+            }))
+            .unwrap();
+            engine.ingest_event(0, &raw).await.unwrap();
+        }
+
+        for _ in 0..100 {
+            if engine.snapshot_state().subscriptions[0].suspended {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(engine.snapshot_state().subscriptions[0].suspended);
+        assert_eq!(pools.outbox.used(), 0);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dual_mode_max_age_bootstrap_recovers_historical_batch_across_restart() {
+        let seen_max_ages: Arc<Mutex<Vec<Option<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sma = Arc::clone(&seen_max_ages);
+        let (up_url, up_handle) = spawn_http_mock(move |req| {
+            let sma = Arc::clone(&sma);
+            async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                let id = v["id"].clone();
+                let resp = match v["method"].as_str().unwrap_or("") {
+                    "events/list" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "events": [{
+                                "name": "task.exited",
+                                "delivery": ["push", "poll"],
+                                "inputSchema": { "type": "object" },
+                                "payloadSchema": { "type": "object" }
+                            }]
+                        }
+                    }),
+                    "events/poll" => {
+                        let cursor = v["params"].get("cursor").and_then(Value::as_str);
+                        let max_age = v["params"].get("maxAgeMs").and_then(Value::as_u64);
+                        sma.lock().unwrap().push(max_age);
+                        let events = if cursor.is_none() && max_age.is_some() {
+                            vec![json!({
+                                "eventId": "hist_1",
+                                "name": "task.exited",
+                                "timestamp": "2026-11-25T00:00:00Z",
+                                "data": { "ok": true }
+                            })]
+                        } else {
+                            Vec::new()
+                        };
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "events": events,
+                                "cursor": "c_hist_1",
+                                "truncated": false,
+                                "hasMore": false,
+                                "nextPollMs": 200
+                            }
+                        })
+                    }
+                    "events/stream" => {
+                        assert_eq!(v["params"]["cursor"], "c_hist_1");
+                        let sse = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/events/active\",\"params\":{\"cursor\":\"c_live_tail\",\"truncated\":false}}\n\n";
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "text/event-stream")
+                            .body(Full::new(Bytes::from(sse)))
+                            .unwrap();
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(resp.to_string())))
+                    .unwrap()
+            }
+        })
+        .await;
+
+        let stall_first = Arc::new(AtomicUsize::new(0));
+        let sf = Arc::clone(&stall_first);
+        let cb = spawn_tls_callback(move |_headers, body| {
+            let sf = Arc::clone(&sf);
+            async move {
+                let v: Value = serde_json::from_slice(&body).unwrap();
+                if v["type"] == "verification" {
+                    let resp = json!({ "challenge": v["challenge"] });
+                    return (StatusCode::OK, resp.to_string().into_bytes());
+                }
+                if sf.load(Ordering::SeqCst) == 0 {
+                    return (StatusCode::SERVICE_UNAVAILABLE, b"{}".to_vec());
+                }
+                (StatusCode::OK, b"{}".to_vec())
+            }
+        })
+        .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_path = dir.path().join("subs.json");
+        let make_cfg = || {
+            base_config(
+                state_path.clone(),
+                Profile::Sep3415,
+                Some(UpstreamConfig {
+                    url: up_url.clone(),
+                    bearer_token: None,
+                    passthrough_prefixes: Vec::new(),
+                    request_timeout_secs: 5,
+                    expose_events: vec![ExposeEventConfig {
+                        name: "task.exited".into(),
+                        disallow_arguments: Vec::new(),
+                    }],
+                }),
+                None,
+                None,
+            )
+        };
+
+        let mut q1 = test_quotas();
+        q1.retry_base_ms = 500;
+        let engine1 = HookdEngine::new(
+            make_cfg(),
+            q1.clone(),
+            MemoryPools::from_quotas(&q1),
+            Some(loopback_outbound(cb.roots.clone())),
+        )
+        .await
+        .unwrap();
+
+        engine1
+            .subscribe(
+                &CallerAuth::StaticSlot(0),
+                SubscribeRequest {
+                    event_name: "task.exited".into(),
+                    arguments: Map::new(),
+                    delivery_mode: "webhook".into(),
+                    delivery_url: cb.url.clone(),
+                    delivery_secret: test_secret(33),
+                    ttl_ms: None,
+                    cursor: None,
+                    max_age_ms: Some(30_000),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            engine1.snapshot_state().subscriptions[0]
+                .safe_cursor
+                .is_none()
+        );
+        assert!(
+            engine1.snapshot_state().subscriptions[0]
+                .bootstrap_since_ms
+                .is_some()
+        );
+        engine1
+            .shutdown_until(tokio::time::Instant::now())
+            .await
+            .unwrap();
+
+        // Allow webhook delivery on restart and verify hist_1 is re-polled via maxAgeMs instead of jumping to live tail.
+        stall_first.store(1, Ordering::SeqCst);
+        let q2 = test_quotas();
+        let engine2 = HookdEngine::new(
+            make_cfg(),
+            q2.clone(),
+            MemoryPools::from_quotas(&q2),
+            Some(loopback_outbound(cb.roots.clone())),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..100 {
+            let delivered = cb.captured.lock().await.iter().any(|w| {
+                serde_json::from_slice::<Value>(&w.body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("eventId")
+                            .and_then(Value::as_str)
+                            .map(|s| s == "hist_1")
+                    })
+                    .unwrap_or(false)
+            });
+            if delivered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let delivered = cb.captured.lock().await.iter().any(|w| {
+            serde_json::from_slice::<Value>(&w.body)
+                .ok()
+                .and_then(|v| {
+                    v.get("eventId")
+                        .and_then(Value::as_str)
+                        .map(|s| s == "hist_1")
+                })
+                .unwrap_or(false)
+        });
+        assert!(delivered, "expected hist_1 to be replayed after restart");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        for _ in 0..50 {
+            if engine2.snapshot_state().subscriptions[0]
+                .safe_cursor
+                .as_deref()
+                == Some("c_live_tail")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = engine2.snapshot_state();
+        assert!(matches!(
+            snap.subscriptions[0].safe_cursor.as_deref(),
+            Some("c_hist_1" | "c_live_tail")
+        ));
+        assert!(snap.subscriptions[0].bootstrap_since_ms.is_none());
+        assert!(
+            seen_max_ages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.is_some())
+                .count()
+                >= 2
+        );
+
+        engine2.shutdown().await.unwrap();
+        up_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_unknown_fields_and_scopes_dedup_by_token_and_event_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let deploy_schema = json!({
+            "type": "object",
+            "properties": { "env": { "type": "string" } },
+            "required": ["env"],
+            "additionalProperties": false
+        });
+        let deploy_filter = vec!["env".to_string()];
+        let deploy_input_schema =
+            build_filter_input_schema(&deploy_schema, &deploy_filter).unwrap();
+        let deploy_cfg = IngestEventConfig {
+            name: "ci.deploy_finished".into(),
+            description: "Deploy finished.".into(),
+            filter_fields: deploy_filter,
+            payload_schema: deploy_schema,
+            input_schema: deploy_input_schema,
+        };
+
+        let cfg = base_config(
+            dir.path().join("subscriptions.json"),
+            Profile::Sep3415,
+            None,
+            Some(IngestConfig {
+                tokens: vec![
+                    SecretString::new("producer_token_slot_0"),
+                    SecretString::new("producer_token_slot_1"),
+                ],
+                events: vec![sample_ingest_event_cfg(), deploy_cfg],
+            }),
+            None,
+        );
+        let quotas = QuotaConfig::default();
+        let engine = HookdEngine::new(cfg, quotas.clone(), MemoryPools::from_quotas(&quotas), None)
+            .await
+            .unwrap();
+
+        // Unknown and control-plane top-level fields must return 400 Bad Request.
+        for bad in [
+            json!({"eventId": "evt_bad1", "name": "ci.build_failed", "data": {"repo": "r"}, "truncated": false}),
+            json!({"eventId": "evt_bad2", "name": "ci.build_failed", "data": {"repo": "r"}, "upstreamEventId": "u1"}),
+            json!({"eventId": "evt_bad3", "name": "ci.build_failed", "data": {"repo": "r"}, "unknownKey": 1}),
+        ] {
+            let err = engine
+                .ingest_event(0, bad.to_string().as_bytes())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        }
+
+        // Optional ignored stream-wrapper keys cursor and _meta are accepted.
+        let wrapped = json!({
+            "eventId": "evt_shared_1",
+            "name": "ci.build_failed",
+            "data": {"repo": "demo", "pr": 1},
+            "cursor": "cur_ignored",
+            "_meta": {"origin": "stream"}
+        })
+        .to_string();
+        let r_build = engine.ingest_event(0, wrapped.as_bytes()).await.unwrap();
+        assert!(!r_build.deduplicated);
+
+        // Same token_slot + same eventId under a DIFFERENT event name must neither deduplicate nor 409.
+        let same_id_other_event = json!({
+            "eventId": "evt_shared_1",
+            "name": "ci.deploy_finished",
+            "data": {"env": "prod"}
+        })
+        .to_string();
+        let r_deploy = engine
+            .ingest_event(0, same_id_other_event.as_bytes())
+            .await
+            .unwrap();
+        assert!(!r_deploy.deduplicated);
+
+        // Same (token_slot, name, eventId) with identical payload deduplicates; mutated payload returns 409.
+        let r_deploy_dup = engine
+            .ingest_event(0, same_id_other_event.as_bytes())
+            .await
+            .unwrap();
+        assert!(r_deploy_dup.deduplicated);
+
+        let same_id_mutated = json!({
+            "eventId": "evt_shared_1",
+            "name": "ci.deploy_finished",
+            "data": {"env": "staging"}
+        })
+        .to_string();
+        let conflict = engine
+            .ingest_event(0, same_id_mutated.as_bytes())
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
+
+        // Different token_slot has an isolated dedup namespace.
+        let r_other_slot = engine
+            .ingest_event(1, same_id_mutated.as_bytes())
+            .await
+            .unwrap();
+        assert!(!r_other_slot.deduplicated);
+
+        engine.shutdown().await.unwrap();
     }
 }
