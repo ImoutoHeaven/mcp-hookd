@@ -436,7 +436,7 @@ impl HookdEngine {
         let upstream = config
             .upstream
             .as_ref()
-            .map(UpstreamClient::new)
+            .map(|config| UpstreamClient::new(config, Arc::clone(&pools.proxy)))
             .transpose()?;
         let auth_client = config
             .auth_context
@@ -789,6 +789,7 @@ impl HookdEngine {
             }
         }
         let normalized_args = normalize_filter_arguments(&input_schema, &req.arguments)
+            .await
             .map_err(EngineError::InvalidParams)?;
 
         let key = SubscriptionKey::new(
@@ -985,6 +986,7 @@ impl HookdEngine {
                 .poll_events(
                     &req.event_name,
                     Some(&normalized_args),
+                    &input_schema,
                     req.cursor.as_deref(),
                     req.max_age_ms,
                     Some(self.quotas.max_outbox_per_sub),
@@ -1117,7 +1119,9 @@ impl HookdEngine {
         let normalized_args = match self.resolve_event_for_subscribe(&req.event_name).await {
             Ok(EventKind::Ingest { input_schema })
             | Ok(EventKind::Upstream { input_schema, .. }) => {
-                normalize_filter_arguments(&input_schema, &req.arguments).unwrap_or(req.arguments)
+                normalize_filter_arguments(&input_schema, &req.arguments)
+                    .await
+                    .unwrap_or(req.arguments)
             }
             Err(_) => req.arguments,
         };
@@ -1160,7 +1164,7 @@ impl HookdEngine {
         Ok(())
     }
 
-    pub fn ingest_event(
+    pub async fn ingest_event(
         &self,
         token_slot: usize,
         raw_body: &[u8],
@@ -1188,6 +1192,7 @@ impl HookdEngine {
         };
 
         validate_against_schema(&ev_cfg.payload_schema, &parsed.data)
+            .await
             .map_err(|e| IngestError::Unprocessable(format!("payload schema violation: {e}")))?;
 
         let data_json = serde_json::to_string(&parsed.data)
@@ -2068,18 +2073,23 @@ impl HookdEngine {
                 continue;
             }
 
-            let supports_push = self
-                .resolve_event_for_subscribe(event_name)
-                .await
-                .is_ok_and(|k| {
-                    matches!(
-                        k,
-                        EventKind::Upstream {
-                            supports_push: true,
-                            ..
+            let (supports_push, input_schema) =
+                match self.resolve_event_for_subscribe(event_name).await {
+                    Ok(EventKind::Upstream {
+                        supports_push,
+                        input_schema,
+                        ..
+                    }) => (supports_push, input_schema),
+                    _ => {
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                            _ = cancel_rx.changed() => return,
+                            _ = consumer_cancel.changed() => return,
+                            _ = shutdown_rx.changed() => return,
                         }
-                    )
-                });
+                        continue;
+                    }
+                };
 
             let mut use_poll = true;
             if supports_push
@@ -2090,7 +2100,14 @@ impl HookdEngine {
                     st.ingest_cursor.clone()
                 };
                 match upstream
-                    .open_event_stream(event_name, Some(arguments), cursor.as_deref(), None, None)
+                    .open_event_stream(
+                        event_name,
+                        Some(arguments),
+                        &input_schema,
+                        cursor.as_deref(),
+                        None,
+                        None,
+                    )
                     .await
                 {
                     Ok(mut stream) => {
@@ -2200,6 +2217,7 @@ impl HookdEngine {
                 let poll_fut = upstream.poll_events(
                     event_name,
                     Some(arguments),
+                    &input_schema,
                     cursor.as_deref(),
                     None,
                     Some(max_events),
@@ -3320,7 +3338,10 @@ mod tests {
             "data": { "repo": "demo", "pr": 1 }
         })
         .to_string();
-        let ir = engine.ingest_event(0, ingest_body.as_bytes()).unwrap();
+        let ir = engine
+            .ingest_event(0, ingest_body.as_bytes())
+            .await
+            .unwrap();
         assert_eq!(ir.matched, Some(1));
         assert_eq!(ir.dropped_slow, Some(0));
 
@@ -3476,9 +3497,9 @@ mod tests {
             "data": { "repo": "demo", "pr": 1 }
         })
         .to_string();
-        let r1 = engine.ingest_event(0, b1.as_bytes()).unwrap();
+        let r1 = engine.ingest_event(0, b1.as_bytes()).await.unwrap();
         assert!(!r1.deduplicated);
-        let r1_dup = engine.ingest_event(0, b1.as_bytes()).unwrap();
+        let r1_dup = engine.ingest_event(0, b1.as_bytes()).await.unwrap();
         assert!(r1_dup.deduplicated);
 
         let b1_diff = json!({
@@ -3487,7 +3508,10 @@ mod tests {
             "data": { "repo": "demo", "pr": 2 }
         })
         .to_string();
-        let conflict = engine.ingest_event(0, b1_diff.as_bytes()).unwrap_err();
+        let conflict = engine
+            .ingest_event(0, b1_diff.as_bytes())
+            .await
+            .unwrap_err();
         assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
 
         // Burst 68 more events (> 64 outbox slots) while delivery is blocked.
@@ -3499,7 +3523,7 @@ mod tests {
                 "data": { "repo": "demo", "pr": i }
             })
             .to_string();
-            let res = engine.ingest_event(0, body.as_bytes()).unwrap();
+            let res = engine.ingest_event(0, body.as_bytes()).await.unwrap();
             total_dropped += res.dropped_slow.unwrap_or(0);
         }
         assert!(
@@ -3977,8 +4001,8 @@ mod tests {
             "data": { "repo": "demo" }
         })
         .to_string();
-        engine.ingest_event(0, b1.as_bytes()).unwrap();
-        engine.ingest_event(0, b2.as_bytes()).unwrap();
+        engine.ingest_event(0, b1.as_bytes()).await.unwrap();
+        engine.ingest_event(0, b2.as_bytes()).await.unwrap();
 
         let captured = wait_for_captured(&cb.captured, 3).await;
         assert_eq!(delivered_410.load(Ordering::SeqCst), 1);
@@ -3994,7 +4018,7 @@ mod tests {
             "data": { "repo": "demo" }
         })
         .to_string();
-        engine.ingest_event(0, b3.as_bytes()).unwrap();
+        engine.ingest_event(0, b3.as_bytes()).await.unwrap();
 
         for _ in 0..100 {
             if engine.snapshot_state().subscriptions[0].suspended {
