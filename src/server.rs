@@ -1110,37 +1110,37 @@ async fn validate_event_params_and_routing_headers<'a>(
     req_headers: &HeaderMap,
     id: &Value,
     params: Option<&'a Value>,
-) -> Result<(&'a str, Option<&'a Map<String, Value>>), Response<RespBody>> {
+) -> Result<(&'a str, Option<&'a Map<String, Value>>), Box<Response<RespBody>>> {
     let profile = state.engine.config().profile;
     let Some(params_obj) = params.and_then(Value::as_object) else {
-        return Err(jsonrpc_error(
+        return Err(Box::new(jsonrpc_error(
             StatusCode::OK,
             id.clone(),
             -32602,
             "params must be a JSON object",
             None,
-        ));
+        )));
     };
     let Some(event_name) = params_obj.get("name").and_then(Value::as_str) else {
-        return Err(jsonrpc_error(
+        return Err(Box::new(jsonrpc_error(
             StatusCode::OK,
             id.clone(),
             -32602,
             "params.name must be a string",
             None,
-        ));
+        )));
     };
     let args_map = match params_obj.get("arguments") {
         None | Some(Value::Null) => None,
         Some(Value::Object(m)) => Some(m),
         Some(_) => {
-            return Err(jsonrpc_error(
+            return Err(Box::new(jsonrpc_error(
                 StatusCode::OK,
                 id.clone(),
                 -32602,
                 "params.arguments must be an object",
                 None,
-            ));
+            )));
         }
     };
 
@@ -1159,7 +1159,7 @@ async fn validate_event_params_and_routing_headers<'a>(
     {
         match state.engine.routing_input_schema(event_name).await {
             Ok(schema) => schema,
-            Err(err) => return Err(engine_error_response(id.clone(), profile, err)),
+            Err(err) => return Err(Box::new(engine_error_response(id.clone(), profile, err))),
         }
     } else {
         None
@@ -1172,13 +1172,13 @@ async fn validate_event_params_and_routing_headers<'a>(
         disallowed,
         input_schema.as_ref(),
     ) {
-        return Err(jsonrpc_error(
+        return Err(Box::new(jsonrpc_error(
             StatusCode::BAD_REQUEST,
             id.clone(),
             -32020,
             &msg,
             None,
-        ));
+        )));
     }
 
     Ok((event_name, args_map))
@@ -1195,7 +1195,7 @@ async fn handle_upstream_events_passthrough(
     let (event_name, args_map) =
         match validate_event_params_and_routing_headers(state, req_headers, &id, params).await {
             Ok(pair) => pair,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
 
     match state
@@ -1790,7 +1790,7 @@ async fn handle_events_method(
         && let Err(resp) =
             validate_event_params_and_routing_headers(&state, req_headers, &id, params).await
     {
-        return resp;
+        return *resp;
     }
 
     match method {
@@ -3984,6 +3984,16 @@ fn full_body(bytes: Bytes) -> RespBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const _: () = {
+        assert!(std::mem::size_of::<Box<Response<RespBody>>>() < 128);
+        assert!(std::mem::size_of::<BodyReadError>() < 128);
+        assert!(std::mem::size_of::<EngineError>() < 128);
+        assert!(std::mem::size_of::<UpstreamError>() < 128);
+        assert!(std::mem::size_of::<crate::engine::IngestError>() < 128);
+        assert!(std::mem::size_of::<crate::outbound::VerifyError>() < 128);
+        assert!(std::mem::size_of::<crate::outbound::OutboundConnectError>() < 128);
+    };
     use http_body::Frame;
     use std::collections::VecDeque;
     use std::pin::Pin;
