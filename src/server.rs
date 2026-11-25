@@ -12,7 +12,7 @@ use crate::headers::{
     validate_passthrough_path,
 };
 use crate::outbound::OutboundClient;
-use crate::proxy_body::{ProxyBody, lease_bytes};
+use crate::proxy_body::{LeasedBuffer, ProxyBody};
 use crate::types::{
     ByteBudget, LATEST_LEGACY_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSIONS, LEGACY_SESSION_IDLE_SECS,
     MAX_INGEST_BODY_BYTES, MAX_LEGACY_SESSIONS, MAX_REQUEST_BODY_BYTES, MemoryPools,
@@ -20,7 +20,7 @@ use crate::types::{
     random_base64url, unix_now,
 };
 use crate::upstream::UpstreamError;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
 use http_body::Body;
@@ -359,7 +359,7 @@ async fn handle_ingest(state: Arc<ServerState>, req: Request<Incoming>) -> Respo
         }
     };
 
-    match state.engine.ingest_event(token_slot, &body) {
+    match state.engine.ingest_event(token_slot, &body).await {
         Ok(res) => json_response(StatusCode::OK, &res),
         Err(err) => json_response(
             err.status_code(),
@@ -1625,7 +1625,7 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    let mut lease = if prefer_control {
+    let lease = if prefer_control {
         pools
             .control
             .try_acquire(0)
@@ -1639,7 +1639,7 @@ where
     let mut using_control = prefer_control;
 
     let read_fut = async {
-        let mut out = BytesMut::new();
+        let mut out = LeasedBuffer::new(lease);
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|e| BodyReadError::Io(e.to_string()))?;
             if let Ok(chunk) = frame.into_data() {
@@ -1650,23 +1650,31 @@ where
                 if using_control && !prefer_control && next_len > CONTROL_FALLBACK_MAX_BYTES {
                     return Err(BodyReadError::BudgetExhausted);
                 }
-                if !lease.grow(chunk.len()) {
-                    // Fall back to the reserved control pool only for small MCP control requests.
+                if !out
+                    .try_extend(&chunk)
+                    .map_err(|err| BodyReadError::Io(err.to_string()))?
+                {
                     if allow_control_fallback
                         && !using_control
                         && next_len <= CONTROL_FALLBACK_MAX_BYTES
-                        && let Some(ctrl_lease) = pools.control.try_acquire(next_len)
+                        && let Some(ctrl_lease) =
+                            pools.control.try_acquire(next_len.max(out.capacity()))
                     {
-                        lease = ctrl_lease;
+                        out.replace_lease(ctrl_lease);
                         using_control = true;
+                        if !out
+                            .try_extend(&chunk)
+                            .map_err(|err| BodyReadError::Io(err.to_string()))?
+                        {
+                            return Err(BodyReadError::BudgetExhausted);
+                        }
                     } else {
                         return Err(BodyReadError::BudgetExhausted);
                     }
                 }
-                out.put_slice(&chunk);
             }
         }
-        Ok(lease_bytes(out.freeze(), lease))
+        Ok(out.into_bytes())
     };
 
     tokio::time::timeout(BODY_READ_TIMEOUT, read_fut)

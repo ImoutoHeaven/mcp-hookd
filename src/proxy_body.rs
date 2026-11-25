@@ -24,6 +24,89 @@ pub(crate) fn lease_bytes(bytes: Bytes, lease: ByteLease) -> Bytes {
     })
 }
 
+pub(crate) struct LeasedBuffer {
+    bytes: Vec<u8>,
+    lease: ByteLease,
+}
+
+impl LeasedBuffer {
+    pub(crate) fn new(lease: ByteLease) -> Self {
+        Self {
+            bytes: Vec::new(),
+            lease,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn try_extend(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        let needed = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("response buffer size overflow"))?;
+        if !self.lease.grow(needed.saturating_sub(self.lease.bytes())) {
+            return Ok(false);
+        }
+        self.bytes
+            .try_reserve_exact(bytes.len())
+            .map_err(io::Error::other)?;
+        if !self
+            .lease
+            .grow(self.bytes.capacity().saturating_sub(self.lease.bytes()))
+        {
+            return Ok(false);
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(true)
+    }
+
+    pub(crate) fn replace_lease(&mut self, lease: ByteLease) {
+        assert!(lease.bytes() >= self.bytes.capacity());
+        self.lease = lease;
+    }
+
+    pub(crate) fn discard_prefix(&mut self, bytes: usize) {
+        self.bytes.drain(..bytes);
+        if self.bytes.is_empty() {
+            self.bytes = Vec::new();
+            drop(self.lease.split(self.lease.bytes()));
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> Bytes {
+        lease_bytes(Bytes::from(self.bytes), self.lease)
+    }
+
+    pub(crate) fn into_text(self) -> Result<(String, ByteLease), std::string::FromUtf8Error> {
+        String::from_utf8(self.bytes).map(|text| (text, self.lease))
+    }
+}
+
+impl io::Write for LeasedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.try_extend(bytes)? {
+            Ok(bytes.len())
+        } else {
+            Err(io::Error::other("proxy byte budget exhausted"))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) struct ProxyBody<B> {
     inner: B,
     budget: Arc<ByteBudget>,

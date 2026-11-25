@@ -6,11 +6,12 @@ use crate::headers::{
     build_event_routing_headers, build_upstream_headers, strip_hop_by_hop_response_headers,
     url_authority,
 };
+use crate::proxy_body::LeasedBuffer;
 use crate::types::{
-    MAX_HANDSHAKE_BODY_BYTES, MAX_PING_BODY_BYTES, PROTOCOL_VERSION_MODERN, Profile, SecretString,
-    random_hex,
+    ByteBudget, ByteLease, MAX_HANDSHAKE_BODY_BYTES, MAX_PING_BODY_BYTES, PROTOCOL_VERSION_MODERN,
+    Profile, SecretString, random_hex,
 };
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body::Body;
@@ -150,40 +151,140 @@ pub enum UpstreamStreamFrame {
     },
 }
 
+struct SseText {
+    text: String,
+    _lease: ByteLease,
+}
+
+fn response_buffer(budget: &Arc<ByteBudget>) -> LeasedBuffer {
+    LeasedBuffer::new(budget.try_acquire(0).expect("zero-byte lease"))
+}
+
+fn append_response(buf: &mut LeasedBuffer, bytes: &[u8]) -> Result<(), UpstreamError> {
+    if buf
+        .try_extend(bytes)
+        .map_err(|err| UpstreamError::Http(err.to_string()))?
+    {
+        Ok(())
+    } else {
+        Err(UpstreamError::Http("proxy byte budget exhausted".into()))
+    }
+}
+
+fn sse_text(buffer: LeasedBuffer) -> Result<SseText, UpstreamError> {
+    let (text, lease) = buffer
+        .into_text()
+        .map_err(|err| UpstreamError::InvalidResponse(err.to_string()))?;
+    Ok(SseText {
+        text,
+        _lease: lease,
+    })
+}
+
+fn take_sse_frame(
+    buf: &mut LeasedBuffer,
+    eof: bool,
+    budget: &Arc<ByteBudget>,
+) -> Result<Option<SseText>, UpstreamError> {
+    let (len, tail) = match sse_frame_len(buf.as_slice()) {
+        Some(len) => (len, false),
+        None if eof && buf.len() > 0 => (buf.len(), true),
+        None => return Ok(None),
+    };
+    let mut text = response_buffer(budget);
+    let mut raw = &buf.as_slice()[..len];
+    while !raw.is_empty() {
+        match std::str::from_utf8(raw) {
+            Ok(valid) => {
+                append_response(&mut text, valid.as_bytes())?;
+                break;
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                append_response(&mut text, &raw[..valid])?;
+                append_response(&mut text, "\u{fffd}".as_bytes())?;
+                raw = &raw[valid + err.error_len().unwrap_or(raw.len() - valid)..];
+            }
+        }
+    }
+    if tail {
+        append_response(&mut text, b"\n\n")?;
+    }
+    let frame = sse_text(text)?;
+    buf.discard_prefix(len);
+    Ok(Some(frame))
+}
+
+fn sse_data(
+    frame: &SseText,
+    at_start: bool,
+    budget: &Arc<ByteBudget>,
+) -> Result<Option<SseText>, UpstreamError> {
+    let raw = if at_start {
+        frame.text.strip_prefix('\u{feff}').unwrap_or(&frame.text)
+    } else {
+        &frame.text
+    };
+    let mut data = response_buffer(budget);
+    let mut seen = false;
+    for (line, _) in sse_lines(raw) {
+        let value = if let Some(rest) = line.strip_prefix("data:") {
+            rest.strip_prefix(' ').unwrap_or(rest)
+        } else if line == "data" {
+            ""
+        } else {
+            continue;
+        };
+        if seen {
+            append_response(&mut data, b"\n")?;
+        }
+        append_response(&mut data, value.as_bytes())?;
+        seen = true;
+    }
+    if seen {
+        Ok(Some(sse_text(data)?))
+    } else {
+        Ok(None)
+    }
+}
+
 pub struct UpstreamEventStream {
     body: Incoming,
-    buf: BytesMut,
+    buf: LeasedBuffer,
+    budget: Arc<ByteBudget>,
     eof: bool,
     at_start: bool,
 }
 
 impl UpstreamEventStream {
-    fn new(body: Incoming) -> Self {
+    fn new(body: Incoming, budget: Arc<ByteBudget>) -> Self {
         Self {
             body,
-            buf: BytesMut::new(),
+            buf: response_buffer(&budget),
+            budget,
             eof: false,
             at_start: true,
         }
     }
 
-    /// Read the next structured `notifications/events/*` frame, returning `Ok(None)` on clean EOF.
+    /// Read the next structured event frame, returning None on clean EOF.
     pub async fn next_frame(&mut self) -> Result<Option<UpstreamStreamFrame>, UpstreamError> {
         loop {
-            while let Some(raw_frame) = take_sse_frame(&mut self.buf) {
-                if let Some(data) =
-                    extract_sse_data(&raw_frame, std::mem::replace(&mut self.at_start, false))
-                {
-                    if data.trim().is_empty() {
+            while let Some(frame) = take_sse_frame(&mut self.buf, self.eof, &self.budget)? {
+                if let Some(data) = sse_data(
+                    &frame,
+                    std::mem::replace(&mut self.at_start, false),
+                    &self.budget,
+                )? {
+                    if data.text.trim().is_empty() {
                         continue;
                     }
-                    let msg: Value = serde_json::from_str(&data).map_err(|e| {
+                    let msg: Value = serde_json::from_str(&data.text).map_err(|e| {
                         UpstreamError::InvalidResponse(format!("invalid SSE JSON frame: {e}"))
                     })?;
                     if let Some(frame) = classify_stream_message(&msg)? {
                         return Ok(Some(frame));
                     }
-                    // A JSON-RPC `result` frame marks clean stream completion.
                     if msg.get("result").is_some() {
                         return Ok(None);
                     }
@@ -202,17 +303,11 @@ impl UpstreamEventStream {
                                 limit: MAX_SSE_FRAME_BYTES,
                             });
                         }
-                        self.buf.put_slice(&chunk);
+                        append_response(&mut self.buf, &chunk)?;
                     }
                 }
                 Some(Err(e)) => return Err(UpstreamError::Http(e.to_string())),
-                None => {
-                    self.eof = true;
-                    if !self.buf.is_empty() {
-                        // Flush any trailing frame not terminated by a blank line.
-                        self.buf.put_slice(b"\n\n");
-                    }
-                }
+                None => self.eof = true,
             }
         }
     }
@@ -226,10 +321,11 @@ pub struct UpstreamClient {
     bearer_token: Option<SecretString>,
     default_timeout: Duration,
     req_counter: Arc<AtomicU64>,
+    proxy_budget: Arc<ByteBudget>,
 }
 
 impl UpstreamClient {
-    pub fn new(config: &UpstreamConfig) -> Result<Self, String> {
+    pub fn new(config: &UpstreamConfig, proxy_budget: Arc<ByteBudget>) -> Result<Self, String> {
         let authority = url_authority(&config.url)?;
         let origin_base = format!("{}://{authority}", config.url.scheme());
 
@@ -266,6 +362,7 @@ impl UpstreamClient {
             bearer_token: config.bearer_token.clone(),
             default_timeout: Duration::from_secs(config.request_timeout_secs),
             req_counter: Arc::new(AtomicU64::new(1)),
+            proxy_budget,
         })
     }
 
@@ -357,19 +454,30 @@ impl UpstreamClient {
         let mut headers = strip_hop_by_hop_response_headers(resp.headers());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let content_type = media_type(&headers);
-        let transformed = if status.is_success()
-            && content_type.as_deref() == Some("text/event-stream")
-        {
-            read_sse_handshake(resp.into_body(), request_id, profile, remaining).await?
-        } else {
-            let raw_body =
-                read_body_bounded(resp.into_body(), MAX_HANDSHAKE_BODY_BYTES, remaining).await?;
-            if status.is_success() && content_type.as_deref() == Some("application/json") {
-                rewrite_json_handshake(&raw_body, profile)?
+        let transformed =
+            if status.is_success() && content_type.as_deref() == Some("text/event-stream") {
+                read_sse_handshake(
+                    resp.into_body(),
+                    request_id,
+                    profile,
+                    remaining,
+                    &self.proxy_budget,
+                )
+                .await?
             } else {
-                raw_body
-            }
-        };
+                let raw_body = read_body_bounded(
+                    resp.into_body(),
+                    MAX_HANDSHAKE_BODY_BYTES,
+                    remaining,
+                    &self.proxy_budget,
+                )
+                .await?;
+                if status.is_success() && content_type.as_deref() == Some("application/json") {
+                    rewrite_json_handshake(&raw_body, profile, &self.proxy_budget)?
+                } else {
+                    raw_body
+                }
+            };
 
         headers.remove(header::CONTENT_LENGTH);
         if let Ok(len_val) = HeaderValue::from_str(&transformed.len().to_string()) {
@@ -446,9 +554,21 @@ impl UpstreamClient {
         let is_sse = media_type(resp.headers()).as_deref() == Some("text/event-stream");
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let msg = if is_sse {
-            read_first_sse_json_bounded(resp.into_body(), MAX_PING_BODY_BYTES, remaining).await?
+            read_first_sse_json_bounded(
+                resp.into_body(),
+                MAX_PING_BODY_BYTES,
+                remaining,
+                &self.proxy_budget,
+            )
+            .await?
         } else {
-            let bytes = read_body_bounded(resp.into_body(), MAX_PING_BODY_BYTES, remaining).await?;
+            let bytes = read_body_bounded(
+                resp.into_body(),
+                MAX_PING_BODY_BYTES,
+                remaining,
+                &self.proxy_budget,
+            )
+            .await?;
             serde_json::from_slice::<Value>(&bytes).map_err(|e| {
                 UpstreamError::InvalidResponse(format!("invalid ping JSON response: {e}"))
             })?
@@ -623,13 +743,17 @@ impl UpstreamClient {
         let status = resp.status();
         let ct = media_type(resp.headers());
         if status.is_success() && ct.as_deref() == Some("text/event-stream") {
-            return Ok(UpstreamEventStream::new(resp.into_body()));
+            return Ok(UpstreamEventStream::new(
+                resp.into_body(),
+                Arc::clone(&self.proxy_budget),
+            ));
         }
 
         let raw = read_body_bounded(
             resp.into_body(),
             MAX_CONTROL_RESPONSE_BYTES,
             Duration::from_secs(10),
+            &self.proxy_budget,
         )
         .await?;
         if let Ok(msg) = serde_json::from_slice::<Value>(&raw)
@@ -674,11 +798,21 @@ impl UpstreamClient {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         let msg = if ct.as_deref() == Some("text/event-stream") {
-            read_first_sse_json_bounded(resp.into_body(), MAX_CONTROL_RESPONSE_BYTES, remaining)
-                .await?
+            read_first_sse_json_bounded(
+                resp.into_body(),
+                MAX_CONTROL_RESPONSE_BYTES,
+                remaining,
+                &self.proxy_budget,
+            )
+            .await?
         } else {
-            let bytes =
-                read_body_bounded(resp.into_body(), MAX_CONTROL_RESPONSE_BYTES, remaining).await?;
+            let bytes = read_body_bounded(
+                resp.into_body(),
+                MAX_CONTROL_RESPONSE_BYTES,
+                remaining,
+                &self.proxy_budget,
+            )
+            .await?;
             match serde_json::from_slice::<Value>(&bytes) {
                 Ok(v) => v,
                 Err(_) if !status.is_success() => {
@@ -821,13 +955,18 @@ pub fn inject_handshake_capabilities(payload: &mut Value, profile: Profile) -> b
     }
 }
 
-fn rewrite_json_handshake(raw: &Bytes, profile: Profile) -> Result<Bytes, UpstreamError> {
+fn rewrite_json_handshake(
+    raw: &Bytes,
+    profile: Profile,
+    budget: &Arc<ByteBudget>,
+) -> Result<Bytes, UpstreamError> {
     let mut val: Value = serde_json::from_slice(raw)
         .map_err(|e| UpstreamError::InvalidResponse(format!("invalid handshake JSON body: {e}")))?;
     if inject_handshake_capabilities(&mut val, profile) {
-        let encoded =
-            serde_json::to_vec(&val).map_err(|e| UpstreamError::InvalidResponse(e.to_string()))?;
-        Ok(Bytes::from(encoded))
+        let mut encoded = response_buffer(budget);
+        serde_json::to_writer(&mut encoded, &val)
+            .map_err(|e| UpstreamError::InvalidResponse(e.to_string()))?;
+        Ok(encoded.into_bytes())
     } else {
         Ok(raw.clone())
     }
@@ -838,34 +977,37 @@ async fn read_sse_handshake(
     request_id: &Value,
     profile: Profile,
     timeout: Duration,
+    budget: &Arc<ByteBudget>,
 ) -> Result<Bytes, UpstreamError> {
     tokio::time::timeout(timeout, async {
-        let mut buf = BytesMut::new();
-        let mut out = String::new();
+        let mut buf = response_buffer(budget);
+        let mut out = response_buffer(budget);
         let mut total_read = 0usize;
         let mut at_start = true;
         let mut eof = false;
         loop {
-            while let Some(frame) = take_sse_frame(&mut buf) {
+            while let Some(frame) = take_sse_frame(&mut buf, eof, budget)? {
                 let first = std::mem::replace(&mut at_start, false);
-                let response = extract_sse_data(&frame, first)
-                    .filter(|data| !data.trim().is_empty())
-                    .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+                let response = sse_data(&frame, first, budget)?
+                    .filter(|data| !data.text.trim().is_empty())
+                    .and_then(|data| serde_json::from_str::<Value>(&data.text).ok())
                     .filter(|msg| {
                         msg.get("id") == Some(request_id)
                             && (msg.get("result").is_some() || msg.get("error").is_some())
                     });
                 if let Some(mut response) = response {
                     if inject_handshake_capabilities(&mut response, profile) {
-                        let encoded = serde_json::to_string(&response)
+                        let mut encoded = response_buffer(budget);
+                        serde_json::to_writer(&mut encoded, &response)
                             .map_err(|e| UpstreamError::InvalidResponse(e.to_string()))?;
-                        write_sse_frame_with_data(&mut out, &frame, &encoded, first);
+                        let encoded = sse_text(encoded)?;
+                        write_sse_frame_with_data(&mut out, &frame.text, &encoded.text, first)?;
                     } else {
-                        out.push_str(&frame);
+                        append_response(&mut out, frame.text.as_bytes())?;
                     }
-                    return Ok(Bytes::from(out));
+                    return Ok(out.into_bytes());
                 }
-                out.push_str(&frame);
+                append_response(&mut out, frame.text.as_bytes())?;
             }
             if eof {
                 return Err(UpstreamError::InvalidResponse(
@@ -881,16 +1023,11 @@ async fn read_sse_handshake(
                                 limit: MAX_HANDSHAKE_BODY_BYTES,
                             });
                         }
-                        buf.put_slice(&chunk);
+                        append_response(&mut buf, &chunk)?;
                     }
                 }
                 Some(Err(e)) => return Err(UpstreamError::Http(e.to_string())),
-                None => {
-                    eof = true;
-                    if !buf.is_empty() {
-                        buf.put_slice(b"\n\n");
-                    }
-                }
+                None => eof = true,
             }
         }
     })
@@ -918,7 +1055,12 @@ fn sse_lines(text: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-fn write_sse_frame_with_data(out: &mut String, frame: &str, new_data: &str, at_start: bool) {
+fn write_sse_frame_with_data(
+    out: &mut LeasedBuffer,
+    frame: &str,
+    new_data: &str,
+    at_start: bool,
+) -> Result<(), UpstreamError> {
     let mut wrote_data = false;
     for (index, (line, ending)) in sse_lines(frame).enumerate() {
         let clean = if at_start && index == 0 {
@@ -929,21 +1071,22 @@ fn write_sse_frame_with_data(out: &mut String, frame: &str, new_data: &str, at_s
         if clean.starts_with("data:") || clean == "data" {
             if !wrote_data {
                 if clean.len() != line.len() {
-                    out.push('\u{feff}');
+                    append_response(out, "\u{feff}".as_bytes())?;
                 }
-                out.push_str("data: ");
-                out.push_str(new_data);
-                out.push_str(ending);
+                append_response(out, b"data: ")?;
+                append_response(out, new_data.as_bytes())?;
+                append_response(out, ending.as_bytes())?;
                 wrote_data = true;
             }
         } else {
-            out.push_str(line);
-            out.push_str(ending);
+            append_response(out, line.as_bytes())?;
+            append_response(out, ending.as_bytes())?;
         }
     }
+    Ok(())
 }
 
-fn take_sse_frame(buf: &mut BytesMut) -> Option<String> {
+fn sse_frame_len(buf: &[u8]) -> Option<usize> {
     let mut line_start = 0;
     let mut index = 0;
     while index < buf.len() {
@@ -953,7 +1096,7 @@ fn take_sse_frame(buf: &mut BytesMut) -> Option<String> {
                 next += 1;
             }
             if index == line_start {
-                return Some(String::from_utf8_lossy(&buf.split_to(next)).into_owned());
+                return Some(next);
             }
             line_start = next;
             index = next;
@@ -962,27 +1105,6 @@ fn take_sse_frame(buf: &mut BytesMut) -> Option<String> {
         }
     }
     None
-}
-
-fn extract_sse_data(frame: &str, at_start: bool) -> Option<String> {
-    let frame = if at_start {
-        frame.strip_prefix('\u{feff}').unwrap_or(frame)
-    } else {
-        frame
-    };
-    let mut data_lines = Vec::new();
-    for (line, _) in sse_lines(frame) {
-        if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
-        } else if line == "data" {
-            data_lines.push("");
-        }
-    }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(data_lines.join("\n"))
-    }
 }
 
 fn classify_stream_message(msg: &Value) -> Result<Option<UpstreamStreamFrame>, UpstreamError> {
@@ -1083,19 +1205,20 @@ async fn read_body_bounded(
     mut body: Incoming,
     limit: usize,
     timeout: Duration,
+    budget: &Arc<ByteBudget>,
 ) -> Result<Bytes, UpstreamError> {
     tokio::time::timeout(timeout, async {
-        let mut out = BytesMut::new();
+        let mut out = response_buffer(budget);
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|e| UpstreamError::Http(e.to_string()))?;
             if let Ok(chunk) = frame.into_data() {
                 if out.len() + chunk.len() > limit {
                     return Err(UpstreamError::BodyTooLarge { limit });
                 }
-                out.put_slice(&chunk);
+                append_response(&mut out, &chunk)?;
             }
         }
-        Ok(out.freeze())
+        Ok(out.into_bytes())
     })
     .await
     .map_err(|_| UpstreamError::Timeout)?
@@ -1105,19 +1228,20 @@ async fn read_first_sse_json_bounded(
     mut body: Incoming,
     limit: usize,
     timeout: Duration,
+    budget: &Arc<ByteBudget>,
 ) -> Result<Value, UpstreamError> {
     tokio::time::timeout(timeout, async {
-        let mut buf = BytesMut::new();
+        let mut buf = response_buffer(budget);
         let mut total_read = 0usize;
         let mut eof = false;
         let mut at_start = true;
         loop {
-            while let Some(raw_frame) = take_sse_frame(&mut buf) {
+            while let Some(frame) = take_sse_frame(&mut buf, eof, budget)? {
                 if let Some(data) =
-                    extract_sse_data(&raw_frame, std::mem::replace(&mut at_start, false))
-                    && !data.trim().is_empty()
+                    sse_data(&frame, std::mem::replace(&mut at_start, false), budget)?
+                    && !data.text.trim().is_empty()
                 {
-                    let msg: Value = serde_json::from_str(&data).map_err(|e| {
+                    let msg: Value = serde_json::from_str(&data.text).map_err(|e| {
                         UpstreamError::InvalidResponse(format!("invalid SSE JSON: {e}"))
                     })?;
                     if msg.get("result").is_some() || msg.get("error").is_some() {
@@ -1137,16 +1261,11 @@ async fn read_first_sse_json_bounded(
                         if total_read > limit {
                             return Err(UpstreamError::BodyTooLarge { limit });
                         }
-                        buf.put_slice(&chunk);
+                        append_response(&mut buf, &chunk)?;
                     }
                 }
                 Some(Err(e)) => return Err(UpstreamError::Http(e.to_string())),
-                None => {
-                    eof = true;
-                    if !buf.is_empty() {
-                        buf.put_slice(b"\n\n");
-                    }
-                }
+                None => eof = true,
             }
         }
     })
@@ -1202,7 +1321,7 @@ mod tests {
             request_timeout_secs: 10,
             expose_events: vec![],
         };
-        UpstreamClient::new(&cfg).unwrap()
+        UpstreamClient::new(&cfg, ByteBudget::new(crate::types::PROXY_BYTE_BUDGET)).unwrap()
     }
 
     struct OpenSseBody(std::collections::VecDeque<Bytes>);
@@ -1226,21 +1345,72 @@ mod tests {
     fn sse_frames_accept_split_bom_and_mixed_line_endings() {
         let raw = "\u{feff}data: first\r\rdata: second\r\ndata: line\n\r\n";
         for split in 0..=raw.len() {
-            let mut buf = BytesMut::new();
+            let budget = ByteBudget::new(4096);
+            let mut buf = response_buffer(&budget);
             let mut at_start = true;
             let mut data = Vec::new();
             for chunk in [&raw.as_bytes()[..split], &raw.as_bytes()[split..]] {
-                buf.extend_from_slice(chunk);
-                while let Some(frame) = take_sse_frame(&mut buf) {
+                append_response(&mut buf, chunk).unwrap();
+                while let Some(frame) = take_sse_frame(&mut buf, false, &budget).unwrap() {
                     if let Some(value) =
-                        extract_sse_data(&frame, std::mem::replace(&mut at_start, false))
+                        sse_data(&frame, std::mem::replace(&mut at_start, false), &budget).unwrap()
                     {
-                        data.push(value);
+                        data.push(value.text);
                     }
                 }
             }
             assert_eq!(data, ["first", "second\nline"], "split at {split}");
         }
+    }
+
+    #[test]
+    fn continuous_sse_frames_charge_capacity_without_accumulating_history() {
+        let budget = ByteBudget::new(128);
+        let mut buf = response_buffer(&budget);
+        append_response(&mut buf, b"data: first\n\ndata:").unwrap();
+        for index in 0..1000 {
+            let frame = take_sse_frame(&mut buf, false, &budget).unwrap().unwrap();
+            assert_eq!(budget.used(), buf.capacity() + frame.text.capacity());
+            drop(frame);
+            assert_eq!(budget.used(), buf.capacity());
+            append_response(&mut buf, format!(" {index}\n\ndata:").as_bytes()).unwrap();
+        }
+        drop(buf);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn handshake_bytes_hold_capacity_budget_and_control_reads_share_it() {
+        let (url, _srv) = spawn_mock_server(|_req| async {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{},\"protocolVersion\":\"2025-11-25\"}}",
+                )))
+                .unwrap()
+        })
+        .await;
+        let budget = ByteBudget::new(4096);
+        let mut client = make_client(url, None);
+        client.proxy_budget = Arc::clone(&budget);
+        let response = client
+            .forward_handshake(
+                &HeaderMap::new(),
+                Bytes::from_static(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"),
+                Profile::Chatgpt,
+                None,
+            )
+            .await
+            .unwrap();
+        let retained = response.body.clone();
+        drop(response);
+        assert!(budget.used() >= retained.len());
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+        let lease = budget.try_acquire(budget.limit()).unwrap();
+        assert!(client.list_events_all_pages(false).await.is_err());
+        drop(lease);
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]
