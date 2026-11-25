@@ -688,16 +688,16 @@ mod windows_platform {
         {
             return Err(io::Error::last_os_error());
         }
-        let mut wpath = wide(path.as_os_str())?;
+        let wpath = wide(path.as_os_str())?;
         let status = unsafe {
             SetNamedSecurityInfoW(
-                wpath.as_mut_ptr(),
+                wpath.as_ptr(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 dacl,
-                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
         if status != 0 {
@@ -708,7 +708,7 @@ mod windows_platform {
 
     pub fn create_private_temp_file(path: &Path) -> io::Result<File> {
         let desc = owner_only_descriptor(false)?;
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: desc.0,
             bInheritHandle: 0,
@@ -719,7 +719,7 @@ mod windows_platform {
                 name.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                &mut sa,
+                &sa,
                 CREATE_NEW,
                 FILE_FLAG_OPEN_REPARSE_POINT,
                 std::ptr::null_mut(),
