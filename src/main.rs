@@ -1,5 +1,6 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use mcp_hookd::config::Config;
+use mcp_hookd::emit::{DEFAULT_INGEST_URL, EmitOptions, OnInvalid, run_emit};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -28,11 +29,7 @@ enum Command {
     },
     /// Send one event or a stream of NDJSON events to POST /v1/events.
     Emit {
-        #[arg(
-            long,
-            env = "HOOKD_INGEST_URL",
-            default_value = "http://127.0.0.1:8081/v1/events"
-        )]
+        #[arg(long, env = "HOOKD_INGEST_URL", default_value = DEFAULT_INGEST_URL)]
         url: String,
         #[arg(long)]
         name: Option<String>,
@@ -41,12 +38,6 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OnInvalid::Fail)]
         on_invalid: OnInvalid,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum OnInvalid {
-    Fail,
-    Drop,
 }
 
 fn main() -> ExitCode {
@@ -63,9 +54,29 @@ fn main() -> ExitCode {
             eprintln!("serve not yet implemented");
             ExitCode::FAILURE
         }
-        Command::Emit { .. } => {
-            eprintln!("emit not yet implemented");
-            ExitCode::FAILURE
+        Command::Emit {
+            url,
+            name,
+            stream,
+            on_invalid,
+        } => {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    eprintln!("mcp-hookd emit failed to start runtime: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            rt.block_on(run_emit(EmitOptions {
+                url,
+                name,
+                stream,
+                on_invalid,
+                token: None,
+            }))
         }
     }
 }

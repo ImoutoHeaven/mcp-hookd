@@ -1,3 +1,9 @@
+pub mod auth;
 pub mod config;
+pub mod emit;
+pub mod headers;
+pub mod outbound;
 pub mod schema;
+pub mod store;
 pub mod types;
+pub mod upstream;
