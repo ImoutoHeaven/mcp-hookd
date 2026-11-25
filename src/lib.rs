@@ -4,6 +4,7 @@ pub mod emit;
 pub mod engine;
 pub mod headers;
 pub mod outbound;
+mod proxy_body;
 pub mod schema;
 pub mod server;
 pub mod store;

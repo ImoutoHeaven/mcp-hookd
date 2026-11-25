@@ -1820,3 +1820,46 @@ async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_40
     assert_eq!(disc_priv["result"]["cacheScope"], "private");
     srv_priv.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn passthrough_response_obeys_proxy_byte_budget() {
+    let (up_addr, _up_task) = spawn_http_mock(|_req| async {
+        Response::new(Full::new(Bytes::from_static(
+            b"this response exceeds the small test budget",
+        )))
+    })
+    .await;
+    let dir = TempDir::new().unwrap();
+    let cfg = base_config(
+        dir.path().join("subscriptions.json"),
+        Profile::Sep3415,
+        Some(UpstreamConfig {
+            url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+            bearer_token: None,
+            passthrough_prefixes: vec!["/t/".into()],
+            request_timeout_secs: 10,
+            expose_events: vec![],
+        }),
+        None,
+        None,
+    );
+    let server = start_server(
+        cfg,
+        QuotaConfig {
+            proxy_byte_budget: 16,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let req = Request::builder()
+        .uri(format!("http://{}/t/file", server.local_addr()))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    if let Ok(response) = http_client().request(req).await {
+        assert!(response.into_body().collect().await.is_err());
+    }
+    assert_eq!(server.engine().pools().proxy.used(), 0);
+    server.shutdown().await.unwrap();
+}

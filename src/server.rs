@@ -12,8 +12,9 @@ use crate::headers::{
     validate_passthrough_path,
 };
 use crate::outbound::OutboundClient;
+use crate::proxy_body::{ProxyBody, lease_bytes};
 use crate::types::{
-    ByteLease, LATEST_LEGACY_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSIONS, LEGACY_SESSION_IDLE_SECS,
+    ByteBudget, LATEST_LEGACY_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSIONS, LEGACY_SESSION_IDLE_SECS,
     MAX_INGEST_BODY_BYTES, MAX_LEGACY_SESSIONS, MAX_REQUEST_BODY_BYTES, MemoryPools,
     PROTOCOL_VERSION_MODERN, Profile, QuotaConfig, SecretString, constant_time_token_eq,
     random_base64url, unix_now,
@@ -22,6 +23,7 @@ use crate::upstream::UpstreamError;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
+use http_body::Body;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -321,7 +323,7 @@ async fn handle_ingest(state: Arc<ServerState>, req: Request<Incoming>) -> Respo
         return unauthorized_response();
     };
 
-    let (body, _lease) = match read_request_body_leased(
+    let body = match read_request_body_leased(
         req.into_body(),
         MAX_INGEST_BODY_BYTES,
         state.engine.pools(),
@@ -389,10 +391,17 @@ async fn handle_passthrough(state: Arc<ServerState>, req: Request<Incoming>) -> 
 
     let (parts, incoming) = req.into_parts();
     match upstream
-        .forward_raw(method, Some(&pq), &parts.headers, incoming, false, None)
+        .forward_raw(
+            method,
+            Some(&pq),
+            &parts.headers,
+            ProxyBody::new(incoming, Arc::clone(&state.engine.pools().proxy)),
+            false,
+            None,
+        )
         .await
     {
-        Ok(resp) => relay_upstream_response(resp),
+        Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
         Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
         Err(_) => empty_response(StatusCode::BAD_GATEWAY),
     }
@@ -442,7 +451,7 @@ async fn handle_mcp_get(state: Arc<ServerState>, req: Request<Incoming>) -> Resp
         )
         .await
     {
-        Ok(resp) => relay_upstream_response(resp),
+        Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
         Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
         Err(_) => empty_response(StatusCode::BAD_GATEWAY),
     }
@@ -479,7 +488,7 @@ async fn handle_mcp_delete(state: Arc<ServerState>, req: Request<Incoming>) -> R
             )
             .await
         {
-            Ok(resp) => relay_upstream_response(resp),
+            Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
             Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
             Err(_) => empty_response(StatusCode::BAD_GATEWAY),
         };
@@ -535,7 +544,7 @@ async fn handle_mcp_post(
     );
     let (parts, incoming) = req.into_parts();
 
-    let (raw_body, _lease) = match read_request_body_leased(
+    let raw_body = match read_request_body_leased(
         incoming,
         MAX_REQUEST_BODY_BYTES,
         state.engine.pools(),
@@ -1242,7 +1251,9 @@ async fn handle_events_method(
                         )
                         .await
                     {
-                        Ok(resp) => relay_upstream_response(resp),
+                        Ok(resp) => {
+                            relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy))
+                        }
                         Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
                         Err(_) => empty_response(StatusCode::BAD_GATEWAY),
                     }
@@ -1308,7 +1319,7 @@ async fn handle_other_method(
             )
             .await
         {
-            Ok(resp) => relay_upstream_response(resp),
+            Ok(resp) => relay_upstream_response(resp, Arc::clone(&state.engine.pools().proxy)),
             Err(UpstreamError::Timeout) => empty_response(StatusCode::GATEWAY_TIMEOUT),
             Err(_) => empty_response(StatusCode::BAD_GATEWAY),
         };
@@ -1588,13 +1599,17 @@ enum BodyReadError {
     Io(String),
 }
 
-async fn read_request_body_leased(
-    mut body: Incoming,
+async fn read_request_body_leased<B>(
+    mut body: B,
     limit: usize,
     pools: &MemoryPools,
     prefer_control: bool,
     allow_control_fallback: bool,
-) -> Result<(Bytes, ByteLease), BodyReadError> {
+) -> Result<Bytes, BodyReadError>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let mut lease = if prefer_control {
         pools
             .control
@@ -1617,6 +1632,9 @@ async fn read_request_body_leased(
                 if next_len > limit {
                     return Err(BodyReadError::TooLarge);
                 }
+                if using_control && !prefer_control && next_len > CONTROL_FALLBACK_MAX_BYTES {
+                    return Err(BodyReadError::BudgetExhausted);
+                }
                 if !lease.grow(chunk.len()) {
                     // Fall back to the reserved control pool only for small MCP control requests.
                     if allow_control_fallback
@@ -1633,7 +1651,7 @@ async fn read_request_body_leased(
                 out.put_slice(&chunk);
             }
         }
-        Ok((out.freeze(), lease))
+        Ok(lease_bytes(out.freeze(), lease))
     };
 
     tokio::time::timeout(BODY_READ_TIMEOUT, read_fut)
@@ -1641,14 +1659,17 @@ async fn read_request_body_leased(
         .map_err(|_| BodyReadError::Timeout)?
 }
 
-fn relay_upstream_response(resp: Response<Incoming>) -> Response<RespBody> {
+fn relay_upstream_response(
+    resp: Response<Incoming>,
+    budget: Arc<ByteBudget>,
+) -> Response<RespBody> {
     let (parts, body) = resp.into_parts();
     let headers = strip_hop_by_hop_response_headers(&parts.headers);
     let mut builder = Response::builder().status(parts.status);
     if let Some(h) = builder.headers_mut() {
         *h = headers;
     }
-    let stream = body.map_err(io::Error::other).boxed();
+    let stream = ProxyBody::new(body, budget).boxed();
     builder
         .body(stream)
         .unwrap_or_else(|_| empty_response(StatusCode::BAD_GATEWAY))
@@ -1748,4 +1769,61 @@ fn method_not_allowed(allow: &'static str) -> Response<RespBody> {
 
 fn full_body(bytes: Bytes) -> RespBody {
     Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body::Frame;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Chunks(VecDeque<Bytes>);
+
+    impl Body for Chunks {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            Poll::Ready(self.0.pop_front().map(|chunk| Ok(Frame::data(chunk))))
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_control_request_stays_small_across_body_chunks() {
+        let pools = MemoryPools::from_quotas(&QuotaConfig {
+            proxy_byte_budget: 0,
+            ..Default::default()
+        });
+        let chunks = || {
+            Chunks(
+                [
+                    Bytes::from(vec![0; 4096]),
+                    Bytes::from(vec![0; CONTROL_FALLBACK_MAX_BYTES]),
+                ]
+                .into(),
+            )
+        };
+        let result =
+            read_request_body_leased(chunks(), MAX_REQUEST_BODY_BYTES, &pools, false, true).await;
+        assert!(matches!(result, Err(BodyReadError::BudgetExhausted)));
+        assert_eq!(pools.control.used(), 0);
+
+        let body =
+            read_request_body_leased(chunks(), MAX_REQUEST_BODY_BYTES, &pools, true, true).await;
+        let body = match body {
+            Ok(body) => body,
+            Err(_) => panic!("explicit control request should use its full budget"),
+        };
+        assert_eq!(pools.control.used(), body.len());
+        let retained = body.clone();
+        drop(body);
+        assert_eq!(pools.control.used(), retained.len());
+        drop(retained);
+        assert_eq!(pools.control.used(), 0);
+    }
 }
