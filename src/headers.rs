@@ -659,7 +659,8 @@ fn header_matches_scalar(decoded: &str, arg_val: &Value) -> bool {
                 return exact_header_integer(decoded) == Some(integer);
             }
             if as_exact_i128(&hdr_val).is_some() {
-                return false;
+                return exact_header_integer(&n.to_string())
+                    .is_some_and(|integer| exact_header_integer(decoded) == Some(integer));
             }
             match (n.as_f64(), hdr_num.as_f64()) {
                 (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a == b,
@@ -1042,6 +1043,21 @@ mod tests {
         assert!(header_matches_scalar("-0.000e+200", &json!(0)));
         assert!(!header_matches_scalar("1e-1", &json!(0)));
         assert!(!header_matches_scalar("1e39", &json!(0)));
+    }
+
+    #[test]
+    fn exponent_bodies_accept_exact_integer_headers_and_keep_float_round_trips() {
+        let body = json!(1e18_f64);
+        assert!(header_matches_scalar("1000000000000000000", &body));
+        assert!(!header_matches_scalar("1000000000000000001", &body));
+        for body in [
+            json!(1e18_f64),
+            json!(9.223372036854776e18_f64),
+            json!(1e38_f64),
+        ] {
+            assert!(header_matches_scalar(&body.to_string(), &body));
+        }
+        assert!(!header_matches_scalar("2", &json!(1.5)));
     }
 
     #[test]
