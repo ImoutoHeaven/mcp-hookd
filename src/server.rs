@@ -2093,7 +2093,11 @@ fn verify_bearer_token(headers: &HeaderMap, tokens: &[SecretString]) -> Option<u
         HeaderExtract::Single(s) => s,
         _ => return None,
     };
-    let presented = raw.strip_prefix("Bearer ")?;
+    let (scheme, presented) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let presented = presented.trim_start_matches(' ');
     if presented.is_empty() {
         return None;
     }
@@ -4012,6 +4016,19 @@ fn full_body(bytes: Bytes) -> RespBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_scheme_accepts_case_and_space_variants() {
+        let tokens = [SecretString::new("normal-client-token-0123456789")];
+        for prefix in ["Bearer ", "bearer ", "BEARER ", "bEaReR   "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("{prefix}{}", tokens[0].expose())).unwrap(),
+            );
+            assert_eq!(verify_bearer_token(&headers, &tokens), Some(0));
+        }
+    }
 
     const _: () = {
         assert!(std::mem::size_of::<Box<Response<RespBody>>>() < 128);
