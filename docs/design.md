@@ -146,7 +146,7 @@ Outbound event webhooks carry a canonical JSON envelope (`<= 256 KiB`):
 
 ### Standard Webhooks `v1` Signing and Dual-Secret Window
 
-Subscription requests supply `params.delivery.secret` formatted as `whsec_<standard-base64>`, decoding to `32..=64` raw key bytes. Secrets live in `SecretString`, which zeroes backing memory on drop (`zeroize`) and formats as `[REDACTED]` in `Debug` and `Display`.
+Subscription requests supply `params.delivery.secret` formatted as `whsec_<standard-base64>`, decoding to `24..=64` raw key bytes. Secrets live in `SecretString`, which zeroes backing memory on drop (`zeroize`) and formats as `[REDACTED]` in `Debug` and `Display`.
 
 Every outbound `POST` (verification, `event`, `gap`, and `terminated`) uses HTTP/1.1 (`ALPN: http/1.1`) and includes:
 
@@ -219,7 +219,7 @@ Each subscription runs a single serialized delivery loop (`MAX_IN_FLIGHT_PER_SUB
 
 `StateStore` persists `PersistedState` (`version: 1`, `subscriptions`, `verified_endpoints`) to `state_path` with a `25ms` group-commit debounce (`DEFAULT_GROUP_COMMIT_DEBOUNCE`):
 
-- Both startup reads and runtime writes enforce `MAX_STATE_FILE_BYTES = 16 MiB`. A snapshot exceeding `16 MiB` fails the save and leaves the previously committed `state_path` intact; startup rejects oversized, symlinked, or multi-hardlinked state files and requires owner-only permissions (`0600` file and non-world/group-writable parent on Unix, owner-only DACL via `SetFileSecurity` / `CreateFileW` security attributes on Windows).
+- Both startup reads and runtime writes enforce `MAX_STATE_FILE_BYTES = 16 MiB`. A snapshot exceeding `16 MiB` fails the save and leaves the previously committed `state_path` intact; startup rejects oversized, symlinked, or multi-hardlinked state files. New Unix state directories use `0700`; temporary files use `0600`, and startup reads set the opened state file to `0600`. On Windows, new directories and temporary state files use protected owner-only DACLs; startup does not revalidate the DACL on an existing state file.
 - Saves write to a sibling random temporary file created with `0600` / owner-only permissions, flush via `File::sync_all()`, atomically `rename` over `state_path`, and `sync_all()` the parent directory on Unix. Stale sibling temp files from prior crashes are cleaned on open.
 - On `SIGINT` / `SIGTERM` (or Ctrl+C on Windows), `mcp-hookd` stops accepting new subscriptions, cancels upstream streams and background loops, flushes dirty state, and waits up to `DRAIN_TIMEOUT_SECS = 10s` for in-flight deliveries to settle.
 
