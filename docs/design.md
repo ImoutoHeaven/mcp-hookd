@@ -83,7 +83,7 @@ On `events/poll`, `events/stream`, `events/subscribe`, and `events/unsubscribe`,
 
 ### Hop Authentication (`inbound_tokens`)
 
-Every request to `<resource_path>` must carry a single `Authorization: Bearer <token>` header matching an entry in `inbound_tokens` under constant-time comparison (`subtle::ConstantTimeEq`). Capability URL routes under `<passthrough_prefixes>` do not require `inbound_tokens`; they enforce browser `Origin` validation, strip any inbound `Authorization` header, and never inject `upstream.bearer_token`. Every static token configured in `inbound_tokens[*]`, `auth_context.check_token`, `upstream.bearer_token`, and `ingest.tokens[*]` must be at least `16` visible ASCII characters (`0x21..=0x7E`). When `auth_context` is omitted, the authenticated caller principal is `token:<slot_index>`.
+Every request to `<resource_path>` must carry a single `Authorization: Bearer <token>` header matching an entry in `inbound_tokens` under constant-time comparison (`subtle::ConstantTimeEq`). Capability URL routes under `<passthrough_prefixes>` do not require `inbound_tokens`; they enforce browser `Origin` validation, strip any inbound `Authorization` header, and never inject `upstream.bearer_token`. Every static token configured in `inbound_tokens[*]`, `auth_context.check_token`, `upstream.bearer_token`, and `ingest.tokens[*]` must be at least `16` visible ASCII characters (`0x21..=0x7E`). When `auth_context` is omitted, the authenticated caller principal is `static:<slot_index>`.
 
 ### Delegated Subject Authorization (`auth_context`)
 
@@ -160,11 +160,11 @@ When a subscriber refreshes an existing subscription with a rotated `whsec_` sec
 
 ### Callback Verification Challenge and Fail-Closed Rate Limiting
 
-Before activating a new endpoint or unsuspending a `suspended` subscription, `mcp-hookd` performs a synchronous challenge:
+New subscriptions and secret rotations use the verified-endpoint cache. On a cache miss, `mcp-hookd` performs a synchronous challenge:
 
 1. Sends a signed `POST` to `delivery.url` with `webhook-id: msg_verification_<32-hex>` and body `{"type":"verification","challenge":"<48-hex>"}` (`VERIFY_TIMEOUT = 5s`, response body capped at `MAX_VERIFY_RESP_BYTES = 16 KiB`).
 2. Requires a `2xx` JSON response `{"challenge":"..."}` whose `challenge` string matches in constant time.
-3. Records `(principal, url, sha256_hex(secret))` in the verified-endpoint cache (`VERIFIED_RETENTION_SECS = 3600`, `MAX_VERIFIED_ENDPOINTS = 1024`, persisted in `subscriptions.json`) so subsequent refreshes or sibling event subscriptions sharing the same `(principal, url, secret)` skip redundant round-trips. Refreshing a `suspended` subscription bypasses this cache and forces a live challenge.
+3. Records `(principal, url, sha256_hex(secret))` in the verified-endpoint cache (`VERIFIED_RETENTION_SECS = 3600`, `MAX_VERIFIED_ENDPOINTS = 1024`, persisted in `subscriptions.json`) so subsequent refreshes or sibling event subscriptions sharing the same `(principal, url, secret)` skip redundant round-trips.
 
 To prevent `events/subscribe` from being abused as a reflection or port-scanning amplifier, callback verification enforces a fail-closed three-dimensional sliding-window rate limiter over `VERIFY_RATE_WINDOW = 60s`:
 
@@ -213,7 +213,7 @@ Each subscription runs a single serialized delivery loop (`MAX_IN_FLIGHT_PER_SUB
   - Permanent `4xx` (`400`, `410`, `413`, `422`): item drops permanently without stalling subsequent events and `safe_cursor` advances;
   - Oversized upstream envelopes (`> 256 KiB`) or invalid `chatgpt` event IDs enqueue lightweight `Checkpoint` items so `safe_cursor` advances once all preceding deliveries finish;
   - Transient failures (`5xx`, `3xx`, `401`, `403`, `404`, `408`, `429`, timeouts, TCP/TLS errors) on both `Event` and `Gap` (`sep3415`) items back off exponentially (`retry_base_ms * 2^min(attempt, 5)` plus `0..=25%` random jitter, up to `MAX_TRANSIENT_RETRIES = 6` per cycle) with the item kept at the head of the outbox.
-- Suspension: If consecutive transient failures reach `suspend_failure_count = 12` and span at least `suspend_min_duration_secs = 180s`, the subscription sets `suspended = true`, records `last_error`, cancels upstream consumption, and persists state. For `Ingest` subscriptions (which have no upstream replay cursor), entering `suspended` immediately clears `outbox` so held `ByteLease` allocations return to `OUTBOX_BYTE_BUDGET` (`64 MiB`) instead of pinning memory until TTL expiry. Refreshing via `events/subscribe` re-verifies the callback URL, clears `suspended`, and returns the prior state in `deliveryStatus: { "active": false, "lastError": "<reason>" }`.
+- Suspension: If consecutive transient failures reach `suspend_failure_count = 12` and span at least `suspend_min_duration_secs = 180s`, the subscription sets `suspended = true`, records `last_error`, cancels upstream consumption, and persists state. For `Ingest` subscriptions (which have no upstream replay cursor), entering `suspended` immediately clears `outbox` so held `ByteLease` allocations return to `OUTBOX_BYTE_BUDGET` (`64 MiB`) instead of pinning memory until TTL expiry. A successful refresh via `events/subscribe` clears `suspended` and returns the prior state in `deliveryStatus: { "active": false, "lastError": "<reason>" }`.
 
 ### Atomic State Persistence and Graceful Shutdown
 
