@@ -1117,7 +1117,7 @@ async fn handle_buffered_upstream_post(
             let mode = match classify_protocol(&req_headers, method, req_id.is_some(), params) {
                 Ok(m) => m,
                 Err((code, msg)) => {
-                    return jsonrpc_error(StatusCode::BAD_REQUEST, err_id, code, &msg, None);
+                    return protocol_error_response(&req_headers, err_id, code, &msg);
                 }
             };
             let ctx = RpcContext {
@@ -1421,13 +1421,7 @@ async fn handle_mcp_post_local_only(
     let mode = match classify_protocol(&parts.headers, method, req_id.is_some(), params) {
         Ok(m) => m,
         Err((code, msg)) => {
-            if code == -32022
-                && let HeaderExtract::Single(version) =
-                    single_header_str(&parts.headers, "mcp-protocol-version")
-            {
-                return unsupported_protocol_version(err_id, version);
-            }
-            return jsonrpc_error(StatusCode::BAD_REQUEST, err_id, code, &msg, None);
+            return protocol_error_response(&parts.headers, err_id, code, &msg);
         }
     };
 
@@ -3938,6 +3932,20 @@ fn jsonrpc_ok(id: Value, result: Value) -> Response<RespBody> {
             "result": result
         }),
     )
+}
+
+fn protocol_error_response(
+    headers: &HeaderMap,
+    id: Value,
+    code: i64,
+    message: &str,
+) -> Response<RespBody> {
+    if code == -32022
+        && let HeaderExtract::Single(version) = single_header_str(headers, "mcp-protocol-version")
+    {
+        return unsupported_protocol_version(id, version);
+    }
+    jsonrpc_error(StatusCode::BAD_REQUEST, id, code, message, None)
 }
 
 fn unsupported_protocol_version(id: Value, requested: &str) -> Response<RespBody> {
