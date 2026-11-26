@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -483,6 +484,7 @@ impl UpstreamClient {
                 request_id,
                 profile,
                 Arc::clone(&self.proxy_budget),
+                deadline,
             )
             .boxed();
             return Ok(HandshakeResponse {
@@ -1010,6 +1012,7 @@ fn rewrite_json_handshake(
 
 enum HandshakeSsePhase {
     Searching {
+        deadline: Pin<Box<tokio::time::Sleep>>,
         request_id: Value,
         profile: Profile,
         buf: LeasedBuffer,
@@ -1031,12 +1034,19 @@ struct HandshakeSseBody<B> {
 }
 
 impl<B> HandshakeSseBody<B> {
-    fn new(inner: B, request_id: Value, profile: Profile, budget: Arc<ByteBudget>) -> Self {
+    fn new(
+        inner: B,
+        request_id: Value,
+        profile: Profile,
+        budget: Arc<ByteBudget>,
+        deadline: tokio::time::Instant,
+    ) -> Self {
         let buf = response_buffer(&budget);
         Self {
             inner,
             budget,
             phase: HandshakeSsePhase::Searching {
+                deadline: Box::pin(tokio::time::sleep_until(deadline)),
                 request_id,
                 profile,
                 buf,
@@ -1102,6 +1112,7 @@ where
                     };
                 }
                 HandshakeSsePhase::Searching {
+                    deadline,
                     request_id,
                     profile,
                     buf,
@@ -1109,6 +1120,13 @@ where
                     at_start,
                     eof,
                 } => {
+                    if deadline.as_mut().poll(cx).is_ready() {
+                        this.phase = HandshakeSsePhase::Done;
+                        return Poll::Ready(Some(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "upstream handshake timed out",
+                        ))));
+                    }
                     match take_sse_frame(buf, *eof, &this.budget, MAX_HANDSHAKE_BODY_BYTES) {
                         Ok(Some(frame)) => {
                             let first = std::mem::replace(at_start, false);
@@ -1660,6 +1678,50 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
+    struct ChannelBody(tokio::sync::mpsc::UnboundedReceiver<Bytes>);
+
+    impl Body for ChannelBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            self.0
+                .poll_recv(cx)
+                .map(|opt| opt.map(|b| Ok(Frame::data(b))))
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_sse_deadline_expires_after_priming_before_matching_response() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Bytes::from_static(b": priming\n\n")).unwrap();
+        let budget = ByteBudget::new(4096);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let mut body = HandshakeSseBody::new(
+            ChannelBody(rx),
+            json!(1),
+            Profile::Chatgpt,
+            Arc::clone(&budget),
+            deadline,
+        );
+        let priming = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(priming, Bytes::from_static(b": priming\n\n"));
+        drop(priming);
+        let err = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("the handshake deadline must wake a pending body")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+        assert_eq!(budget.used(), 0);
+        drop(tx);
+    }
+
     #[tokio::test]
     async fn handshake_streams_matching_response_on_open_sse_and_relays_trailing_frames() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -1676,20 +1738,6 @@ mod tests {
         .unwrap();
         let rx = Arc::new(tokio::sync::Mutex::new(Some(rx)));
         let rx_srv = Arc::clone(&rx);
-
-        struct ChannelBody(tokio::sync::mpsc::UnboundedReceiver<Bytes>);
-        impl Body for ChannelBody {
-            type Data = Bytes;
-            type Error = Infallible;
-            fn poll_frame(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-                self.0
-                    .poll_recv(cx)
-                    .map(|opt| opt.map(|b| Ok(Frame::data(b))))
-            }
-        }
 
         let (url, _srv) = spawn_mock_server(move |_req| {
             let rx_srv = Arc::clone(&rx_srv);
@@ -1734,7 +1782,8 @@ mod tests {
         assert!(text_before_eof.contains("\"id\":2,\"result\":{}"));
         assert!(text_before_eof.contains("\"events\":{}"));
 
-        // Push a late server frame while SSE stream is still open, then close EOF.
+        // The handshake deadline stops applying once its response has been forwarded.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         tx.send(Bytes::from_static(
             b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\"}\n\n",
         ))
