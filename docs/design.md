@@ -91,7 +91,7 @@ Enabling `auth_context` requires `listen` to be a literal loopback IP (`127.0.0.
 
 At the `<resource_path>` entry for every HTTP method (`GET`, `POST`, `DELETE`), `mcp-hookd` extracts `X-Authorization-Ref` (`1..=256` visible ASCII bytes) and `X-Authorization-Scope` (space-delimited RFC 6749 scope tokens) and verifies the grant against `POST <auth_context.check_url>` (`Authorization: Bearer <check_token>`, request body `{"ref":"<auth_ref>"}`, `5s` timeout, `4 KiB` response cap). Concurrent checks for the same `auth_ref` coalesce behind a per-ref single-flight lock, and definitive outcomes cache for `reverify_secs` (`default 15s`, range `5..=300s`, capped at `4096` entries).
 
-Effective caller scopes equal `header_scopes ∩ checked.scopes`. Subscription TTLs clamp `refresh_before` to `min(now + effective_ttl, checked.expires_at)`.
+Effective caller scopes equal `header_scopes ∩ checked.scopes`. Subscription TTLs clamp `refresh_before` to `min(now + effective_ttl, checked.expires_at)`. A successful refresh for the same principal commits its current `auth_ref` with the new lease; a failed or cancelled save keeps the previously committed reference.
 
 | Condition at `<resource_path>` | HTTP Status | `WWW-Authenticate` Header | `oauth2-mcp-gateway` Handling (`auth_context` Enabled) |
 | :--- | :--- | :--- | :--- |
@@ -103,13 +103,13 @@ Effective caller scopes equal `header_scopes ∩ checked.scopes`. Subscription T
 
 ### Continuous Re-Verification, Startup Gating, and Instance-Exact Revocation
 
-`mcp-hookd` re-verifies `auth_ref` before outbound webhook deliveries and on periodic sweeps (`reverify_secs`). If a grant becomes inactive, changes `resource`, or narrows scopes below the subscription's persisted `granted_scopes`, `mcp-hookd` revokes only the exact `SubRuntime` instance that failed verification (`Arc::ptr_eq`), clears its outbox, cancels its upstream stream/poll tasks, and marks state dirty. Under the `sep3415` profile, it then acquires the subscription's `key_lock` and global delivery permit, confirms no replacement subscription has been registered under the same `SubscriptionKey`, and posts `{"type":"terminated","reason":"authorization_revoked"}`. Serializing termination on `key_lock` prevents an older revocation task from delivering `terminated` after a rapid re-subscribe to the same key.
+`mcp-hookd` re-verifies `auth_ref` before outbound webhook deliveries and on periodic sweeps (`reverify_secs`). If a grant becomes inactive, changes `resource`, or narrows scopes below the subscription's persisted `granted_scopes`, `mcp-hookd` revokes only the exact `SubRuntime` instance whose current `auth_ref` still matches the checked reference, clears its outbox, cancels its upstream stream/poll tasks, and marks state dirty. Under the `sep3415` profile, it then acquires the subscription's `key_lock` and global delivery permit, confirms no replacement subscription has been registered under the same `SubscriptionKey`, and posts `{"type":"terminated","reason":"authorization_revoked"}`. Serializing termination on `key_lock` prevents an older revocation task from delivering `terminated` after a rapid re-subscribe to the same key.
 
 On startup with `auth_context` enabled, persisted subscriptions carrying an `auth_ref` remain gated (no upstream consumption or outbound webhook delivery) until `run_startup_auth_recovery` confirms their grants against `check_url`, retrying transient check failures with exponential backoff and revoking grants confirmed inactive.
 
 ## 4. `sep3415` and `chatgpt` Profile Mapping
 
-A single `mcp-hookd` instance runs under either `"profile": "sep3415"` or `"profile": "chatgpt"`. Both profiles use identical `SubscriptionKey` derivation: `principal \0 url \0 event_name \0 RFC8785_JCS(arguments)` hashed with SHA-256 to form `sub_<32-lowercase-hex>`. Exact JSON integers are required for JCS canonicalization. On protocol version `2026-07-28`, JSON-RPC `result` objects include `_meta` framing per modern Streamable HTTP conventions; legacy sessions (`2024-11-05`..`2025-11-25`) omit modern result type annotations.
+A single `mcp-hookd` instance runs under either `"profile": "sep3415"` or `"profile": "chatgpt"`. Both profiles use identical `SubscriptionKey` derivation: `principal \0 url \0 event_name \0 RFC8785_JCS(arguments)` hashed with SHA-256 to form `sub_<32-lowercase-hex>`. Exact JSON integers are required for JCS canonicalization. On protocol version `2026-07-28`, locally produced JSON-RPC `result` objects include `resultType: "complete"`; legacy sessions (`2024-11-05`..`2025-11-25`) omit that annotation.
 
 | Behavior Dimension | `sep3415` Profile | `chatgpt` Profile |
 | :--- | :--- | :--- |

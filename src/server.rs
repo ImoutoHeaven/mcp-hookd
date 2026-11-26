@@ -1421,6 +1421,12 @@ async fn handle_mcp_post_local_only(
     let mode = match classify_protocol(&parts.headers, method, req_id.is_some(), params) {
         Ok(m) => m,
         Err((code, msg)) => {
+            if code == -32022
+                && let HeaderExtract::Single(version) =
+                    single_header_str(&parts.headers, "mcp-protocol-version")
+            {
+                return unsupported_protocol_version(err_id, version);
+            }
             return jsonrpc_error(StatusCode::BAD_REQUEST, err_id, code, &msg, None);
         }
     };
@@ -1697,6 +1703,11 @@ async fn handle_server_discover(
             None,
         );
     }
+    if let ProtocolMode::Modern { version } = &mode
+        && version != PROTOCOL_VERSION_MODERN
+    {
+        return unsupported_protocol_version(id, version);
+    }
     let profile = state.engine.config().profile;
 
     let mut caps = Map::new();
@@ -1793,13 +1804,7 @@ async fn handle_events_method(
         }
         ProtocolMode::Modern { version } => {
             if version != PROTOCOL_VERSION_MODERN {
-                return jsonrpc_error(
-                    StatusCode::BAD_REQUEST,
-                    id,
-                    -32022,
-                    &format!("Unsupported protocol version '{version}'"),
-                    None,
-                );
+                return unsupported_protocol_version(id, version);
             }
             false
         }
@@ -1918,13 +1923,7 @@ async fn handle_other_method(
         }
         ProtocolMode::Modern { version } => {
             if version != PROTOCOL_VERSION_MODERN {
-                return jsonrpc_error(
-                    StatusCode::BAD_REQUEST,
-                    req_id.unwrap_or(Value::Null),
-                    -32022,
-                    &format!("Unsupported protocol version '{version}'"),
-                    None,
-                );
+                return unsupported_protocol_version(req_id.unwrap_or(Value::Null), version);
             }
             false
         }
@@ -3938,6 +3937,19 @@ fn jsonrpc_ok(id: Value, result: Value) -> Response<RespBody> {
             "id": id,
             "result": result
         }),
+    )
+}
+
+fn unsupported_protocol_version(id: Value, requested: &str) -> Response<RespBody> {
+    jsonrpc_error(
+        StatusCode::BAD_REQUEST,
+        id,
+        -32022,
+        "Unsupported protocol version",
+        Some(json!({
+            "supported": [PROTOCOL_VERSION_MODERN],
+            "requested": requested,
+        })),
     )
 }
 

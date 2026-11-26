@@ -1824,6 +1824,72 @@ async fn acceptance_5_burst_dropped_slow_without_suspending_or_blocking_healthy_
 }
 
 #[tokio::test]
+async fn acceptance_local_protocol_version_negotiation() {
+    let dir = TempDir::new().unwrap();
+    let cfg = base_config(
+        dir.path().join("subscriptions.json"),
+        Profile::Chatgpt,
+        None,
+        Some(IngestConfig {
+            tokens: vec![SecretString::new("producer-secret-tok-1")],
+            events: vec![ci_ingest_event()],
+        }),
+        None,
+    );
+    let server = start_server(cfg, QuotaConfig::default(), None)
+        .await
+        .unwrap();
+    let base_url = format!("http://{}", server.local_addr());
+    let client = http_client();
+    let requested = "2027-06-01";
+    for method in ["server/discover", "events/list", "ping"] {
+        let mut meta = modern_meta();
+        meta["io.modelcontextprotocol/protocolVersion"] = json!(requested);
+        let payload = json!({
+            "jsonrpc": "2.0", "id": 7, "method": method,
+            "params": {"_meta": meta}
+        });
+        let (status, _, bytes) = send_http(
+            &client,
+            Method::POST,
+            &format!("{base_url}/mcp"),
+            &[
+                ("authorization", "Bearer inbound-secret-tok-1"),
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                ("mcp-protocol-version", requested),
+                ("mcp-method", method),
+            ],
+            Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}");
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32022);
+        assert_eq!(
+            response["error"]["data"],
+            json!({
+                "supported": [PROTOCOL_VERSION_MODERN], "requested": requested
+            })
+        );
+        let (status, _, response) = mcp_post_modern(
+            &client,
+            &base_url,
+            "inbound-secret-tok-1",
+            method,
+            8,
+            json!({}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{method}: {response}");
+        assert_eq!(response["result"]["resultType"], "complete");
+    }
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn acceptance_6_no_upstream_discover_wire_shape_session_guards_and_root_404() {
     let dir = TempDir::new().unwrap();
     let cfg = base_config(
